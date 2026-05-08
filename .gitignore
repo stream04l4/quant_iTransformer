@@ -1,0 +1,23 @@
+# 1. 数据库与日志 (绝对不能记录，实盘数据会撑爆历史)
+data/
+logs/
+models/
+*.pth
+*.csv
+*.db
+*.parquet
+*.png
+
+# 2. AI 模型与动态状态内存 (只管代码，不管模型本身)
+*.json
+*.log
+
+# 3. 配置文件 (防止实盘 API 密钥或私人调参泄露)
+*.json.tmp
+.env
+setup.sh
+# 4. Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
