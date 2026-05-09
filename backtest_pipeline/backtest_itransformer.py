@@ -217,20 +217,26 @@ def run_backtest():
                     
                 active_sl_pct = -abs(HARD_SL)
                 if is_trailing:
-                    step_level = int(max_unrealized_pnl / 0.05) * 0.05
-                    active_sl_pct = step_level - 0.05
+                    # 💡 核心修复：丝滑追踪止损。
+                    # 最高浮盈回撤 5%（指杠杆后的净值回撤 5%）就立刻收网。
+                    trailing_sl = max_unrealized_pnl - 0.05
+                    # 强制保本锁：一旦 24 小时后处于盈利开启了追踪，哪怕行情剧震，止损线也绝对不能跌穿 0.0 (平本线)
+                    active_sl_pct = max(0.0, trailing_sl)
                 
-                # 🎯 盘中绝对止盈离场：瞬间碰触止盈线
-                if best_pnl_pct >= abs(HARD_TP):
-                    close_position = True
-                    actual_exit_pct = abs(HARD_TP)
-                    break
-                    
-                # 🎯 盘中悲观离场：这一分钟内跌破了止损线
+                # 🚨 极其严苛的回测规则：同一分钟内若既触发止损又触发止盈，【优先判定止损】！
+                # 这能彻底消灭“天地针”带来的回测虚假乐观。
+                
+                # 🎯 盘中悲观离场：跌破止损线 / 跌破保本线
                 if worst_pnl_pct <= active_sl_pct:
                     close_position = True
                     actual_exit_pct = min(active_sl_pct, close_pnl_pct)
                     break 
+
+                # 🎯 盘中绝对止盈离场：瞬间碰触 50% 止盈线
+                if best_pnl_pct >= abs(HARD_TP):
+                    close_position = True
+                    actual_exit_pct = abs(HARD_TP)
+                    break
                 
                 # 🎯 时间锁到期判定
                 if hold_timer_mins <= 0:
@@ -243,10 +249,10 @@ def run_backtest():
 
             # 如果这 1 小时走完了都没触发平仓，检查 AI 是否发生了概率反转
             if not close_position and not liquidated:
-                if current_pos == 1 and p_down > th["down_top_10"]:
+                if current_pos == 1 and p_down > th["down_top_0.1"]:
                     close_position = True
                     actual_exit_pct = close_pnl_pct
-                elif current_pos == -1 and p_up > th["up_top_10"]:
+                elif current_pos == -1 and p_up > th["up_top_0.1"]:
                     close_position = True
                     actual_exit_pct = close_pnl_pct
 

@@ -57,14 +57,14 @@ AGGTRADE_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id",
 # ==========================================
 # 这些参数在调优时需要频繁变动，集中管理以防止回测与实盘错配
 LEVERAGE_1 = 1.0           # 杠杆倍数
-LEVERAGE_2 = 3.0           # 杠杆倍数
-LEVERAGE_3 = 5.0           # 杠杆倍数
+LEVERAGE_2 = 2.0           # 杠杆倍数
+LEVERAGE_3 = 3.0           # 杠杆倍数
 
 FEE_RATE = 0.0005        # 交易所单边手续费 (币安市价单 Taker 万五)
 
 HOLD_PERIOD = 24         
 HARD_TP = 0.5           # 绝对止盈线 50% 
-HARD_SL = 0.5           # 绝对止损线 50% 
+HARD_SL = 0.3           # 绝对止损线 50% 
 
 
 # ==========================================
