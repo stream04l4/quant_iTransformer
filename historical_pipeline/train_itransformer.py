@@ -40,8 +40,14 @@ class InvertedTransformer(nn.Module):
     def forward(self, x):
         # x 初始形状: [Batch, Seq_Len, Num_Variates] -> 例: [256, 96, 25]
         
-        # 🚨 核心: 维度倒置 (Inversion)
-        x = x.transpose(1, 2)  # 变为 [Batch, Num_Variates, Seq_Len] -> [256, 25, 96]
+        # 🚨 核心修改 1：Sequence Instance Normalization (类 RevIN 的输入处理)
+        # 对每一个时间序列窗口内的每一个特征，减去自身均值除以标准差
+        seq_means = x.mean(dim=1, keepdim=True)
+        seq_stdev = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x = (x - seq_means) / seq_stdev
+        
+        # 🚨 维度倒置 (Inversion)
+        x = x.transpose(1, 2)  # 变为 [Batch, Num_Variates, Seq_Len]
         
         # Embedding: 变为 [Batch, Num_Variates, d_model] -> [256, 25, 512]
         enc_out = self.enc_embedding(x)
@@ -69,11 +75,6 @@ class CryptoDataset(Dataset):
         X = df.select(self.feature_cols).to_numpy().astype('float32')
         Y_raw = df.select("target_24h_return").to_numpy().astype('float32').reshape(-1)
         
-        # 🚨 核心重构：将连续收益率打上 0, 1, 2 的类别标签
-        # Class 0: 大跌 (< -2%)
-        # Class 1: 震荡 (-2% ~ 2%)
-        # Class 2: 大涨 (> 2%)
-        # 🚨 动态注入类别阈值
         THRESHOLD = CLASS_THRESHOLD
         Y_class = np.where(Y_raw > THRESHOLD, 2, 
                            np.where(Y_raw < -THRESHOLD, 0, 1))
@@ -84,14 +85,6 @@ class CryptoDataset(Dataset):
             self.X, self.Y = X[:split_idx], Y_class[:split_idx]
         else:
             self.X, self.Y = X[split_idx:], Y_class[split_idx:]
-        
-        self.scaler = StandardScaler()
-        if is_train:
-            self.X = self.scaler.fit_transform(self.X)
-        else:
-            train_X_for_fit = X[:split_idx]
-            self.scaler.fit(train_X_for_fit)
-            self.X = self.scaler.transform(self.X)
         
         self.seq_len = seq_len
 
@@ -149,7 +142,7 @@ def train_model():
     ).to(DEVICE)
     
     # 🚨 提升 Weight Decay 10倍 (从 1e-3 到 1e-2)，严厉惩罚“死记硬背”的参数
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
     
     # 动态类别权重 (保持不变)
     train_labels = train_set.Y
@@ -241,7 +234,6 @@ def train_model():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'feature_cols': train_set.feature_cols,
-                'scaler': train_set.scaler,
                 'val_loss': best_val_loss,
                 'val_acc': val_acc
             }, save_path)

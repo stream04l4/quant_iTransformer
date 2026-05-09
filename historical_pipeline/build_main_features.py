@@ -35,13 +35,13 @@ def generate_month_range(start_ym, end_ym):
             curr_m = 1
             curr_y += 1
 
-def fetch_binance_data(market, data_type, symbol, year, month):
+def fetch_binance_data(market, data_type, symbol, year, month, timeframe="1h"):
     month_str = f"{month:02d}"
     base = BINANCE_BASE_URL_FUTURES if market == "futures" else BINANCE_BASE_URL_SPOT
     
-    # 动态构建 URL
+    # 动态构建 URL，增加 timeframe 支持
     if data_type == "klines":
-        url = f"{base}/klines/{symbol}/1h/{symbol}-1h-{year}-{month_str}.zip"
+        url = f"{base}/klines/{symbol}/{timeframe}/{symbol}-{timeframe}-{year}-{month_str}.zip"
     elif data_type == "premiumIndexKlines":
         url = f"{base}/premiumIndexKlines/{symbol}/1h/{symbol}-1h-{year}-{month_str}.zip"
     elif data_type == "fundingRate":
@@ -52,9 +52,8 @@ def fetch_binance_data(market, data_type, symbol, year, month):
     type_temp_dir.mkdir(parents=True, exist_ok=True)
     zip_path = type_temp_dir / f"temp_{year}_{month_str}.zip"
     
-    print(f"⬇️ 尝试下载: {data_type} | {symbol} | {year}-{month_str}")
+    print(f"⬇️ 正在下载: {data_type} ({timeframe}) | {symbol} | {year}-{month_str}")
     try:
-        # 设置超时，防止死锁
         r = requests.get(url, stream=True, timeout=15)
         if r.status_code == 200:
             with open(zip_path, 'wb') as f:
@@ -68,23 +67,23 @@ def fetch_binance_data(market, data_type, symbol, year, month):
             print("   ✅ 下载并解压成功")
             return type_temp_dir / csv_filename
         else:
-            print(f"   ⚠️ 跳过 (HTTP {r.status_code}) - 可能是该月数据暂未生成或 URL 不存在")
+            print(f"   ⚠️ 跳过 (HTTP {r.status_code})")
             return None
     except Exception as e:
         print(f"   ❌ 网络异常: {e}")
         return None
 
-def load_and_concat_months(market, data_type, symbol):
+def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_parquet=False):
     dfs = []
     for year, month in generate_month_range(DATA_START_MONTH, DATA_END_MONTH):
-        csv_path = fetch_binance_data(market, data_type, symbol, year, month)
+        csv_path = fetch_binance_data(market, data_type, symbol, year, month, timeframe)
         if csv_path and csv_path.exists():
             cols = FUNDING_COLS if data_type == "fundingRate" else KLINE_COLS
             df = pl.read_csv(csv_path, has_header=(market=="futures"), new_columns=cols)
             time_col = "calc_time" if data_type == "fundingRate" else "open_time"
             df = df.cast({col: pl.Float64 for col in cols if col != time_col})
             dfs.append(df)
-            os.remove(csv_path)
+            os.remove(csv_path) # 🚨 依然坚决删除原始 CSV，避免硬盘碎片化
             
     if not dfs: 
         print(f"🚨 严重警告: {data_type} ({symbol}) 未获取到任何数据！")
@@ -92,9 +91,24 @@ def load_and_concat_months(market, data_type, symbol):
         
     full_df = pl.concat(dfs)
     time_col = "calc_time" if data_type == "fundingRate" else "open_time"
+    
+    # 提取极其精确的毫秒时间戳
+    full_df = full_df.with_columns(
+        pl.from_epoch(pl.col(time_col), time_unit="ms").alias("exact_timestamp")
+    ).sort("exact_timestamp")
+
+    # 🚨 核心逻辑：给回测引擎准备好“物理弹药”
+    if save_raw_parquet:
+        raw_dir = TEMP_DIR / "klines" / symbol
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        output_path = raw_dir / f"{symbol}_raw_{timeframe}.parquet"
+        # 去掉不需要的列，极简落盘，让回测读取速度飙升
+        full_df.select(["exact_timestamp", "open", "high", "low", "close"]).rename({"exact_timestamp": "timestamp"}).write_parquet(output_path)
+        print(f"   💾 {timeframe} 物理 K 线库合并完成并生成缓存: {output_path.name}")
+        
     return full_df.with_columns(
-        pl.from_epoch(pl.col(time_col), time_unit="ms").dt.truncate("1h").alias("hour_timestamp")
-    ).sort("hour_timestamp")
+        pl.col("exact_timestamp").dt.truncate("1h").alias("hour_timestamp")
+    )
 
 def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
     delta = pl.col(price_col).diff()
@@ -107,7 +121,13 @@ def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
 # ==========================================
 def build_features():
     print(f"\n🚀 [第一阶段] 正在拉取并拼接主维度数据...")
-    btc_klines = load_and_concat_months("futures", "klines", SYMBOL)
+    
+    # 1. 拉取 1h K线，并顺手保存一份未被对数和归一化污染的 raw_1h.parquet 给回测用
+    btc_klines = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1h", save_raw_parquet=True)
+    
+    # 2. 独家补充：拉取 1m K线，只保存 raw_1m.parquet 给回测用，随后丢弃，不干扰训练特征
+    print(f"\n🔬 [特殊补充] 正在拉取 1m K线，专供回测显微镜碰撞使用 (单线程下载可能会花 1-3 分钟)...")
+    _ = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1m", save_raw_parquet=True)
     btc_funding = load_and_concat_months("futures", "fundingRate", SYMBOL)
     btc_premium = load_and_concat_months("futures", "premiumIndexKlines", SYMBOL)
     
@@ -138,7 +158,6 @@ def build_features():
     print("⚙️ [第四阶段] 计算 23 维特征矩阵...")
     master_df = master_df.cast({col: pl.Float64 for col in ["open", "high", "low", "close", "volume"]})
 
-    # 处理潜在的缺失列（如果下载失败，赋予一个常量列防止报错）
     required_cols = ["last_funding_rate", "premium_close", "eth_usdt_close", "eth_btc_close"]
     for col in required_cols:
         if col not in master_df.columns:
@@ -152,9 +171,16 @@ def build_features():
         ((pl.col("high") - pl.max_horizontal("open", "close")) / (pl.col("high") - pl.col("low") + 1e-9)).alias("upper_shadow"),
         ((pl.min_horizontal("open", "close") - pl.col("low")) / (pl.col("high") - pl.col("low") + 1e-9)).alias("lower_shadow"),
         ((pl.col("close").rolling_std(window_size=20) * 4) / (pl.col("close").rolling_mean(window_size=20) + 1e-9)).alias("bb_squeeze"),
-        (pl.col("close").ewm_mean(span=12, adjust=False) - pl.col("close").ewm_mean(span=26, adjust=False)).alias("macd_line"),
-        build_rsi_expr("close", 14).alias("rsi_14"),
-        build_rsi_expr("close", 48).alias("rsi_48"),
+        
+        # 🚨 核心修改 1：将基于绝对差值的 MACD 替换为基于百分比的 PPO
+        (
+            (pl.col("close").ewm_mean(span=12, adjust=False) - pl.col("close").ewm_mean(span=26, adjust=False)) 
+            / (pl.col("close").ewm_mean(span=26, adjust=False) + 1e-9)
+        ).alias("ppo_line"),
+        
+        # 🚨 将 RSI 压缩并平移到 [-1, 1] 之间，对齐其他特征量级
+        ((build_rsi_expr("close", 14) - 50) / 50.0).alias("rsi_14"),
+        ((build_rsi_expr("close", 48) - 50) / 50.0).alias("rsi_48"),
         (pl.col("taker_buy_volume") / (pl.col("volume") + 1e-9)).alias("taker_ratio"),
         (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("vpt"),
         (pl.col("taker_buy_volume") - (pl.col("volume") - pl.col("taker_buy_volume"))).alias("net_taker_vol"),
@@ -169,7 +195,10 @@ def build_features():
         (pl.col("close").shift(-FORECAST_HORIZON).log() - pl.col("close").log()).alias("target_24h_return")
     ])
 
-    features = features.with_columns((pl.col("macd_line") - pl.col("macd_line").ewm_mean(span=9, adjust=False)).alias("macd_hist"))
+    # 🚨 PPO Histogram 替代 MACD Histogram
+    features = features.with_columns(
+        (pl.col("ppo_line") - pl.col("ppo_line").ewm_mean(span=9, adjust=False)).alias("ppo_hist")
+    )
 
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
     if list(PROCESSED_AGGTRADES_DIR.glob("*.parquet")):
@@ -177,23 +206,44 @@ def build_features():
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
             pl.col("cvd").fill_null(0),
             pl.col("whale_net_flow").fill_null(0),
-            # 强化双向填充
             pl.col("retail_ratio").fill_null(strategy="forward").fill_null(strategy="backward").fill_null(0.1)
         ])
     else:
         print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")
 
-    # 确立最终保留的干净列
+    # 🚨 核心修改 2：施加 168 小时 (7天) 的 Robust Z-Score (MAD) 并进行截断
+    print("🌊 [时序平稳化] 正在对高维度绝对量特征进行 Robust Z-Score (MAD) 降维与截断...")
+    rolling_cols = ["vpt", "net_taker_vol"]
+    if "cvd" in features.columns:
+        rolling_cols.extend(["cvd", "whale_net_flow"])
+    
+    # 步骤 1: 计算 rolling median
+    features = features.with_columns([
+        pl.col(c).rolling_median(window_size=168).alias(f"{c}_median") for c in rolling_cols
+    ])
+    # 步骤 2: 计算 rolling MAD (Median Absolute Deviation)
+    features = features.with_columns([
+        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168).alias(f"{c}_mad") for c in rolling_cols
+    ])
+    # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4] 防御极端针行情
+    zscore_exprs = [
+        (0.6745 * (pl.col(c) - pl.col(f"{c}_median")) / (pl.col(f"{c}_mad") + 1e-9)).clip(-4.0, 4.0).alias(f"{c}_zscore") for c in rolling_cols
+    ]
+    features = features.with_columns(zscore_exprs)
+    
+    # 步骤 4: 丢弃中间临时变量
+    features = features.drop([f"{c}_median" for c in rolling_cols] + [f"{c}_mad" for c in rolling_cols])
+
+    # 确立最终保留的干净列 (注意列名已经变更)
     final_cols = [
         "hour_timestamp", "log_return", "body_strength", "ma_bias", "upper_shadow", "lower_shadow",
-        "bb_squeeze", "macd_hist", "rsi_14", "rsi_48", "taker_ratio", "vpt", "net_taker_vol",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", "vpt_zscore", "net_taker_vol_zscore",
         "funding_rate", "premium_delta", "eth_log_return", "eth_btc_return",
         "hour_sin", "hour_cos", "week_sin", "week_cos", "target_24h_return"
     ]
     if "cvd" in features.columns:
-        final_cols.extend(["cvd", "whale_net_flow", "retail_ratio"])
+        final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "retail_ratio"])
 
-    # 只选取需要的列
     features = features.select(final_cols)
 
     # 🔍 核心诊断：在 drop_nulls 前查验空值

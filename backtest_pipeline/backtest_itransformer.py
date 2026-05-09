@@ -11,30 +11,8 @@ from pathlib import Path
 import json
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID
-
-
-# ==========================================
-# 1. 必须对齐的三分类架构
-# ==========================================
-class InvertedTransformer(nn.Module):
-    def __init__(self, num_variates, seq_len, d_model=64, n_heads=4, d_ff=256, e_layers=1, dropout=0.4):
-        super(InvertedTransformer, self).__init__()
-        self.enc_embedding = nn.Linear(seq_len, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True, activation='gelu'
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
-        # 🚨 必须是 3 分类输出
-        self.projector = nn.Linear(d_model, 3) 
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        enc_out = self.enc_embedding(x)
-        enc_out = self.encoder(enc_out)
-        dec_out = self.projector(enc_out)
-        return dec_out.mean(dim=1)
+from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID,FEE_RATE,HOLD_PERIOD,HARD_TP,HARD_SL,LEVERAGE_1,LEVERAGE_2,LEVERAGE_3
+from historical_pipeline.train_itransformer import InvertedTransformer
 
 def run_backtest():
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
@@ -52,7 +30,6 @@ def run_backtest():
     checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     
     feature_cols = checkpoint['feature_cols']
-    scaler = checkpoint['scaler']
     
     # 显式对齐架构参数
     dynamic_n_heads = max(2, D_MODEL // 16) 
@@ -70,18 +47,13 @@ def run_backtest():
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    # 读取数据
+    # === 1. 独立加载特征空间与执行空间 ===
     df = pl.read_parquet(data_path)
-    actuals_1h = df.select("log_return").to_numpy().astype('float32').reshape(-1)
-    prices_full = np.exp(np.cumsum(np.insert(actuals_1h, 0, 0)))
-    
     X_raw = df.select(feature_cols).to_numpy().astype('float32')
-    timestamps = df.select("hour_timestamp").to_series().to_list()
+    timestamps = df.select("hour_timestamp").to_series().to_numpy()
     
     split_idx = int(len(X_raw) * 0.8)
-    X_test_scaled = scaler.transform(X_raw[split_idx:])
-    
-    prices = prices_full[split_idx:]
+    X_test_raw = X_raw[split_idx:]
     test_timestamps = timestamps[split_idx:]
     
     print("\n⚙️ 正在 H100 上生成概率矩阵 (Softmax 置信度)...")
@@ -89,22 +61,36 @@ def run_backtest():
     valid_timestamps = []
     
     with torch.no_grad():
-        for i in range(len(X_test_scaled) - SEQ_LEN):
-            seq_x = X_test_scaled[i : i + SEQ_LEN]
+        for i in range(len(X_test_raw) - SEQ_LEN):
+            seq_x = X_test_raw[i : i + SEQ_LEN]
             tensor_x = torch.from_numpy(seq_x).unsqueeze(0).to(DEVICE)
             with torch.amp.autocast('cuda'):
                 logits = model(tensor_x)
-                # 转化为概率向量: [看跌概率, 震荡概率, 看涨概率]
                 probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
             predictions_probs.append(probs)
-            valid_timestamps.append(test_timestamps[i + SEQ_LEN])
+            valid_timestamps.append(test_timestamps[i + SEQ_LEN - 1])
 
-    predictions_probs = np.array(predictions_probs)
+    # 极速加载 1h 和 1m 的真实物理价格 (执行空间)
+    raw_kline_dir = TEMP_DIR / "klines" / SYMBOL
+    try:
+        df_1h = pl.read_parquet(raw_kline_dir / f"{SYMBOL}_raw_1h.parquet")
+        df_1m = pl.read_parquet(raw_kline_dir / f"{SYMBOL}_raw_1m.parquet")
+    except Exception as e:
+        print(f"❌ 找不到原始 K 线，请先运行 build_main_features.py 完成下载！错误: {e}")
+        return
+
+    ts_1h = df_1h["timestamp"].to_numpy()
+    opens_1h = df_1h["open"].to_numpy()
+    closes_1h = df_1h["close"].to_numpy()
     
+    ts_1m = df_1m["timestamp"].to_numpy()
+    highs_1m = df_1m["high"].to_numpy()
+    lows_1m = df_1m["low"].to_numpy()
+    closes_1m = df_1m["close"].to_numpy()
+
     # ==========================================
-    # 🏦 基于置信度的动态状态机
+    # 🏦 基于 1h 决策 + 1m 显微镜追踪的双轨状态机
     # ==========================================
-    # 自动加载 check_prob_distribution 生成的分位数阈值
     json_path = TRAIN_DATA_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
     if not json_path.exists():
         print("❌ 找不到 dynamic_thresholds.json，请先运行 check_prob_distribution.py！")
@@ -112,107 +98,217 @@ def run_backtest():
     with open(json_path, "r") as f:
         th = json.load(f)
     print("📥 已成功加载动态分位数阈值。")
-
-    HOLD_PERIOD = 24         
-    FEE_RATE = 0.0005        
-    HARD_TP = 0.04           # 绝对止盈线 4% (防止过山车)
     
     equity = 1.0             
-    equity_curve = []        
+    equity_curve = []
+    benchmark_prices = []
     
     current_pos = 0          
-    hold_timer = 0           
+    hold_timer_mins = 0           
     entry_price = 0.0        
     trade_start_equity = 1.0 
-    current_leverage = 0.0   # 记录当前在场单子的杠杆倍数
+    current_leverage = 0.0   
+    entry_time = None
     
+    max_unrealized_pnl = 0.0 
+    is_trailing = False      
     trade_count = 0
     win_count = 0
     liquidated = False       
     
-    print("\n⚔️ 正在执行概率风控撮合...")
+    long_trades = 0
+    short_trades = 0
+    gross_profit = 0.0
+    gross_loss = 0.0
+    
+    print("\n⚔️ 正在执行工业级撮合 (1h 决策开仓 + 1m 盘中悲观碰撞)...")
     
     for i in range(len(predictions_probs)):
         if liquidated:
             equity_curve.append(0)
+            if benchmark_prices: benchmark_prices.append(benchmark_prices[-1])
             continue
             
         p_down, p_flat, p_up = predictions_probs[i]
-        curr_price = prices[i]       
-        next_price = prices[i+1]     
+        signal_time = valid_timestamps[i] 
+        exec_time = signal_time + np.timedelta64(1, 'h')
+        exec_idx_1h = np.searchsorted(ts_1h, exec_time)
         
-        # 1. 寻找开仓机会 (基于真实分位数的动态阶梯杠杆)
+        if exec_idx_1h < len(closes_1h):
+            benchmark_prices.append(closes_1h[exec_idx_1h])
+        else:
+            if benchmark_prices: benchmark_prices.append(benchmark_prices[-1])
+            break
+
+        # ------------------------------------------
+        # 1. 寻找开仓机会 (1h 级别)
+        # ------------------------------------------
         if current_pos == 0:
             target_pos = 0
             dynamic_leverage = 0.0
 
-            if p_up > th["up_top_1"]:      
-                target_pos = 1; dynamic_leverage = 3.0
-            elif p_up > th["up_top_5"]:    
-                target_pos = 1; dynamic_leverage = 2.0
-            elif p_up > th["up_top_10"]:   
-                target_pos = 1; dynamic_leverage = 1.0
+            if p_up > th["up_top_1"]:      target_pos = 1; dynamic_leverage = LEVERAGE_3
+            elif p_up > th["up_top_5"]:    target_pos = 1; dynamic_leverage = LEVERAGE_2
+            elif p_up > th["up_top_10"]:   target_pos = 1; dynamic_leverage = LEVERAGE_1
 
-            elif p_down > th["down_top_1"]:  
-                target_pos = -1; dynamic_leverage = 3.0
-            elif p_down > th["down_top_5"]:  
-                target_pos = -1; dynamic_leverage = 2.0
-            elif p_down > th["down_top_10"]: 
-                target_pos = -1; dynamic_leverage = 1.0
+            elif p_down > th["down_top_1"]:  target_pos = -1; dynamic_leverage = LEVERAGE_3
+            elif p_down > th["down_top_5"]:  target_pos = -1; dynamic_leverage = LEVERAGE_2
+            elif p_down > th["down_top_10"]: target_pos = -1; dynamic_leverage = LEVERAGE_1
 
-            if target_pos != 0:
+            if target_pos != 0 and exec_idx_1h < len(opens_1h):
                 current_pos = target_pos
                 current_leverage = dynamic_leverage
-                hold_timer = HOLD_PERIOD
-                entry_price = curr_price
-                trade_start_equity = equity
+                hold_timer_mins = HOLD_PERIOD * 60  # 时间锁转换为分钟
+                
+                # 💡 核心升级：按 exec_time 对应 K 线的开盘价直接进场，消除旧版的 1 小时滑点延迟
+                entry_price = opens_1h[exec_idx_1h] 
+                entry_time = ts_1h[exec_idx_1h]
+                
+                trade_start_equity = equity 
                 equity -= trade_start_equity * current_leverage * FEE_RATE
+                
+                if target_pos == 1: long_trades += 1
+                if target_pos == -1: short_trades += 1
+                
+                max_unrealized_pnl = 0.0
+                is_trailing = False
 
-        # 2. 持仓监控与结算
+        # ------------------------------------------
+        # 2. 1分钟级别显微镜追踪持仓 (盘中碰撞)
+        # ------------------------------------------
         if current_pos != 0:
-            underlying_return = (next_price - entry_price) / entry_price if current_pos == 1 else (entry_price - next_price) / entry_price
-            floating_equity = trade_start_equity * (1 - current_leverage * FEE_RATE + current_leverage * underlying_return)
+            start_1m_idx = np.searchsorted(ts_1m, entry_time)
+            chunk_end_time = exec_time + np.timedelta64(1, 'h') # 追踪到这 1 个小时结束
+            end_1m_idx = np.searchsorted(ts_1m, chunk_end_time)
             
-            if floating_equity <= 0:
-                liquidated = True
+            close_position = False
+            actual_exit_pct = 0.0
+            close_pnl_pct = 0.0 # 初始化，防止当小时无数据
+            
+            for m_idx in range(start_1m_idx, end_1m_idx):
+                if m_idx >= len(closes_1m): break
+                
+                m_high = highs_1m[m_idx]
+                m_low = lows_1m[m_idx]
+                m_close = closes_1m[m_idx]
+                
+                if current_pos == 1:
+                    worst_intra = (m_low - entry_price) / entry_price
+                    best_intra = (m_high - entry_price) / entry_price
+                    close_return = (m_close - entry_price) / entry_price
+                else:
+                    worst_intra = (entry_price - m_high) / entry_price
+                    best_intra = (entry_price - m_low) / entry_price
+                    close_return = (entry_price - m_close) / entry_price
+
+                worst_pnl_pct = current_leverage * worst_intra
+                best_pnl_pct = current_leverage * best_intra
+                close_pnl_pct = current_leverage * close_return
+                
+                if best_pnl_pct > max_unrealized_pnl:
+                    max_unrealized_pnl = best_pnl_pct
+                    
+                hold_timer_mins -= 1
+                
+                # 分钟级极限爆仓检测
+                if trade_start_equity * (1 - current_leverage * FEE_RATE + worst_pnl_pct) <= 0:
+                    liquidated = True
+                    break
+                    
+                active_sl_pct = -abs(HARD_SL)
+                if is_trailing:
+                    step_level = int(max_unrealized_pnl / 0.05) * 0.05
+                    active_sl_pct = step_level - 0.05
+                
+                # 🎯 盘中绝对止盈离场：瞬间碰触止盈线
+                if best_pnl_pct >= abs(HARD_TP):
+                    close_position = True
+                    actual_exit_pct = abs(HARD_TP)
+                    break
+                    
+                # 🎯 盘中悲观离场：这一分钟内跌破了止损线
+                if worst_pnl_pct <= active_sl_pct:
+                    close_position = True
+                    actual_exit_pct = min(active_sl_pct, close_pnl_pct)
+                    break 
+                
+                # 🎯 时间锁到期判定
+                if hold_timer_mins <= 0:
+                    if close_pnl_pct <= 0:
+                        close_position = True
+                        actual_exit_pct = close_pnl_pct
+                        break
+                    else:
+                        is_trailing = True
+
+            # 如果这 1 小时走完了都没触发平仓，检查 AI 是否发生了概率反转
+            if not close_position and not liquidated:
+                if current_pos == 1 and p_down > th["down_top_10"]:
+                    close_position = True
+                    actual_exit_pct = close_pnl_pct
+                elif current_pos == -1 and p_up > th["up_top_10"]:
+                    close_position = True
+                    actual_exit_pct = close_pnl_pct
+
+            # 统一交割结算
+            if liquidated:
                 equity = 0
                 current_pos = 0
                 equity_curve.append(0)
-                print(f"💀 爆仓！发生于第 {i} 小时！")
+                print(f"💀 盘中分钟级扎针爆仓！发生于 {signal_time}")
                 trade_count += 1
+                gross_loss += trade_start_equity
                 continue
                 
-            hold_timer -= 1
-            close_position = False
-            
-            # 🎯 离场逻辑一：概率反转 (对齐新的 Top 10% 警戒线)
-            if current_pos == 1 and p_down > th["down_top_10"]:
-                close_position = True
-            elif current_pos == -1 and p_up > th["up_top_10"]:
-                close_position = True
-            
-            # 🎯 离场逻辑二：触及绝对止盈线
-            elif underlying_return >= HARD_TP:
-                close_position = True
-                
-            # ⏳ 离场逻辑三：时间锁到期
-            elif hold_timer == 0:
-                close_position = True
-                
             if close_position:
-                floating_equity -= trade_start_equity * current_leverage * FEE_RATE
+                floating_equity = trade_start_equity * (1 - current_leverage * FEE_RATE + actual_exit_pct)
+                floating_equity -= trade_start_equity * current_leverage * FEE_RATE # 扣除平仓手续费
                 equity = floating_equity
-                if underlying_return > 0: win_count += 1
+                
+                trade_pnl = equity - trade_start_equity
+                if trade_pnl > 0: 
+                    win_count += 1
+                    gross_profit += trade_pnl
+                else:
+                    gross_loss += abs(trade_pnl)
+                
                 trade_count += 1
                 current_pos = 0 
                 current_leverage = 0.0
             else:
-                equity = floating_equity
+                # 若持仓跨越当前小时，账面浮盈以本小时最后一分钟收盘价计
+                equity = trade_start_equity * (1 - current_leverage * FEE_RATE + close_pnl_pct)
+                # 将追踪起点推移至下一个 1 小时的开端
+                entry_time = chunk_end_time
                 
         equity_curve.append(equity)
 
     equity_curve = np.array(equity_curve)
-    benchmark_curve = prices[1:len(predictions_probs)+1] / prices[0]
+    valid_timestamps = valid_timestamps[:len(equity_curve)]
+    benchmark_prices = np.array(benchmark_prices)
+
+    # 计算最大回撤 (Max Drawdown)
+    rolling_max = np.maximum.accumulate(equity_curve)
+    drawdowns = (equity_curve - rolling_max) / rolling_max
+    max_drawdown = np.min(drawdowns) * 100 if len(drawdowns) > 0 else 0.0
+
+    # 计算盈亏比 (Profit Factor)
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+
+    # 计算多空比
+    ls_ratio = (long_trades / short_trades) if short_trades > 0 else float('inf')
+
+    # 计算卡玛比率 (Calmar Ratio)
+    total_return = equity_curve[-1] - 1.0
+    years = len(predictions_probs) / 8760
+    annualized_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+    calmar = (annualized_return / (abs(max_drawdown)/100)) if max_drawdown < 0 else float('inf')
+    
+    # 修复基准对齐：动态构建的 benchmark_prices 已经完全对齐了每次开仓时刻
+    if len(benchmark_prices) > 0:
+        benchmark_curve = benchmark_prices / benchmark_prices[0]
+    else:
+        benchmark_curve = np.ones(len(predictions_probs))
 
     if trade_count > 0:
         win_rate = (win_count / trade_count) * 100
@@ -229,13 +325,13 @@ def run_backtest():
     print("\n📊 终极 3分类动态杠杆 回测结果:")
     print("-" * 45)
     print(f"总回测时长: {len(predictions_probs)} 小时")
-    print(f"共计交易: {trade_count} 笔")
-    print(f"胜率 (Win Rate): {win_rate:.2f}%")
+    print(f"共计交易: {trade_count} 笔 (多头: {long_trades} | 空头: {short_trades} | 多空比: {ls_ratio:.2f})")
+    print(f"胜率 (Win Rate): {win_rate:.2f}% | 盈亏比 (Profit Factor): {profit_factor:.2f}")
     if liquidated:
         print(f"⚠️ 状态: 已爆仓 (账户归零)")
     print(f"期末策略净值: {equity_curve[-1]:.4f}")
-    print(f"期末基准净值: {benchmark_curve[-1]:.4f}")
-    print(f"估算年化夏普: {sharpe:.2f}")
+    print(f"最大回撤 (Max Drawdown): {max_drawdown:.2f}%")
+    print(f"估算年化夏普: {sharpe:.2f} | 卡玛比率: {calmar:.2f}")
     print("-" * 45)
 
     plt.figure(figsize=(14, 7))

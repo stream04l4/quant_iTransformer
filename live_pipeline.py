@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import json
 from pathlib import Path
-from historical_pipeline.model_itransformer import InvertedTransformer
+from historical_pipeline.train_itransformer import InvertedTransformer
 from execution_oms import execute_gate_trade, log_system_alert
 from risk_manager import bailout_worker
 import threading
@@ -61,56 +61,69 @@ def compute_features(df_1h, snapshot):
     """根据历史K线和网关快照，构建与训练完全对齐的 23 维宽表"""
     df = df_1h.copy()
     
-    # === 1. 基础价格与容量 ===
-    df['return'] = df['close'].pct_change()
+    # === 1. 基础价格转换 ===
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
-    df['volatility_12h'] = df['log_return'].rolling(window=12).std()
+    df['body_strength'] = (df['close'] - df['open']) / df['open']
+    
+    ma_200 = df['close'].ewm(span=200, adjust=False).mean()
+    df['ma_bias'] = (df['close'] - ma_200) / ma_200
+    
+    high_low_range = df['high'] - df['low'] + 1e-9
+    max_open_close = df[['open', 'close']].max(axis=1)
+    min_open_close = df[['open', 'close']].min(axis=1)
+    df['upper_shadow'] = (df['high'] - max_open_close) / high_low_range
+    df['lower_shadow'] = (min_open_close - df['low']) / high_low_range
     
     # === 2. 技术指标 (复刻) ===
-    # MA & EMA
-    df['ma_12'] = df['close'].rolling(window=12).mean()
-    df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
+    # Bollinger Bands Squeeze
+    rolling_mean_20 = df['close'].rolling(window=20).mean()
+    rolling_std_20 = df['close'].rolling(window=20).std()
+    df['bb_squeeze'] = (rolling_std_20 * 4) / (rolling_mean_20 + 1e-9)
     
-    # MACD
-    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema_12 - ema_26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
+    # PPO (Percentage Price Oscillator) 替代 MACD
+    ppo_line = (df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()) / (df['close'].ewm(span=26, adjust=False).mean() + 1e-9)
+    ppo_signal = ppo_line.ewm(span=9, adjust=False).mean()
+    df['ppo_hist'] = ppo_line - ppo_signal
     
-    # RSI
+    # RSI 14 & 48 (压缩至 [-1, 1] 范围)
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi_14'] = 100 - (100 / (1 + rs))
+    gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+    df['rsi_14'] = ((100 - (100 / (1 + gain / (loss + 1e-9)))) - 50) / 50.0
     
-    # Bollinger Bands
-    df['bb_mid'] = df['close'].rolling(window=20).mean()
-    df['bb_std'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
-    df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+    gain_48 = delta.clip(lower=0).ewm(span=48, adjust=False).mean()
+    loss_48 = (-delta.clip(upper=0)).ewm(span=48, adjust=False).mean()
+    df['rsi_48'] = ((100 - (100 / (1 + gain_48 / (loss_48 + 1e-9)))) - 50) / 50.0
     
-    # === 3. 微观特征拼接 (关键融合点！) ===
-    # 我们将网关传来的实时衍生品特征，"强行"拼接到最后一行
-    # 训练时的衍生品特征可能比较粗糙，实盘中我们直接用 Binance 最新的真实数据覆盖
-    df['funding_rate'] = snapshot['funding_rate']
-    df['open_interest'] = snapshot['open_interest']
-    df['liquidation_vol_15m'] = snapshot['liquidation_vol_15m']
-    df['taker_buy_ratio_15m'] = snapshot['taker_buy_ratio_15m']
+    # === 3. 周期时间编码 ===
+    df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['hour_sin'] = np.sin(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
+    df['hour_cos'] = np.cos(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
+    df['week_sin'] = np.sin(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
+    df['week_cos'] = np.cos(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
     
-    # 填充前面的空值 (为了能够顺利通过 scaler)
+    # === 4. 微观特征与缺失数据对齐 (填充中性值 0) ===
+    # 实盘网关目前未提供这些高阶订单流与横截面数据，暂时置 0 以保证张量形状匹配，避免推断崩溃
+    df['taker_ratio'] = snapshot.get('taker_buy_ratio_15m', 0.5) 
+    df['vpt_zscore'] = 0.0
+    df['net_taker_vol_zscore'] = 0.0
+    df['funding_rate'] = snapshot.get('funding_rate', 0.0)
+    df['premium_delta'] = 0.0
+    df['eth_log_return'] = 0.0
+    df['eth_btc_return'] = 0.0
+    df['cvd_zscore'] = snapshot.get('liquidation_vol_15m', 0.0) # 临时代理
+    df['whale_net_flow_zscore'] = 0.0
+    df['retail_ratio'] = 0.1
+    
     df.fillna(method='bfill', inplace=True)
     df.fillna(0, inplace=True)
     
-    # === 🚨 确保特征顺序与训练时绝对一致！===
+    # === 🚨 必须与 train_itransformer.py 的 self.feature_cols 完全一致 ===
     feature_cols = [
-        'open', 'high', 'low', 'close', 'volume', 
-        'return', 'log_return', 'volatility_12h',
-        'ma_12', 'ema_12', 'macd', 'macd_signal', 'macd_hist',
-        'rsi_14', 'bb_mid', 'bb_upper', 'bb_lower', 'bb_width',
-        'funding_rate', 'open_interest', 'liquidation_vol_15m', 'taker_buy_ratio_15m'
+        "log_return", "body_strength", "ma_bias", "upper_shadow", "lower_shadow",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", "vpt_zscore", "net_taker_vol_zscore",
+        "funding_rate", "premium_delta", "eth_log_return", "eth_btc_return",
+        "hour_sin", "hour_cos", "week_sin", "week_cos", "cvd_zscore", "whale_net_flow_zscore", "retail_ratio"
     ]
     
     return df[feature_cols]
@@ -123,8 +136,7 @@ def run_live():
     threading.Thread(target=bailout_worker, daemon=True).start()
     # 1. 加载神级模型
     print(f"📥 加载最优权重: {MODEL_PATH}")
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
-    scaler = checkpoint['scaler']
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     feature_cols = checkpoint['feature_cols']
     
     dynamic_n_heads = max(2, D_MODEL // 16) 
@@ -173,11 +185,10 @@ def run_live():
                 
             input_window = features_df.iloc[-SEQ_LEN:].values
             
-            # 4. Z-Score 缩放 (必须用训练时的 Scaler)
-            input_scaled = scaler.transform(input_window)
+            input_raw = features_df.iloc[-SEQ_LEN:].values.astype('float32')
             
-            # 5. 张量化送入大脑
-            x_tensor = torch.tensor(input_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            # 5. 张量化送入大脑 (无需 Scaler，模型内部已含 RevIN)
+            x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
             
             with torch.no_grad():
                 logits = model(x_tensor)

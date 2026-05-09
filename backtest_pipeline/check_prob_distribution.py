@@ -27,7 +27,6 @@ def check_distribution():
     checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     
     feature_cols = checkpoint['feature_cols']
-    scaler = checkpoint['scaler']
     
     dynamic_n_heads = max(2, D_MODEL // 16) 
     dynamic_d_ff = D_MODEL * 4
@@ -49,14 +48,14 @@ def check_distribution():
     
     # 严格取最后 20% 的样本外数据进行统计，防止拿训练集作弊
     split_idx = int(len(X_raw) * 0.8)
-    X_test_scaled = scaler.transform(X_raw[split_idx:])
+    X_test_raw = X_raw[split_idx:]
     
     print("\n⚙️ 正在 H100 上全量推断样本外概率分布...")
     p_down_list, p_flat_list, p_up_list = [], [], []
     
     with torch.no_grad():
-        for i in range(len(X_test_scaled) - SEQ_LEN):
-            seq_x = X_test_scaled[i : i + SEQ_LEN]
+        for i in range(len(X_test_raw) - SEQ_LEN):
+            seq_x = X_test_raw[i : i + SEQ_LEN]
             tensor_x = torch.from_numpy(seq_x).unsqueeze(0).to(DEVICE)
             with torch.amp.autocast('cuda'):
                 logits = model(tensor_x)
