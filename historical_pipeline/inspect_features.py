@@ -11,7 +11,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR
+from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, TRAIN_DATA_DIR
 
 def inspect_master_matrix():
     current_date = datetime.now().strftime("%Y%m%d")
@@ -64,7 +64,7 @@ def inspect_master_matrix():
     plt.tight_layout()
     
     # 🚨 核心修复：保存为高分辨率的 PNG 图片，而不是调用 plt.show()
-    save_path = PROJECT_ROOT / "data" / "train" / "feature_inspection.png"
+    save_path = TRAIN_DATA_DIR / "feature_inspection.png"
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     
     print(f"\n📈 完美！诊断分布图已渲染完毕，已存入服务器本地：\n   {save_path}")

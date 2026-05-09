@@ -13,7 +13,7 @@ from sklearn.utils.class_weight import compute_class_weight
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
-    SYMBOL, PROCESSED_MAIN_DIR, EXPERIMENT_ID, 
+    SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, EXPERIMENT_ID, 
     SEQ_LEN, BATCH_SIZE, EPOCHS, LEARNING_RATE, 
     D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD
 )
@@ -21,7 +21,7 @@ from quant_config.config import (
 # 1. iTransformer 模型核心架构 (维度倒置)
 # ==========================================
 class InvertedTransformer(nn.Module):
-    def __init__(self, num_variates, seq_len, d_model=512, n_heads=8, d_ff=2048, e_layers=3, dropout=0.1):
+    def __init__(self, num_variates, seq_len, d_model, n_heads, d_ff, e_layers, dropout):
         super(InvertedTransformer, self).__init__()
         
         # Variate Embedding: 将每个特征的一整段历史 (seq_len) 映射为一个 Token
@@ -59,7 +59,7 @@ class InvertedTransformer(nn.Module):
 # 2. PyTorch 数据加载器 (Dataset) - 3分类版本
 # ==========================================
 class CryptoDataset(Dataset):
-    def __init__(self, parquet_path, seq_len=96, is_train=True, train_ratio=0.8):
+    def __init__(self, parquet_path, seq_len, is_train=True, train_ratio=0.8):
         print(f"📦 正在加载数据集 ({'训练' if is_train else '验证'}): {Path(parquet_path).name}")
         df = pl.read_parquet(parquet_path)
         
@@ -110,8 +110,7 @@ class CryptoDataset(Dataset):
 # ==========================================
 def train_model():
     # 路径配置
-    MODEL_SAVE_DIR = PROJECT_ROOT / "model"
-    MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     
     # 自动定位最新生成的特征宽表
     parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
@@ -233,9 +232,9 @@ def train_model():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-            save_path = MODEL_SAVE_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth"
+            save_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth"
             
-            #for old_model in MODEL_SAVE_DIR.glob(f"itransformer_{SYMBOL}_best_*.pth"):
+            #for old_model in MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_*.pth"):
             #    old_model.unlink()
             
             torch.save({

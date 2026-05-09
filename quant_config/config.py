@@ -5,6 +5,13 @@ from pathlib import Path
 # 1. 目录结构配置 (Directory Paths)
 # ==========================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# 主要模块目录
+BACKTEST_DIR = PROJECT_ROOT / "backtest_pipeline"
+HISTORICAL_DIR = PROJECT_ROOT / "historical_pipeline"
+CONFIG_DIR = PROJECT_ROOT / "quant_config"
+
+# 数据与模型目录
 DATA_DIR = PROJECT_ROOT / "data"
 TRAIN_DATA_DIR = DATA_DIR / "train"
 LIVE_DATA_DIR = DATA_DIR / "live"
@@ -53,9 +60,6 @@ LEVERAGE = 3.0           # 杠杆倍数 (实测 3 倍优于 5 倍)
 FEE_RATE = 0.0005        # 交易所单边手续费 (币安市价单 Taker 万五)
 
 # ==========================================
-# 6. 模型架构与训练超参数 (网格搜索动态注入区)
-# ==========================================
-# ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)
 # ==========================================
 EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
@@ -63,10 +67,10 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 336))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 100))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-5))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-4))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 32))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 1))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.025))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.027))

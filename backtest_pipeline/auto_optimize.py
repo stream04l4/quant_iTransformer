@@ -7,6 +7,7 @@ import itertools
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import time
+import sys
 
 # ==========================================
 # 1. 通宵级全维寻优空间 (总计 1296 组)
@@ -15,31 +16,34 @@ SEARCH_SPACE = {
     # 🎯 观测视野 (Alpha 的核心来源)：
     # 168 (7天), 336 (14天), 504 (21天), 720 (30天)
     # 测试模型是更擅长短期动量，还是长期均值回归
-    'SEQ_LEN': [168, 336, 504, 720],
+    'SEQ_LEN': [336],
 
     # 🧬 梯度噪音控制：
-    'BATCH_SIZE': [128, 256, 512],
+    'BATCH_SIZE': [256],
 
     # 脑容量与深度：
     # 直接锁死 E_LAYERS=1，不浪费算力。
     # 增加 D_MODEL=16 探底，看看更极端的微型网络会不会泛化更好
     'E_LAYERS': [1],
-    'D_MODEL': [16, 32, 64],
+    'D_MODEL': [64],
 
     # 🛡️ 极致防过拟合：
-    'DROPOUT': [0.3, 0.4, 0.5, 0.6],
+    'DROPOUT': [0.4],
 
     # 步伐大小：
-    'LEARNING_RATE': [1e-4, 5e-5, 1e-5],
+    'LEARNING_RATE': [1e-4],
 
     # ⚖️ 赔率与胜率的天平 (极其精细地扫描 0.025 附近的黄金坑)：
-    'CLASS_THRESHOLD': [0.023, 0.025, 0.027],
+    'CLASS_THRESHOLD': [0.027],
     
     'EPOCHS': [100] # 固定 100 轮交由余弦退火和早停控制
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_CSV = PROJECT_ROOT / "data" / "train" / "optimization_results.csv"
+sys.path.append(str(PROJECT_ROOT))
+from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR
+
+RESULTS_CSV = TRAIN_DATA_DIR / "optimization_results.csv"
 
 def extract_metrics(output):
     metrics = {'win_rate': 0.0, 'final_equity': 0.0, 'sharpe': 0.0, 'trades': 0}
@@ -70,7 +74,10 @@ def run_experiment(params):
     backtest_out = ""
     
     for script in scripts:
-        script_path = PROJECT_ROOT / "historical_pipeline" / script
+        if script == 'train_itransformer.py':
+            script_path = HISTORICAL_DIR / script
+        else:
+            script_path = BACKTEST_DIR / script
         result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
         if result.returncode != 0:
             return {"error": f"\n💥 {script} 崩溃了！真实报错日志如下:\n{result.stderr}", **params}
@@ -83,8 +90,8 @@ def run_experiment(params):
     
     # 并发产生的文件极多，回测完务必删掉模型和JSON释放硬盘！
     try:
-        os.remove(PROJECT_ROOT / "model" / f"itransformer_BTCUSDT_best_{exp_id}.pth")
-        os.remove(PROJECT_ROOT / "data" / "train" / f"dynamic_thresholds_{exp_id}.json")
+        #os.remove(MODEL_DIR / f"itransformer_BTCUSDT_best_{exp_id}.pth")
+        os.remove(TRAIN_DATA_DIR / f"dynamic_thresholds_{exp_id}.json")
     except: pass
     
     return res

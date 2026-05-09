@@ -11,7 +11,7 @@ from pathlib import Path
 import json
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID
+from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID
 
 
 # ==========================================
@@ -37,7 +37,6 @@ class InvertedTransformer(nn.Module):
         return dec_out.mean(dim=1)
 
 def run_backtest():
-    MODEL_DIR = PROJECT_ROOT / "model"
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
     model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
     
@@ -106,7 +105,7 @@ def run_backtest():
     # 🏦 基于置信度的动态状态机
     # ==========================================
     # 自动加载 check_prob_distribution 生成的分位数阈值
-    json_path = PROJECT_ROOT / "data" / "train" / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+    json_path = TRAIN_DATA_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
     if not json_path.exists():
         print("❌ 找不到 dynamic_thresholds.json，请先运行 check_prob_distribution.py！")
         return
@@ -252,7 +251,7 @@ def run_backtest():
     plt.legend(facecolor='#1e1e1e', labelcolor='white')
     plt.grid(True, alpha=0.1, color='white')
     
-    plot_path = PROJECT_ROOT / "data" / "train" / "backtest_probabilistic.png"
+    plot_path = TRAIN_DATA_DIR / "backtest_probabilistic.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='#121212')
     print(f"\n📈 最终资金曲线已生成: {plot_path}")
 

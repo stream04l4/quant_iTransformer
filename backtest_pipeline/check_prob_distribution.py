@@ -8,11 +8,10 @@ import json
 # 引入之前的模型架构和配置
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, BATCH_SIZE, EPOCHS, EXPERIMENT_ID
-from train_itransformer import InvertedTransformer
+from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, BATCH_SIZE, EPOCHS, EXPERIMENT_ID
+from historical_pipeline.train_itransformer import InvertedTransformer
 
 def check_distribution():
-    MODEL_DIR = PROJECT_ROOT / "model"
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
     model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
     
@@ -100,7 +99,7 @@ def check_distribution():
         "down_top_5": float(np.percentile(p_down, 95)),
         "down_top_10": float(np.percentile(p_down, 90))
     }
-    json_path = PROJECT_ROOT / "data" / "train" / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+    json_path = TRAIN_DATA_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
     with open(json_path, "w") as f:
         json.dump(thresholds, f)
     print(f"💾 动态分位数阈值已生成并保存至: {json_path.name}")
