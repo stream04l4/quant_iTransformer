@@ -217,11 +217,11 @@ def run_backtest():
                     
                 active_sl_pct = -abs(HARD_SL)
                 if is_trailing:
-                    # 💡 核心修复：丝滑追踪止损。
-                    # 最高浮盈回撤 5%（指杠杆后的净值回撤 5%）就立刻收网。
+                    # 💡 修正：正常的阶梯追踪止损，跟随最高浮盈上移。
+                    # 当且仅当浮盈减去回撤容忍度(5%)后依然大于0时，止损线才会变成正数锁定利润。
+                    # 否则，允许止损线在硬止损 (HARD_SL) 和成本线之间活动，给予行情呼吸空间。
                     trailing_sl = max_unrealized_pnl - 0.05
-                    # 强制保本锁：一旦 24 小时后处于盈利开启了追踪，哪怕行情剧震，止损线也绝对不能跌穿 0.0 (平本线)
-                    active_sl_pct = max(0.0, trailing_sl)
+                    active_sl_pct = max(-abs(HARD_SL), trailing_sl)
                 
                 # 🚨 极其严苛的回测规则：同一分钟内若既触发止损又触发止盈，【优先判定止损】！
                 # 这能彻底消灭“天地针”带来的回测虚假乐观。
@@ -249,10 +249,10 @@ def run_backtest():
 
             # 如果这 1 小时走完了都没触发平仓，检查 AI 是否发生了概率反转
             if not close_position and not liquidated:
-                if current_pos == 1 and p_down > th["down_top_0.1"]:
+                if current_pos == 1 and p_down > th["down_top_1"]:
                     close_position = True
                     actual_exit_pct = close_pnl_pct
-                elif current_pos == -1 and p_up > th["up_top_0.1"]:
+                elif current_pos == -1 and p_up > th["up_top_1"]:
                     close_position = True
                     actual_exit_pct = close_pnl_pct
 

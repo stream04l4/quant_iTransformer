@@ -9,46 +9,29 @@ from pathlib import Path
 import time
 import sys
 
-# 新增一个配置：当检测到参数唯一时，重复训练几次来找寻最优模型？
-SINGLE_MODE_REPEATS = 5
 # ==========================================
-# 1. 通宵级全维寻优空间 (总计 1296 组)
+# 1. 通宵级全维寻优空间 
 # ==========================================
 SEARCH_SPACE = {
-    # 🎯 观测视野 (Alpha 的时间尺度) - 4 个维度
-    # 168(一周) 抓极速动量；336(两周) 和 504(三周) 抓中期；720(一个月) 测试能否学会宏观趋势
-    'SEQ_LEN': [168, 336, 504, 720],
-
-    # ⚖️ 赔率与胜率天平 (开仓的严苛程度) - 6 个维度
-    # 从 0.02 到 0.045 极细致地扫描。阈值越高，交易越少，但也越容易躲过震荡市的回撤
-    'CLASS_THRESHOLD': [0.02, 0.025, 0.03, 0.035, 0.04, 0.045],
-
-    # 🧠 模型脑容量与非线性深度 - 6 个维度 (2 x 3)
-    # E_LAYERS 加到 2 层测试特征组合能力；D_MODEL 探底 32 (极致防过拟合)，摸高 128 (赋予更多参数量)
-    'E_LAYERS': [1, 2],
-    'D_MODEL': [32, 64, 128],
-
-    # 🛡️ 正则化与防弹衣 - 3 个维度
-    # 0.3 轻度防守，0.4 标准防守，0.5 极限防守 (强迫网络在每次前向传播时忘掉一半特征)
-    'DROPOUT': [0.3, 0.4, 0.5],
-
-    # 🏃‍♂️ 寻路步长 (配合余弦退火) - 3 个维度
-    # 测试在 100 轮里，到底哪种步长能完美走到全局最优点
-    'LEARNING_RATE': [5e-5, 1e-4, 3e-4],
-
-    # 📌 算力锁死区
+    'SEQ_LEN': [168],
+    'CLASS_THRESHOLD': [0.024],
+    'E_LAYERS': [2],
+    'D_MODEL': [64],
+    'DROPOUT': [0.4],
+    'LEARNING_RATE': [5e-5],
     'BATCH_SIZE': [256],
     'EPOCHS': [100] 
 }
 
+SINGLE_MODE_REPEATS = 32
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR
+from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR, SYMBOL
 
 RESULTS_CSV = TRAIN_DATA_DIR / "optimization_results.csv"
 
 def extract_metrics(output):
-    # 增加新的维度捕获
     metrics = {
         'win_rate': 0.0, 'final_equity': 0.0, 'sharpe': 0.0, 'trades': 0,
         'max_drawdown': 0.0, 'profit_factor': 0.0, 'calmar': 0.0, 'ls_ratio': 0.0
@@ -65,7 +48,8 @@ def extract_metrics(output):
         if match := re.search(r"共计交易: (\d+) 笔 .*多空比: ([\d\.inf]+)", output): 
             metrics['trades'] = int(match.group(1))
             metrics['ls_ratio'] = float(match.group(2)) if match.group(2) != 'inf' else 999.0
-    except: pass
+    except Exception: 
+        pass
     return metrics
 
 def run_experiment(params, is_grid_search):
@@ -88,7 +72,7 @@ def run_experiment(params, is_grid_search):
         script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
         result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
         if result.returncode != 0:
-            return {"error": f"\n💥 {script} 崩溃了！真实报错日志:\n{result.stderr}", **params}
+            return {"error": f"💥 {script} 报错:\n{result.stderr}", **params}
         if script == 'backtest_itransformer.py':
             backtest_out = result.stdout
             
@@ -96,17 +80,17 @@ def run_experiment(params, is_grid_search):
     res.update(params)
     res['exp_id'] = exp_id
     
-    # 🚨 双模式清理逻辑
+    # 子进程内的即时清理 (防积压第一道防线)
     model_file_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
     if is_grid_search:
-        # 网格寻优模式：跑完就删，节约硬盘
-        try: os.remove(model_file_path) except: pass
+        try: os.remove(model_file_path) 
+        except FileNotFoundError: pass
         res['model_file'] = "Deleted (Grid Search)"
     else:
-        # 单一复训模式：保留模型，并在表格中记录名字
         res['model_file'] = model_file_path.name
 
-    try: os.remove(TRAIN_DATA_DIR / f"dynamic_thresholds_{exp_id}.json") except: pass
+    try: os.remove(TRAIN_DATA_DIR / f"dynamic_thresholds_{exp_id}.json") 
+    except FileNotFoundError: pass
     
     return res
 
@@ -118,29 +102,60 @@ def main():
     
     if not is_grid_search:
         print(f"🔍 模式切换：检测到参数唯一，进入【稳健性盲盒模式】...")
-        print(f"   将使用相同参数运行 {SINGLE_MODE_REPEATS} 次，并保留所有过程模型，以便你挑选夏普最高的种子。")
         combinations = [combinations[0] for _ in range(SINGLE_MODE_REPEATS)]
     else:
-        print(f"🔥 模式切换：检测到多种参数组合，进入【海量并发寻优模式】...")
-        print(f"   共 {len(combinations)} 组矩阵，过程中产生的冗余模型将会被自动销毁。")
+        print(f"🔥 模式切换：进入【海量并发寻优模式】...")
 
     MAX_WORKERS = 16 
+    total_tasks = len(combinations)
+    
+    # 🚨 核心逻辑：将任务切分为多个批次 (Chunking)
+    batches = [combinations[i:i + MAX_WORKERS] for i in range(0, total_tasks, MAX_WORKERS)]
+    
+    print(f"📦 任务已被切分为 {len(batches)} 个批次，每批最大 {MAX_WORKERS} 组。将执行严格的批次清理。")
+    print("=" * 70)
+
     all_results = []
     start_time = time.time()
+    completed_tasks = 0
     
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(run_experiment, params, is_grid_search): params for params in combinations}
+    for batch_idx, batch in enumerate(batches, 1):
+        print(f"\n🚀 正在拉起第 {batch_idx}/{len(batches)} 批次 (包含 {len(batch)} 组模型) ...")
         
-        for count, future in enumerate(as_completed(futures), 1):
-            res = future.result()
-            all_results.append(res)
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(run_experiment, params, is_grid_search): params for params in batch}
             
-            if "error" in res:
-                print(f"[{count}/{len(combinations)}] ❌ 失败: {res['error']}")
-            else:
-                # 打印出带有回撤的新日志
-                print(f"[{count}/{len(combinations)}] ✅ 夏普: {res['sharpe']:.2f} | 净值: {res['final_equity']:.2f} | 回撤: {res['max_drawdown']:.2f}% | 模型: {res['model_file']}")
+            for future in as_completed(futures):
+                res = future.result()
+                all_results.append(res)
+                completed_tasks += 1
+                
+                # 动态进度条计算
+                progress_pct = (completed_tasks / total_tasks) * 100
+                progress_str = f"[{completed_tasks}/{total_tasks} - {progress_pct:.1f}%]"
+                
+                if "error" in res:
+                    print(f"   {progress_str} ❌ 失败: {res['error'].splitlines()[0]}") # 只打首行防刷屏
+                else:
+                    print(f"   {progress_str} ✅ 夏普: {res['sharpe']:>5.2f} | 净值: {res['final_equity']:>5.2f} | 回撤: {res['max_drawdown']:>6.2f}%")
+        
+        # 🚨 每个批次结束后的“第二道防线”：物理级强制扫盘清场
+        pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
+        
+        if is_grid_search:
+            swept_files = 0
+            for f in MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_EXP_*.pth"):
+                try: os.remove(f); swept_files += 1 
+                except Exception: pass
+            for f in TRAIN_DATA_DIR.glob("dynamic_thresholds_EXP_*.json"):
+                try: os.remove(f); swept_files += 1 
+                except Exception: pass
             
-            pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
+        print(f"🧹 第 {batch_idx} 批次收尾完毕 | CSV已更新 | 强制清场扫描清理了 {swept_files if is_grid_search else 0} 个僵尸残余。")
 
-    print(f"\n🎉 任务完毕！总耗时: {(time.time() - start_time) / 60:.2f} 分钟。结果已保存至 {RESULTS_CSV.name}")
+    print("=" * 70)
+    print(f"🎉 寻优任务大功告成！总耗时: {(time.time() - start_time) / 60:.2f} 分钟。")
+    print(f"💾 所有结果已安全保存至 {RESULTS_CSV.name}")
+
+if __name__ == "__main__":
+    main()
