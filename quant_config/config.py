@@ -20,6 +20,7 @@ TEMP_DIR = TRAIN_DATA_DIR / "raw_temp"
 PROCESSED_AGGTRADES_DIR = TRAIN_DATA_DIR / "processed" / "aggtrades_1h"
 PROCESSED_MAIN_DIR = TRAIN_DATA_DIR / "processed" / "main_features_1h"
 MODEL_DIR = PROJECT_ROOT / "model"
+LOG_DIR = LIVE_DATA_DIR / "logs"
 
 # ==========================================
 # 2. 交易标的与业务参数 (Trading & Features)
@@ -66,19 +67,26 @@ HOLD_PERIOD = 24
 HARD_TP = 0.5           # 绝对止盈线 50% 
 HARD_SL = 0.3           # 绝对止损线 50% 
 
+# --- 实盘专用风控与仓位参数 ---
+LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
+TRADE_COOLDOWN_SEC = 3600            # 开仓后防连续发车冷却时间(秒)
+MAX_MACRO_IMPACT = 0.015            # 宏观情绪对模型输出概率的最大干预幅度
+MACRO_CHECK_INTERVAL = 1800         # 宏观情报拉取间隔(秒)
+HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
+
 
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)
 # ==========================================
 EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
-SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 336))
+SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 168))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 100))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-4))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-5))
 
 D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))
-E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 1))
+E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.027))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.024))

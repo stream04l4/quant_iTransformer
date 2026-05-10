@@ -23,7 +23,7 @@ SEARCH_SPACE = {
     'EPOCHS': [100] 
 }
 
-SINGLE_MODE_REPEATS = 32
+SINGLE_MODE_REPEATS = 48
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
@@ -89,7 +89,7 @@ def run_experiment(params, is_grid_search):
     else:
         res['model_file'] = model_file_path.name
 
-    try: os.remove(TRAIN_DATA_DIR / f"dynamic_thresholds_{exp_id}.json") 
+    try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
     except FileNotFoundError: pass
     
     return res
@@ -147,7 +147,7 @@ def main():
             for f in MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_EXP_*.pth"):
                 try: os.remove(f); swept_files += 1 
                 except Exception: pass
-            for f in TRAIN_DATA_DIR.glob("dynamic_thresholds_EXP_*.json"):
+            for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
                 try: os.remove(f); swept_files += 1 
                 except Exception: pass
             

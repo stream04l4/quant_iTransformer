@@ -12,32 +12,31 @@ import threading
 from state_manager import state
 import sqlite3
 import os
-from quant_config.config import DATA_DIR
-
+from datetime import datetime
+from quant_config.config import (
+    DATA_DIR, LIVE_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, CLASS_THRESHOLD, 
+    MODEL_DIR, DROPOUT, SYMBOL, AUX_SYMBOLS,
+    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD, 
+    TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL
+)
 # ==========================================
 # 1. 加载实盘配置 (对齐 1296 次寻优跑出的终极神级参数)
 # ==========================================
-SYMBOL = "BTC/USDT"
 GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-SEQ_LEN = 336
-D_MODEL = 64
-E_LAYERS = 1
-# 注意：自适应架构参数 (N_HEADS=4, D_FF=256) 会在初始化时自己计算
-
 # 🚨 极其重要：把我们在网格搜索中跑出的神级模型的绝对路径填好！
 # 如果你没改文件名，大概率长这样，请替换为你本地真实的路径
-MODEL_PATH = "model/itransformer_BTCUSDT_best_EXP_xxxxx.pth" 
+MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_default_run.pth" 
 # 对应的概率门槛文件
-JSON_PATH = "data/train/dynamic_thresholds_EXP_xxxxx.json"
+JSON_PATH = MODEL_DIR / "dynamic_thresholds_default_run.json"
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
 # ==========================================
 def get_macro_sentiment_score():
     """实时读取最新的宏观情绪得分"""
-    db_path = os.path.join(DATA_DIR, "macro_intelligence.db")
+    db_path = os.path.join(LIVE_DATA_DIR, "macro_intelligence.db")
     if not os.path.exists(db_path):
         return 0.0 # 找不到数据库，默认宏观中性
 
@@ -55,16 +54,100 @@ def get_macro_sentiment_score():
         
     return 0.0
 # ==========================================
-# 2. 特征工程构建器 (复刻回测逻辑)
+# 2. 特征工程构建器 (严禁补零，严格对齐)
 # ==========================================
-def compute_features(df_1h, snapshot):
-    """根据历史K线和网关快照，构建与训练完全对齐的 23 维宽表"""
-    df = df_1h.copy()
+def fetch_gateway_snapshot(sym):
+    """从本地网关拉取指定币种快照"""
+    # 格式化请求符号，兼容网关的 REST 解析
+    request_sym = sym.replace("/", "") 
+    try:
+        resp = requests.get(f"{GATEWAY_URL}/{request_sym}", timeout=2)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+def fetch_derivatives_history(sym):
+    """直接从 Binance 拉取 fundingRate 和 premiumIndexKlines 的历史以修复时序特征崩塌"""
+    clean_sym = sym.replace('/', '')
+    try:
+        # 获取溢价指数历史 (1h), limit=500
+        url_premium = f"https://fapi.binance.com/fapi/v1/premiumIndexKlines?symbol={clean_sym}&interval=1h&limit=500"
+        r_premium = requests.get(url_premium, timeout=5)
+        if r_premium.status_code == 200:
+            premium_data = r_premium.json()
+            df_premium = pd.DataFrame(premium_data)
+            df_premium['hour_timestamp'] = pd.to_datetime(df_premium[0], unit='ms')
+            df_premium['premium_close'] = df_premium[4].astype(float)
+            df_premium = df_premium[['hour_timestamp', 'premium_close']]
+        else:
+            df_premium = None
+            
+        # 获取资金费率历史
+        url_funding = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={clean_sym}&limit=500"
+        r_funding = requests.get(url_funding, timeout=5)
+        if r_funding.status_code == 200:
+            funding_data = r_funding.json()
+            df_funding = pd.DataFrame(funding_data)
+            df_funding['hour_timestamp'] = pd.to_datetime(df_funding['fundingTime'], unit='ms')
+            df_funding['funding_rate'] = df_funding['fundingRate'].astype(float)
+            df_funding = df_funding[['hour_timestamp', 'funding_rate']]
+        else:
+            df_funding = None
+            
+        return df_premium, df_funding
+    except Exception as e:
+        print(f"⚠️ 拉取衍生品历史失败: {e}")
+        return None, None
+
+def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
+    """根据主备网关快照，严格重组 23 维特征矩阵。出现任何缺失值直接报错"""
     
-    # === 1. 基础价格转换 ===
+    # 1. 重建主 K 线体系
+    df = pd.DataFrame(main_snap['ohlcv_1h'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # 🚨 【核心修复】：物理剔除当前正在生成的“未闭合”K线，保持与离线训练的绝对同构！
+    # 获取当前整点小时的时间戳 (毫秒)
+    current_hour_ts = int(datetime.utcnow().timestamp() / 3600) * 3600000
+    if df['timestamp'].iloc[-1] >= current_hour_ts:
+        df = df.iloc[:-1] # 毫不留情地丢弃它，只用已闭合的历史
+        
+    df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # 【门槛校验】：至少需要 336(模型窗口) + 168(Z-Score窗口) = 504 根 K 线
+    required_len = SEQ_LEN + 168
+    if len(df) < required_len:
+        raise ValueError(f"主K线历史长度不足 (需>={required_len}，当前{len(df)})，拒绝产生信号。")
+
+    # 2. 缝合横截面辅助数据 (严密防守现货接口丢包)
+    df_eth = pd.DataFrame(eth_usdt_snap['ohlcv_1h'], columns=['timestamp', 'open_e', 'high_e', 'low_e', 'eth_usdt_close', 'volume_e'])
+    df_ethbtc = pd.DataFrame(eth_btc_snap['ohlcv_1h'], columns=['timestamp', 'open_eb', 'high_eb', 'low_eb', 'eth_btc_close', 'volume_eb'])
+    
+    df = df.merge(df_eth[['timestamp', 'eth_usdt_close']], on='timestamp', how='left')
+    df = df.merge(df_ethbtc[['timestamp', 'eth_btc_close']], on='timestamp', how='left')
+    
+    # 🚨 缝合衍生品历史 (修复时序坍塌)
+    df_premium, df_funding = fetch_derivatives_history(SYMBOL)
+    if df_premium is not None:
+        df = df.merge(df_premium, on='hour_timestamp', how='left')
+    else:
+        df['premium_close'] = 0.0
+        
+    if df_funding is not None:
+        df = df.merge(df_funding, on='hour_timestamp', how='left')
+    else:
+        df['funding_rate'] = 0.0
+        
+    # 🚨 核心对齐：复刻离线的 strategy="forward"，防止单点丢包引发整个矩阵崩溃
+    df['eth_usdt_close'] = df['eth_usdt_close'].ffill().bfill()
+    df['eth_btc_close'] = df['eth_btc_close'].ffill().bfill()
+    df['premium_close'] = df['premium_close'].ffill().bfill()
+    df['funding_rate'] = df['funding_rate'].ffill().bfill()
+
+    # === 3. 基础指标计算 (同离线一致) ===
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
     df['body_strength'] = (df['close'] - df['open']) / df['open']
-    
     ma_200 = df['close'].ewm(span=200, adjust=False).mean()
     df['ma_bias'] = (df['close'] - ma_200) / ma_200
     
@@ -74,18 +157,14 @@ def compute_features(df_1h, snapshot):
     df['upper_shadow'] = (df['high'] - max_open_close) / high_low_range
     df['lower_shadow'] = (min_open_close - df['low']) / high_low_range
     
-    # === 2. 技术指标 (复刻) ===
-    # Bollinger Bands Squeeze
     rolling_mean_20 = df['close'].rolling(window=20).mean()
     rolling_std_20 = df['close'].rolling(window=20).std()
     df['bb_squeeze'] = (rolling_std_20 * 4) / (rolling_mean_20 + 1e-9)
     
-    # PPO (Percentage Price Oscillator) 替代 MACD
     ppo_line = (df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()) / (df['close'].ewm(span=26, adjust=False).mean() + 1e-9)
     ppo_signal = ppo_line.ewm(span=9, adjust=False).mean()
     df['ppo_hist'] = ppo_line - ppo_signal
     
-    # RSI 14 & 48 (压缩至 [-1, 1] 范围)
     delta = df['close'].diff()
     gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
@@ -95,30 +174,54 @@ def compute_features(df_1h, snapshot):
     loss_48 = (-delta.clip(upper=0)).ewm(span=48, adjust=False).mean()
     df['rsi_48'] = ((100 - (100 / (1 + gain_48 / (loss_48 + 1e-9)))) - 50) / 50.0
     
-    # === 3. 周期时间编码 ===
-    df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['hour_sin'] = np.sin(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['hour_cos'] = np.cos(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['week_sin'] = np.sin(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
     df['week_cos'] = np.cos(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
     
-    # === 4. 微观特征与缺失数据对齐 (填充中性值 0) ===
-    # 实盘网关目前未提供这些高阶订单流与横截面数据，暂时置 0 以保证张量形状匹配，避免推断崩溃
-    df['taker_ratio'] = snapshot.get('taker_buy_ratio_15m', 0.5) 
-    df['vpt_zscore'] = 0.0
-    df['net_taker_vol_zscore'] = 0.0
-    df['funding_rate'] = snapshot.get('funding_rate', 0.0)
-    df['premium_delta'] = 0.0
-    df['eth_log_return'] = 0.0
-    df['eth_btc_return'] = 0.0
-    df['cvd_zscore'] = snapshot.get('liquidation_vol_15m', 0.0) # 临时代理
-    df['whale_net_flow_zscore'] = 0.0
-    df['retail_ratio'] = 0.1
+    df['eth_log_return'] = np.log(df['eth_usdt_close'] / df['eth_usdt_close'].shift(1))
+    df['eth_btc_return'] = np.log(df['eth_btc_close'] / df['eth_btc_close'].shift(1))
+
+    # === 4. 微观订单流时序重组 ===
+    taker_stats = main_snap.get('taker_stats_1h', {})
+    if not taker_stats:
+        raise ValueError("微观特征提取失败：网关未返回任何 taker_stats_1h 数据。")
+        
+    taker_df = pd.DataFrame.from_dict(taker_stats, orient='index')
+    taker_df.index.name = 'timestamp'
+    taker_df.index = taker_df.index.astype('int64') 
+    taker_df = taker_df.reset_index()
     
-    df.fillna(method='bfill', inplace=True)
-    df.fillna(0, inplace=True)
+    # 物理左连接对齐 K 线时间轴
+    df = df.merge(taker_df, on='timestamp', how='left')
     
-    # === 🚨 必须与 train_itransformer.py 的 self.feature_cols 完全一致 ===
+    # 衍生订单流计算 (精准对齐离线方程)
+    df['taker_ratio'] = df['taker_buy_volume'] / (df['volume'] + 1e-9)
+    df['net_taker_vol'] = df['taker_buy_volume'] - df['taker_sell_volume']
+    df['vpt'] = df['quote_volume'] / (df['count'] + 1e-9)
+    df['cvd'] = df['taker_buy_volume'] - df['taker_sell_volume']
+    df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
+    
+    # 🚨 核心对齐：使用真实撮合总量作为分母，取代粗糙的 K 线 volume
+    df['total_trade_vol'] = df['taker_buy_volume'] + df['taker_sell_volume']
+    df['retail_ratio'] = df['retail_vol'] / (df['total_trade_vol'] + 1e-9)
+
+    # === 5. 衍生品特征衍生 ===
+    # 此时 funding_rate 已在第 2 步成功 join 并且带有真实的 8 小时阶梯特征
+    # premium_close 也已带有真实的 1 小时时序波动
+    df['premium_delta'] = df['premium_close'] - df['premium_close'].shift(1)
+
+    # === 6. 严苛的 168 小时 Z-Score 截断 (Pandas 复刻 Polars MAD) ===
+    rolling_cols = ["vpt", "net_taker_vol", "cvd", "whale_net_flow"]
+    for c in rolling_cols:
+        median = df[c].rolling(window=168, min_periods=1).median()
+        mad = (df[c] - median).abs().rolling(window=168, min_periods=1).median()
+        df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
+
+    # 🚨 防御 inf 污染：将除法可能产生的 inf 踢回为 NaN，交由熔断器处理
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # === 7. 特征列切片与终极物理熔断 ===
     feature_cols = [
         "log_return", "body_strength", "ma_bias", "upper_shadow", "lower_shadow",
         "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", "vpt_zscore", "net_taker_vol_zscore",
@@ -126,7 +229,17 @@ def compute_features(df_1h, snapshot):
         "hour_sin", "hour_cos", "week_sin", "week_cos", "cvd_zscore", "whale_net_flow_zscore", "retail_ratio"
     ]
     
-    return df[feature_cols]
+    final_df = df[feature_cols].copy()
+    
+    # 截取最后的 SEQ_LEN 给模型推断
+    inference_window = final_df.iloc[-SEQ_LEN:]
+    
+    # 🚨 物理熔断机制：拒绝任何形态的空值！
+    if inference_window.isnull().any().any():
+        missing_cols = inference_window.columns[inference_window.isnull().any()].tolist()
+        raise ValueError(f"🚨 实盘数据特征矩阵出现断层！包含空值的列: {missing_cols}。拒绝输出预测信号！")
+        
+    return inference_window
 
 # ==========================================
 # 3. 实盘主循环
@@ -148,7 +261,8 @@ def run_live():
         d_model=D_MODEL, 
         n_heads=dynamic_n_heads, 
         d_ff=dynamic_d_ff, 
-        e_layers=E_LAYERS
+        e_layers=E_LAYERS,
+        dropout=DROPOUT
     ).to(DEVICE)
     
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -159,109 +273,144 @@ def run_live():
         thresholds = json.load(f)
     print(f"📥 加载分位数风控: {thresholds}")
     
+    # ==========================================
+    # 🎯 频段隔离器：初始化各种频率的控制阀
+    # ==========================================
+    last_inferred_hour = 0
+    cached_p_down, cached_p_flat, cached_p_up = 0.0, 0.0, 0.0
+    
+    last_macro_check = 0.0
+    cached_macro_score = 0.0
+    
+    last_trade_hour = 0  # 核心修正：使用 K 线的时间戳代替物理时间
+    last_trade_signal = 0
+    latest_closed_ts = 0
+
     while True:
         try:
-            # 1. 抓取网关切片
-            resp = requests.get(f"{GATEWAY_URL}/{SYMBOL.replace('/', '_')}")
+            # ---------------------------------------------------------
+            # ⚡ [10秒级 Tick] 高频抓取与风控心跳
+            # ---------------------------------------------------------
+            resp = requests.get(f"{GATEWAY_URL}/{SYMBOL}", timeout=2)
             if resp.status_code != 200:
-                print(f"等待网关预热... {resp.text}")
-                time.sleep(10)
+                time.sleep(2)
                 continue
-                
             snapshot = resp.json()
-            ohlcv = snapshot['ohlcv_1h']
-            
-            # 转为 DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # 2. 算子提取与拼接
-            features_df = compute_features(df, snapshot)
-            
-            # 3. 截取最近的 336 根 K 线
-            if len(features_df) < SEQ_LEN:
-                print(f"数据不足，当前 K 线数: {len(features_df)}")
-                time.sleep(10)
-                continue
-                
-            input_window = features_df.iloc[-SEQ_LEN:].values
-            
-            input_raw = features_df.iloc[-SEQ_LEN:].values.astype('float32')
-            
-            # 5. 张量化送入大脑 (无需 Scaler，模型内部已含 RevIN)
-            x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            
-            with torch.no_grad():
-                logits = model(x_tensor)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-                
-            p_down, p_flat, p_up = probs[0], probs[1], probs[2]
-            
-            # ==========================================
-            # 6. 风控撮合与动态微调 (微观主导，宏观辅助)
-            # ==========================================
-            # 1. 获取最新宏观情绪得分 (范围 [-1, 1])
-            macro_score = get_macro_sentiment_score() 
-            
-            # 2. 💡 核心算法：微调 Softmax 置信度
-            # MAX_MACRO_IMPACT 定义了宏观情绪的“最大辅助干预权限”。
-            # 设置为 0.015 (1.5%) 意味着：即使 DeepSeek 给出最极端的 +1.0 狂热得分，
-            # 它也只能给做多方向额外加上 1.5% 的概率辅助。
-            # 由于模型的原生概率（主导力量）通常跨度高达 30%~60%，这 1.5% 只会在“临门一脚”时发挥作用！
-            MAX_MACRO_IMPACT = 0.015 
-            
-            # 计算宏观情绪带来的概率 Buff (为正则利多，为负则利空)
-            macro_buff = macro_score * MAX_MACRO_IMPACT
-            
-            # 将 Buff 叠加到 AI 的原生微观置信度上
-            adj_p_up = p_up + macro_buff
-            adj_p_down = p_down - macro_buff
+            current_time = time.time()
+            current_price = snapshot['current_price']
 
-            print(f"\n[{snapshot['server_time']}] 💰 {SYMBOL} 最新价: {snapshot['current_price']}")
-            print(f"🧠 [宏观辅助] 情绪得分: {macro_score:+.2f} | 施加置信度偏移: {macro_buff:+.4f}")
-            print(f"🎯 [原生微观] 📉 看跌: {p_down:.4f} | ⚪ 震荡: {p_flat:.4f} | 📈 看涨: {p_up:.4f}")
-            print(f"⚖️ [综合裁决] 📉 修正看跌: {adj_p_down:.4f} | 📈 修正看涨: {adj_p_up:.4f}")
+            # 👇 【关键补充】将最新价格更新到全局状态机，供后端的 bailout_worker (阶梯止损) 随时读取
+            try:
+                state.update_price(SYMBOL, current_price)
+            except Exception:
+                pass # 兼容你可能的 state_manager 写法
+
+            # ---------------------------------------------------------
+            # ⏱️ [30分钟级 Tick] 宏观情报低频轮询
+            # ---------------------------------------------------------
+            # 超过 MACRO_CHECK_INTERVAL 才去读一次数据库更新宏观得分
+            if current_time - last_macro_check > MACRO_CHECK_INTERVAL:
+                cached_macro_score = get_macro_sentiment_score()
+                last_macro_check = current_time
+                print(f"📡 [宏观雷达] 已刷新宏观情绪得分: {cached_macro_score:+.2f}")
+
+            # ---------------------------------------------------------
+            # ⏳ [1小时级 Tick] 深度学习微观特征矩阵推理
+            # ---------------------------------------------------------
+            if len(snapshot['ohlcv_1h']) >= 2:
+                # 倒数第二根是已闭合的完整 K 线
+                latest_closed_ts = snapshot['ohlcv_1h'][-2][0] 
+                
+                # 只有跨入新的一小时，才执行沉重的 Transformer 张量计算
+                if latest_closed_ts != last_inferred_hour:
+                    print(f"\n🔄 [换线时刻] 侦测到 K 线闭合 (TS: {latest_closed_ts})，开始重构 23 维张量...")
+                    
+                    eth_usdt_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[0]}").json()
+                    eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
+                    
+                    features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
+                    input_raw = features_df.iloc[-SEQ_LEN:].values.astype('float32')
+                    x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                    
+                    with torch.no_grad():
+                        logits = model(x_tensor)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                        
+                    cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
+                    last_inferred_hour = latest_closed_ts
+                    print(f"✅ 微观推理完成！本小时基准概率 -> 📉空:{cached_p_down:.4f} | ⚪平:{cached_p_flat:.4f} | 📈多:{cached_p_up:.4f}")
+
+            # ---------------------------------------------------------
+            # ⚔️ [10秒级 Tick] 实时高频信号撮合
+            # ---------------------------------------------------------
+            # 虽然模型概率 1 小时变一次，宏观 30 分钟变一次，
+            # 只要有任何一边发生了改变，或者价格触发了特定条件，这里每 10 秒都会进行一次拦截判断
+            macro_buff = cached_macro_score * MAX_MACRO_IMPACT
             
+            adj_p_up = cached_p_up + macro_buff
+            adj_p_down = cached_p_down - macro_buff
+
+            # 👇 【新增：输出状态给监控塔 UI】
+            try:
+                status_data = {
+                    "latest_kline_ts": latest_closed_ts,
+                    "macro_score": cached_macro_score,
+                    "p_up": float(cached_p_up),
+                    "p_flat": float(cached_p_flat),
+                    "p_down": float(cached_p_down),
+                    "adj_p_up": float(adj_p_up),
+                    "adj_p_down": float(adj_p_down),
+                    "current_price": current_price,
+                    "updated_at": current_time
+                }
+                with open(os.path.join(LIVE_DATA_DIR, "live_status.json.tmp"), "w") as f:
+                    json.dump(status_data, f)
+                os.replace(os.path.join(LIVE_DATA_DIR, "live_status.json.tmp"), os.path.join(LIVE_DATA_DIR, "live_status.json"))
+            except Exception: pass
+
             signal = 0
-            # 依然使用网格搜索跑出来的、不容篡改的物理阈值门槛！
-            if adj_p_up > thresholds['up_top_5']:
+            dynamic_leverage = 0.0
+
+            if adj_p_up > thresholds['up_top_1']:
                 signal = 1
-                print("🔥 [开仓指令] 综合置信度突破看涨红线！启动多头 OMS...")
+                dynamic_leverage = LEVERAGE_3
+            elif adj_p_up > thresholds['up_top_5']:
+                signal = 1
+                dynamic_leverage = LEVERAGE_2
+            elif adj_p_up > thresholds['up_top_10']:
+                signal = 1
+                dynamic_leverage = LEVERAGE_1
+            elif adj_p_down > thresholds['down_top_1']:
+                signal = -1
+                dynamic_leverage = LEVERAGE_3
             elif adj_p_down > thresholds['down_top_5']:
                 signal = -1
-                print("🔥 [开仓指令] 综合置信度突破看跌红线！启动空头 OMS...")
-            else:
-                print("⏳ 综合置信度被阈值拦截，持币观望...")
+                dynamic_leverage = LEVERAGE_2
+            elif adj_p_down > thresholds['down_top_10']:
+                signal = -1
+                dynamic_leverage = LEVERAGE_1
             
-            # 👇 将信号发送给执行系统 (OMS)
             if signal != 0:
-                try:
-                    free_usdt = float(state.portfolio_memory.get('balance', {}).get('USDT', {}).get('free', 100.0))
-                except Exception:
-                    free_usdt = 100.0 
-                    
-                trade_margin = max(free_usdt * 0.05, 10.0) 
-                
-                # OMS 扣动扳机
-                success, actual_margin = execute_gate_trade(
-                    symbol=SYMBOL,
-                    signal=signal,
-                    leverage=2,
-                    current_price=snapshot['current_price'],
-                    tp_pct=0.08,
-                    sl_pct=0.04,
-                    risk_margin_usd=trade_margin
-                )
-                
-                if success:
-                    print(f"✅ 交易指令已成功送达并成交，动用保证金: ${actual_margin:.2f}")
+                # 完美物理对齐：使用 K 线闭合时间戳做锁定，彻底消灭物理时间的毫秒级误差！
+                if latest_closed_ts == last_trade_hour and signal == last_trade_signal:
+                    pass # 同一根 K 线内同方向静默跳过
                 else:
-                    print("❌ 交易指令执行失败，已被 OMS 拦截。")
+                    print(f"\n[{snapshot['server_time']}] 🔥 突破红线！最新价: {current_price} | 发送 OMS 指令 (杠杆: {dynamic_leverage}x)...")
+                    success, actual_margin = execute_gate_trade(
+                        symbol=SYMBOL, signal=signal, leverage=dynamic_leverage,
+                        current_price=current_price,
+                        tp_pct=HARD_TP, sl_pct=HARD_SL, risk_margin_usd=LIVE_RISK_MARGIN_USD
+                    )
+                    if success:
+                        print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
+                        last_trade_hour = latest_closed_ts
+                        last_trade_signal = signal
                 
         except Exception as e:
-            print(f"❌ 预测引擎异常: {e}")
+            print(f"❌ 主循环异常: {e}")
             
-        # 每隔 15 秒预测一次 (因为订单薄和成交是秒级变的，即便 K 线没走完，特征也会变)
-        time.sleep(15)
+        # 稳定维持 10 秒的心跳，给 bailout_worker 提供充足的反应时间
+        time.sleep(HEARTBEAT_INTERVAL)
 
 if __name__ == "__main__":
     run_live()

@@ -116,7 +116,7 @@ def check_distribution():
         "down_top_10": float(np.percentile(p_down, 90))
     }
     
-    json_path = TRAIN_DATA_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+    json_path = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
     with open(json_path, "w") as f:
         json.dump(thresholds, f)
     print(f"💾 历史防作弊动态分位数阈值已生成并保存至: {json_path.name}")

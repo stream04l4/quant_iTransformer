@@ -8,7 +8,7 @@ import re
 import yfinance as yf
 from datetime import datetime
 from dotenv import load_dotenv
-from quant_config.config import DATA_DIR, LOG_DIR
+from quant_config.config import LIVE_DATA_DIR, LOG_DIR
 
 # 👇 激活 .env 文件读取
 load_dotenv()
@@ -22,7 +22,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-DB_NAME = os.path.join(DATA_DIR, "macro_intelligence.db")
+DB_NAME = os.path.join(LIVE_DATA_DIR, "macro_intelligence.db")
 
 def init_db():
     """初始化宏观情报数据库"""

@@ -10,6 +10,10 @@ from execution_oms import log_system_alert
 from quant_config.config import *
 
 
+from quant_config.config import *
+from dotenv import load_dotenv
+load_dotenv()
+
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
 
@@ -34,7 +38,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
         except: pass
         
         # 3. 落库：历史本纪
-        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{base_sym.replace('/', '_')}.db")
+        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{base_sym}.db")
         with sqlite3.connect(db_name, timeout=10.0, check_same_thread=False) as conn_log:
             cursor = conn_log.cursor()
             try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
@@ -93,10 +97,10 @@ def bailout_worker():
             import concurrent.futures
             
             def fetch_snap(p):
-                base_sym = p['symbol'].split(':')[0]
+                base_sym = p['symbol'].split(':')[0].replace('/', '')
                 try:
                     # 【优化1】：将 timeout 从 1.0 降低到 0.2。本地网关 200ms 拿不到数据直接丢弃，不要阻塞主轮询
-                    resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym.replace('/', '_')}", timeout=0.2)
+                    resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym}", timeout=0.2)
                     if resp.status_code == 200:
                         return p, base_sym, resp.json()
                 except Exception:

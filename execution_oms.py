@@ -11,7 +11,8 @@ import threading
 from ccxt.base.errors import NetworkError, ExchangeError, RequestTimeout
 from state_manager import state
 from quant_config.config import *
-
+from dotenv import load_dotenv
+load_dotenv()
 
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
@@ -59,7 +60,7 @@ def portfolio_sync_worker():
                 pos = sync_ex.fetch_positions()
                 state.portfolio_memory['positions'] = pos
                 
-                active_pos_map = {p['symbol'].split(':')[0]: p for p in pos if float(p.get('contracts', 0)) > 0}
+                active_pos_map = {p['symbol'].split(':')[0].replace('/', ''): p for p in pos if float(p.get('contracts', 0)) > 0}
                 with state.pos_lock:
                     dead_keys = [k for k in list(state.active_pos_map.keys()) if k not in active_pos_map]
                     for k in dead_keys:
@@ -96,8 +97,8 @@ def portfolio_sync_worker():
                 'open_stops': state.portfolio_memory.get('open_stops', []),
                 'updated_at': time.time()
             })
-            tmp_file = os.path.join(DATA_DIR, "portfolio_state.json.tmp")
-            target_file = os.path.join(DATA_DIR, "portfolio_state.json")
+            tmp_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json.tmp")
+            target_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json")
             with open(tmp_file, "w") as f:
                 json.dump(sync_state, f)
             os.replace(tmp_file, target_file)
@@ -148,22 +149,48 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
     try:
         # 【核心修复】：彻底抛弃 Gate 原生的下划线写法，拥抱 CCXT 跨平台标准永续符号
         # 构建 CCXT 标准合约代码格式，例如: 'APT/USDT' -> 'APT/USDT:USDT'
-        gate_symbol = symbol + ":" + symbol.split('/')[1]
+        if symbol.endswith("USDT"):
+            gate_symbol = f"{symbol[:-4]}/USDT:USDT"
+        else:
+            gate_symbol = symbol + ":" + symbol.split('/')[1]
         side = 'buy' if signal == 1 else 'sell'
         # 👇 新增这一行：将旧的局部变量名直接映射到我们预热好的全局单例上
         exchange_private = global_gate
 
         # ---------------------------------------------------------
-        # 1. 仓位互斥锁：防止同一币种重复开仓
+        # 1. 仓位互斥锁与反转引擎：防止重复同向开仓，支持反向平仓反转
         # ---------------------------------------------------------
         order_sent = False # 👇 新增标志位
         positions = exchange_private.fetch_positions([gate_symbol])
         for pos in positions:
             if float(pos.get('contracts', 0)) > 1e-8:
-                msg = f"🔒 仓位锁拦截：{gate_symbol} 当前已有存续仓位，拒绝重复开仓。"
-                print("⚠️", msg)
-                log_system_alert("⚠️ 拦截", symbol, msg)
-                return False, 0.0
+                current_pos_side = str(pos.get('side', '')).lower()
+                
+                # 侦测到信号反转：当前持有长单但新信号是空单，或者相反
+                if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
+                    msg = f"🔄 侦测到 AI 预测反转信号！当前持有 {current_pos_side.upper()}，最新强烈预测方向为 {side.upper()}。执行平仓反转逻辑。"
+                    print("⚠️", msg)
+                    log_system_alert("🔄 信号反转", symbol, msg)
+                    
+                    close_side = 'buy' if current_pos_side == 'short' else 'sell'
+                    try:
+                        # 1. 市价平旧仓
+                        exchange_private.create_order(symbol=gate_symbol, type='market', side=close_side, amount=float(pos['contracts']), params={'reduceOnly': True})
+                        # 2. 清扫旧的 OCO 止盈止损单
+                        for o in exchange_private.fetch_open_orders(gate_symbol, params={'stop': True}):
+                            try: exchange_private.cancel_order(o['id'], gate_symbol, params={'stop': True})
+                            except: pass
+                            
+                        print(f"✅ 旧有 {current_pos_side.upper()} 仓位已平仓完毕。为严格对齐回测，将进入冷却期等待下一个时间窗口...")
+                        return True, 0.0 # 👈 核心修正：仅平仓并返回，交由 live_pipeline 的冷却机制等待下个周期
+                    except Exception as e:
+                        print(f"❌ 反转平仓失败，为保护保证金，拒绝开启反向仓位: {e}")
+                        return False, 0.0
+                else:
+                    msg = f"🔒 仓位锁拦截：{gate_symbol} 当前已有同向存续仓位，拒绝重复加仓。"
+                    print("⚠️", msg)
+                    log_system_alert("⚠️ 拦截", symbol, msg)
+                    return False, 0.0
 
         # ---------------------------------------------------------
         # 2. 面值与张数计算 (工业级精度适配与风控智能压降)
@@ -261,8 +288,11 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         slippage = abs(actual_fill_price - current_price) / current_price
         
         # 基于真实的成交均价，计算物理止盈止损位
-        tp_price = actual_fill_price * (1 + tp_pct) if side == 'buy' else actual_fill_price * (1 - tp_pct)
-        sl_price = actual_fill_price * (1 - sl_pct) if side == 'buy' else actual_fill_price * (1 + sl_pct)
+        # 统一量纲：传入的 tp_pct 和 sl_pct 是带杠杆的预期收益率/亏损率，因此需要除以杠杆得到实际的 K 线涨跌幅
+        actual_tp_move = abs(tp_pct) / leverage
+        actual_sl_move = abs(sl_pct) / leverage
+        tp_price = actual_fill_price * (1 + actual_tp_move) if side == 'buy' else actual_fill_price * (1 - actual_tp_move)
+        sl_price = actual_fill_price * (1 - actual_sl_move) if side == 'buy' else actual_fill_price * (1 + actual_sl_move)
 
         # ---------------------------------------------------------
         # 【核心修复 1：使用 Gate.io 原生条件平仓单 (彻底解决互斥与占用)】
@@ -301,14 +331,14 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         print(
             f"✅ ⚡ [Gate模拟盘] 下单成功！方向：{side.upper()} | 数量：{order_amount} 张 {gate_symbol}。\n"
             f"🎯 进场均价: ${actual_fill_price:.4f} (滑点 {slippage:.3%})\n"
-            f"💰 硬性止盈 (TP): ${tp_price:.4f} (预期 ROE +{tp_pct * leverage:.2%})\n"
-            f"🛡️ 硬性止损 (SL): ${sl_price:.4f} (极限亏损 -{sl_pct * leverage:.2%})"
+            f"💰 硬性止盈 (TP): ${tp_price:.4f} (预期 ROE +{abs(tp_pct):.2%})\n"
+            f"🛡️ 硬性止损 (SL): ${sl_price:.4f} (极限亏损 -{abs(sl_pct):.2%})"
         )
 
         # ---------------------------------------------------------
         # 4. 真实订单特征落库（live_trades 表）
         # ---------------------------------------------------------
-        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol.replace('/', '_')}.db")
+        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol}.db")
         with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS live_trades
@@ -354,15 +384,17 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     log_system_alert("✅ 超时抢救", symbol, msg_ok)
                     
                     # 👇 【修复 2：兜底价格计算】因为断网拿不到实际成交价，强制用当前盘口价测算防线
-                    fallback_tp_price = current_price * (1 + tp_pct) if side == 'buy' else current_price * (1 - tp_pct)
-                    fallback_sl_price = current_price * (1 - sl_pct) if side == 'buy' else current_price * (1 + sl_pct)
+                    actual_tp_move = abs(tp_pct) / leverage
+                    actual_sl_move = abs(sl_pct) / leverage
+                    fallback_tp_price = current_price * (1 + actual_tp_move) if side == 'buy' else current_price * (1 - actual_tp_move)
+                    fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
                     
                     # 立刻挂载 OCO 条件单，堵住超时裸奔漏洞
                     safe_post_condition(sl_rule, fallback_sl_price, "sl")
                     safe_post_condition(tp_rule, fallback_tp_price, "tp")
                     
                     # 超时抢救成功后兜底落库
-                    db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol.replace('/', '_')}.db")
+                    db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol}.db")
                     try:
                         with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
                             cursor = conn.cursor()

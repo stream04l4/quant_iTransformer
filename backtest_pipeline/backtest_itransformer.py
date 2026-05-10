@@ -91,7 +91,7 @@ def run_backtest():
     # ==========================================
     # 🏦 基于 1h 决策 + 1m 显微镜追踪的双轨状态机
     # ==========================================
-    json_path = TRAIN_DATA_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+    json_path = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
     if not json_path.exists():
         print("❌ 找不到 dynamic_thresholds.json，请先运行 check_prob_distribution.py！")
         return
