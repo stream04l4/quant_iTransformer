@@ -240,7 +240,9 @@ def save_settings():
         "initial_capital": st.session_state.get("ui_initial_capital", s.get("initial_capital", 10000.0)),
         "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget", 0.02)),
         "target_risk": st.session_state.get("ui_risk", s.get("target_risk", 30.0)),
+        "target_profit": st.session_state.get("ui_profit", s.get("target_profit", 60.0)),
         "excursion": st.session_state.get("ui_excursion", s.get("excursion", 1.5)),
+        "max_macro_impact": st.session_state.get("ui_macro_impact", s.get("max_macro_impact", 1.5)),
         "use_xgboost": st.session_state.get("ui_use_xgboost", s.get("use_xgboost")),
         "beta_thresh": st.session_state.get("ui_beta_thresh", s.get("beta_thresh", 0.001) * 100) / 100.0,
         "max_dd_limit": st.session_state.get("ui_max_dd_limit", s.get("max_dd_limit")),
@@ -1319,17 +1321,21 @@ with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
 with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     st.caption("基于波动率平价的机构级算仓防线与实时风控联动。")
     user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
-    user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.05, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
+    user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.5, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
+    user_target_profit = st.slider("单笔目标 ROE 止盈 (%)", min_value=10.0, max_value=200.0, value=float(st.session_state.settings.get("target_profit", 60.0)), step=5.0, key="ui_profit", on_change=save_settings, disabled=lock_params, help="硬止盈线 (如60%代表ROE盈利60%止盈)")
     user_target_risk = st.slider("单笔最高容忍 ROE 亏损 (%)", min_value=10.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", 30.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params, help="硬止损线 (如30%代表ROE亏损30%止损)")
     
     st.markdown("#### 💡 物理硬止损保护")
     user_excursion = st.slider("物理硬止损拉伸宽幅 ⚠️ (越大越防插针)", min_value=0.50, max_value=3.00, value=float(st.session_state.settings.get("excursion", 1.5)), step=0.1, key="ui_excursion", on_change=save_settings, disabled=lock_params)
 
-    # 👇 新增：右脑阈值专区
     st.markdown("#### 🧠 右脑高频熔断阈值")
     st.caption("防插针过滤：结合量价的三重并发锁，识别真伪瀑布。")
     user_bailout_atr_multi = st.slider("价格瀑布乘数 (ATR)", min_value=1.5, max_value=8.0, value=float(st.session_state.settings.get("bailout_atr_multi", 2.5)), step=0.1, key="ui_bailout_atr_multi", on_change=save_settings, disabled=lock_params, help="1分钟内跌幅超过该倍数的 ATR 才会触发警报")
     user_bailout_vol_multi = st.slider("异常爆量乘数 (Volume)", min_value=1.5, max_value=10.0, value=float(st.session_state.settings.get("bailout_vol_multi", 3.0)), step=0.5, key="ui_bailout_vol_multi", on_change=save_settings, disabled=lock_params, help="下跌时的成交量必须大于过去15分钟均量的该倍数，以过滤无量假摔插针")
+
+    # 👇 新增：宏观干预专区
+    st.markdown("#### 🌐 宏观情报干预")
+    user_macro_impact = st.slider("宏观情绪干预幅度 (%)", min_value=0.0, max_value=5.0, value=float(st.session_state.settings.get("max_macro_impact", 1.5)), step=0.1, key="ui_macro_impact", on_change=save_settings, disabled=lock_params, help="宏观得分对AI原始概率的最大增减幅度 (如1.5%代表情绪极度狂热时，看涨概率强行增加1.5%)")
 
 st.sidebar.divider()
 

@@ -27,9 +27,9 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🚨 极其重要：把我们在网格搜索中跑出的神级模型的绝对路径填好！
 # 如果你没改文件名，大概率长这样，请替换为你本地真实的路径
-MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_default_run.pth" 
+MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_1.pth" 
 # 对应的概率门槛文件
-JSON_PATH = MODEL_DIR / "dynamic_thresholds_default_run.json"
+JSON_PATH = MODEL_DIR / "dynamic_thresholds_1.json"
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
@@ -247,37 +247,48 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 def run_live():
     print("🚀 极速实盘预测引擎启动...")
     threading.Thread(target=bailout_worker, daemon=True).start()
-    # 1. 加载神级模型
-    print(f"📥 加载最优权重: {MODEL_PATH}")
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    feature_cols = checkpoint['feature_cols']
+    # 1. 加载 5 个神级模型形成议会
+    models = []
+    thresholds_list = []
+    feature_cols = None
     
     dynamic_n_heads = max(2, D_MODEL // 16) 
     dynamic_d_ff = D_MODEL * 4
     
-    model = InvertedTransformer(
-        num_variates=len(feature_cols), 
-        seq_len=SEQ_LEN, 
-        d_model=D_MODEL, 
-        n_heads=dynamic_n_heads, 
-        d_ff=dynamic_d_ff, 
-        e_layers=E_LAYERS,
-        dropout=DROPOUT
-    ).to(DEVICE)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    # 2. 加载对应的风控门槛
-    with open(JSON_PATH, 'r') as f:
-        thresholds = json.load(f)
-    print(f"📥 加载分位数风控: {thresholds}")
+    for i in range(1, 6):
+        m_path = MODEL_DIR / f"itransformer_BTCUSDT_best_{i}.pth"
+        j_path = MODEL_DIR / f"dynamic_thresholds_{i}.json"
+        
+        print(f"📥 加载席位 {i} 权重: {m_path}")
+        checkpoint = torch.load(m_path, map_location=DEVICE, weights_only=False)
+        if feature_cols is None:
+            feature_cols = checkpoint['feature_cols']
+            
+        model = InvertedTransformer(
+            num_variates=len(feature_cols), 
+            seq_len=SEQ_LEN, 
+            d_model=D_MODEL, 
+            n_heads=dynamic_n_heads, 
+            d_ff=dynamic_d_ff, 
+            e_layers=E_LAYERS,
+            dropout=DROPOUT
+        ).to(DEVICE)
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        models.append(model)
+        
+        with open(j_path, 'r') as f:
+            thresholds_list.append(json.load(f))
+            
+    print(f"✅ 成功组建 5 节点 AI 议会。")
     
     # ==========================================
     # 🎯 频段隔离器：初始化各种频率的控制阀
     # ==========================================
     last_inferred_hour = 0
     cached_p_down, cached_p_flat, cached_p_up = 0.0, 0.0, 0.0
+    cached_probs_list = [[0.0, 0.0, 0.0] for _ in range(5)]
     
     last_macro_check = 0.0
     cached_macro_score = 0.0
@@ -319,9 +330,9 @@ def run_live():
             base_risk = float(ui_config.get("base_risk_budget", 0.02))
             dynamic_margin_usd = initial_cap * base_risk if initial_cap * base_risk > 0 else LIVE_RISK_MARGIN_USD
             
-            target_risk = float(ui_config.get("target_risk", 30.0)) / 100.0
-            dynamic_sl = target_risk
-            dynamic_tp = target_risk * 1.5
+            # 优先读取前端 UI 的止盈止损，若无则使用 config.py 作为保底
+            dynamic_sl = float(ui_config.get("target_risk", HARD_SL * 100.0)) / 100.0
+            dynamic_tp = float(ui_config.get("target_profit", HARD_TP * 100.0)) / 100.0
 
             # 👇 【关键补充】将最新价格更新到全局状态机，供后端的 bailout_worker (阶梯止损) 随时读取
             try:
@@ -363,10 +374,14 @@ def run_live():
                     x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                     
                     with torch.no_grad():
-                        logits = model(x_tensor)
-                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                        cached_probs_list = []
+                        for m in models:
+                            logits = m(x_tensor)
+                            cached_probs_list.append(torch.softmax(logits, dim=1).cpu().numpy()[0])
                         
-                    cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
+                    # 计算议会平均概率用于监控展示
+                    avg_probs = np.mean(cached_probs_list, axis=0)
+                    cached_p_down, cached_p_flat, cached_p_up = avg_probs[0], avg_probs[1], avg_probs[2]
                     last_inferred_hour = latest_closed_ts
                     current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
                     print(f"✅ [{current_time_str} UTC] 微观推理完成！本小时基准概率 -> 📉空:{cached_p_down:.4f} | ⚪平:{cached_p_flat:.4f} | 📈多:{cached_p_up:.4f}")
@@ -378,12 +393,13 @@ def run_live():
             # ---------------------------------------------------------
             # 虽然模型概率 1 小时变一次，宏观 30 分钟变一次，
             # 只要有任何一边发生了改变，或者价格触发了特定条件，这里每 10 秒都会进行一次拦截判断
-            macro_buff = cached_macro_score * MAX_MACRO_IMPACT
+            dynamic_macro_impact = float(ui_config.get("max_macro_impact", MAX_MACRO_IMPACT * 100.0)) / 100.0
+            macro_buff = cached_macro_score * dynamic_macro_impact
             
             adj_p_up = cached_p_up + macro_buff
             adj_p_down = cached_p_down - macro_buff
 
-            # 👇 【新增：输出状态给监控塔 UI】
+            # 👇 【新增：输出状态给监控塔 UI (依然显示平均概率)】
             try:
                 status_data = {
                     "latest_kline_ts": latest_closed_ts,
@@ -403,33 +419,46 @@ def run_live():
 
             signal = 0
             dynamic_leverage = 0.0
-
-            if adj_p_up > thresholds['up_top_1']:
-                signal = 1
-                dynamic_leverage = LEVERAGE_3
-            elif adj_p_up > thresholds['up_top_5']:
-                signal = 1
-                dynamic_leverage = LEVERAGE_2
-            elif adj_p_up > thresholds['up_top_10']:
-                signal = 1
-                dynamic_leverage = LEVERAGE_1
-            elif adj_p_down > thresholds['down_top_1']:
-                signal = -1
-                dynamic_leverage = LEVERAGE_3
-            elif adj_p_down > thresholds['down_top_5']:
-                signal = -1
-                dynamic_leverage = LEVERAGE_2
-            elif adj_p_down > thresholds['down_top_10']:
-                signal = -1
-                dynamic_leverage = LEVERAGE_1
             
+            # 👇 进行议会投票
+            directions = []
+            leverages = []
+            
+            for i in range(5):
+                m_p_down, m_p_flat, m_p_up = cached_probs_list[i]
+                m_adj_p_up = m_p_up + macro_buff
+                m_adj_p_down = m_p_down - macro_buff
+                thresh = thresholds_list[i]
+                
+                sig = 0
+                lev = 0.0
+                if m_adj_p_up > thresh['up_top_1']: sig = 1; lev = LEVERAGE_3
+                elif m_adj_p_up > thresh['up_top_5']: sig = 1; lev = LEVERAGE_2
+                elif m_adj_p_up > thresh['up_top_10']: sig = 1; lev = LEVERAGE_1
+                elif m_adj_p_down > thresh['down_top_1']: sig = -1; lev = LEVERAGE_3
+                elif m_adj_p_down > thresh['down_top_5']: sig = -1; lev = LEVERAGE_2
+                elif m_adj_p_down > thresh['down_top_10']: sig = -1; lev = LEVERAGE_1
+                
+                directions.append(sig)
+                leverages.append(lev)
+                
+            long_votes = directions.count(1)
+            short_votes = directions.count(-1)
+            
+            if long_votes >= 3:
+                signal = 1
+                dynamic_leverage = max([leverages[i] for i in range(5) if directions[i] == 1])
+            elif short_votes >= 3:
+                signal = -1
+                dynamic_leverage = max([leverages[i] for i in range(5) if directions[i] == -1])
+
             # 👇 新增：每次重推理（换线或宏观刷新）记录综合决策结论到前端
             if needs_evaluation_log:
-                action_str = "按兵不动 (未达门槛)"
+                action_str = f"按兵不动 (投票: 涨{long_votes} 跌{short_votes})"
                 if signal == 1:
-                    action_str = f"🚀 触发做多 (推荐杠杆: {dynamic_leverage}x)"
+                    action_str = f"🚀 触发做多 (通过 {long_votes}/5 票, 最终杠杆: {dynamic_leverage}x)"
                 elif signal == -1:
-                    action_str = f"🩸 触发做空 (推荐杠杆: {dynamic_leverage}x)"
+                    action_str = f"🩸 触发做空 (通过 {short_votes}/5 票, 最终杠杆: {dynamic_leverage}x)"
                     
                 is_duplicate = (latest_closed_ts == last_trade_hour and signal == last_trade_signal)
                 if signal != 0 and is_duplicate:
