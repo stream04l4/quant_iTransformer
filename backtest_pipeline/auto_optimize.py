@@ -91,6 +91,8 @@ def run_experiment(params, is_grid_search):
 
     try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
     except FileNotFoundError: pass
+    try: os.remove(TRAIN_DATA_DIR / f"backtest_probabilistic_{exp_id}.png")
+    except FileNotFoundError: pass
     
     return res
 
@@ -144,8 +146,11 @@ def main():
         
         if is_grid_search:
             swept_files = 0
-            for f in MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_EXP_*.pth"):
+            for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
                 try: os.remove(f); swept_files += 1 
+                except Exception: pass
+            for f in TRAIN_DATA_DIR.glob("backtest_probabilistic_EXP_*.png"):
+                try: os.remove(f); swept_files += 1
                 except Exception: pass
             for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
                 try: os.remove(f); swept_files += 1 

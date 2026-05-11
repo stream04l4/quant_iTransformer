@@ -60,15 +60,27 @@ def run_backtest():
     predictions_probs = []
     valid_timestamps = []
     
+    class FastSeqDataset(torch.utils.data.Dataset):
+        def __init__(self, data, seq_len):
+            self.data = torch.tensor(data, dtype=torch.float32)
+            self.seq_len = seq_len
+        def __len__(self):
+            return len(self.data) - self.seq_len
+        def __getitem__(self, idx):
+            return self.data[idx : idx + self.seq_len]
+
+    dataset = FastSeqDataset(X_test_raw, SEQ_LEN)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
+    
     with torch.no_grad():
-        for i in range(len(X_test_raw) - SEQ_LEN):
-            seq_x = X_test_raw[i : i + SEQ_LEN]
-            tensor_x = torch.from_numpy(seq_x).unsqueeze(0).to(DEVICE)
+        for batch_x in loader:
+            batch_x = batch_x.to(DEVICE)
             with torch.amp.autocast('cuda'):
-                logits = model(tensor_x)
-                probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
-            predictions_probs.append(probs)
-            valid_timestamps.append(test_timestamps[i + SEQ_LEN - 1])
+                logits = model(batch_x)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+            predictions_probs.extend(probs)
+            
+    valid_timestamps = test_timestamps[SEQ_LEN - 1 : len(X_test_raw) - 1].tolist()
 
     # 极速加载 1h 和 1m 的真实物理价格 (执行空间)
     raw_kline_dir = TEMP_DIR / "klines" / SYMBOL
@@ -79,14 +91,18 @@ def run_backtest():
         print(f"❌ 找不到原始 K 线，请先运行 build_main_features.py 完成下载！错误: {e}")
         return
 
-    ts_1h = df_1h["timestamp"].to_numpy()
+    # 🚨 降维打击：全部强制转换为 int64 的秒级 Unix 绝对时间，彻底消除 NumPy 精度错乱
+    ts_1h = df_1h["timestamp"].to_numpy().astype('datetime64[s]').astype(np.int64)
     opens_1h = df_1h["open"].to_numpy()
     closes_1h = df_1h["close"].to_numpy()
     
-    ts_1m = df_1m["timestamp"].to_numpy()
+    ts_1m = df_1m["timestamp"].to_numpy().astype('datetime64[s]').astype(np.int64)
     highs_1m = df_1m["high"].to_numpy()
     lows_1m = df_1m["low"].to_numpy()
     closes_1m = df_1m["close"].to_numpy()
+
+    # 专门为撮合引擎生成一份秒级信号时间戳 (画图依然保留原来的 datetime 格式)
+    valid_timestamps_sec = np.array(valid_timestamps).astype('datetime64[s]').astype(np.int64)
 
     # ==========================================
     # 🏦 基于 1h 决策 + 1m 显微镜追踪的双轨状态机
@@ -124,14 +140,18 @@ def run_backtest():
     print("\n⚔️ 正在执行工业级撮合 (1h 决策开仓 + 1m 盘中悲观碰撞)...")
     
     for i in range(len(predictions_probs)):
+        # 🚨 增加进度回显，打破静默卡死错觉
+        if i > 0 and i % 1000 == 0:
+            print(f"   ⏳ 已撮合 {i} / {len(predictions_probs)} 小时...")
+            
         if liquidated:
             equity_curve.append(0)
             if benchmark_prices: benchmark_prices.append(benchmark_prices[-1])
             continue
             
         p_down, p_flat, p_up = predictions_probs[i]
-        signal_time = valid_timestamps[i] 
-        exec_time = signal_time + np.timedelta64(1, 'h')
+        signal_time = valid_timestamps_sec[i] 
+        exec_time = signal_time + 3600  # 🚨 1小时 = 3600秒，极速纯整数加法
         exec_idx_1h = np.searchsorted(ts_1h, exec_time)
         
         if exec_idx_1h < len(closes_1h):
@@ -178,7 +198,7 @@ def run_backtest():
         # ------------------------------------------
         if current_pos != 0:
             start_1m_idx = np.searchsorted(ts_1m, entry_time)
-            chunk_end_time = exec_time + np.timedelta64(1, 'h') # 追踪到这 1 个小时结束
+            chunk_end_time = exec_time + 3600 # 🚨 1小时 = 3600秒，极速纯整数加法
             end_1m_idx = np.searchsorted(ts_1m, chunk_end_time)
             
             close_position = False
@@ -353,7 +373,7 @@ def run_backtest():
     plt.legend(facecolor='#1e1e1e', labelcolor='white')
     plt.grid(True, alpha=0.1, color='white')
     
-    plot_path = TRAIN_DATA_DIR / "backtest_probabilistic.png"
+    plot_path = TRAIN_DATA_DIR / f"backtest_probabilistic_{EXPERIMENT_ID}.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='#121212')
     print(f"\n📈 最终资金曲线已生成: {plot_path}")
 

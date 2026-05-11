@@ -35,7 +35,7 @@ FORECAST_HORIZON = 24    # 模型预测未来 24 小时
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
-DATA_START_MONTH = (2021, 1)   
+DATA_START_MONTH = (2023, 1)   
 DATA_END_MONTH = (2026, 4)     
 
 # ==========================================
@@ -43,7 +43,7 @@ DATA_END_MONTH = (2026, 4)
 # ==========================================
 BINANCE_BASE_URL_FUTURES = "https://data.binance.vision/data/futures/um/monthly"
 BINANCE_BASE_URL_SPOT = "https://data.binance.vision/data/spot/monthly"
-
+BINANCE_BASE_URL_METRICS_DAILY = "https://data.binance.vision/data/futures/um/daily/metrics"
 # 强制规范无表头 CSV 的字段名防错
 KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time", 
               "quote_volume", "count", "taker_buy_volume", "taker_buy_quote_volume", "ignore"]
@@ -53,6 +53,11 @@ FUNDING_COLS = ["calc_time", "funding_interval_hours", "last_funding_rate"]
 AGGTRADE_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id", 
                  "last_trade_id", "transact_time", "is_buyer_maker"]
 
+METRICS_COLS = [
+    "create_time", "symbol", "sum_open_interest", "sum_open_interest_value", 
+    "count_toptrader_long_short_ratio", "sum_toptrader_long_short_ratio", 
+    "count_long_short_ratio", "sum_taker_long_short_vol_ratio"
+]
 # ==========================================
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
@@ -82,7 +87,7 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 168))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
-EPOCHS = int(os.environ.get("OPT_EPOCHS", 100))
+EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
 LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-5))
 
 D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))

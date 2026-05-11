@@ -15,7 +15,7 @@ sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, EXPERIMENT_ID, 
     SEQ_LEN, BATCH_SIZE, EPOCHS, LEARNING_RATE, 
-    D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD
+    D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, FORECAST_HORIZON
 )
 # ==========================================
 # 1. iTransformer 模型核心架构 (维度倒置)
@@ -69,11 +69,12 @@ class CryptoDataset(Dataset):
         print(f"📦 正在加载数据集 ({'训练' if is_train else '验证'}): {Path(parquet_path).name}")
         df = pl.read_parquet(parquet_path)
         
-        exclude_cols = ["hour_timestamp", "target_24h_return"]
+        target_col = f"target_{FORECAST_HORIZON}h_return"
+        exclude_cols = ["hour_timestamp", target_col]
         self.feature_cols = [c for c in df.columns if c not in exclude_cols]
         
         X = df.select(self.feature_cols).to_numpy().astype('float32')
-        Y_raw = df.select("target_24h_return").to_numpy().astype('float32').reshape(-1)
+        Y_raw = df.select(target_col).to_numpy().astype('float32').reshape(-1)
         
         THRESHOLD = CLASS_THRESHOLD
         Y_class = np.where(Y_raw > THRESHOLD, 2, 
