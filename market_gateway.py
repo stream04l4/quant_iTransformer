@@ -81,7 +81,7 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
             # 🛡️ 【看门狗防线】：90秒收不到任何 K 线跳动，强制视为假死并抛出异常
             ohlcvs = await asyncio.wait_for(
                 exchange.watch_ohlcv(swap_symbol, timeframe),
-                timeout=90.0
+                timeout=180.0
             )
             
             if was_dead:
@@ -97,23 +97,36 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
                 else:
                     q.append(candle)
                     
-        except asyncio.TimeoutError:
-            # 🚨 触发重连：由于我们有底层的 SQLite 兜底，这里只需简单的 WS 重连即可
-            print(f"   ⚠️ [WS 看门狗] {symbol} ({timeframe}) 超过 90 秒假死，触发 WebSocket 重连！")
-            # 强制清理底层死锁的 WS 客户端，促使下次调用重新发 SUBSCRIBE 请求
-            for url, client in list(exchange.clients.items()):
-                for f in list(client.futures.values()):
-                    if isinstance(f, list):
-                        for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
-                    else:
-                        f.add_done_callback(lambda x: x.exception())
-                client.reject(Exception(f"{symbol} ({timeframe}) K线流假死重连"))
-                exchange.clients.pop(url, None)
-            was_dead = True
-            await asyncio.sleep(2)
         except Exception as e:
-            print(f"   ❌ [WS 异常] {symbol} {timeframe}: {e}")
-            await asyncio.sleep(5)
+            is_timeout = isinstance(e, asyncio.TimeoutError)
+            err_str = str(e).lower()
+            
+            if "假死重连" in str(e):
+                # 兄弟线程已经把共享的 websocket 砸了重建，我们只需要默默跟随重连即可，不要大声喧哗
+                was_dead = True
+                await asyncio.sleep(1)
+                continue
+                
+            if is_timeout or "timeout" in err_str or "network" in err_str or "closed" in err_str:
+                if is_timeout:
+                    print(f"   ⚠️ [WS 看门狗] {symbol} ({timeframe}) 超过 180 秒无变动，触发 WebSocket 重连！")
+                else:
+                    print(f"   ⚠️ [WS 断线] {symbol} ({timeframe}) 连接异常: {e}，触发底舱清理与重连！")
+                
+                # 强制清理底层死锁的 WS 客户端，促使下次调用重新发 SUBSCRIBE 请求
+                for url, client in list(exchange.clients.items()):
+                    for f in list(client.futures.values()):
+                        if isinstance(f, list):
+                            for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
+                        else:
+                            f.add_done_callback(lambda x: x.exception())
+                    client.reject(Exception(f"底层引擎触发假死重连"))
+                    exchange.clients.pop(url, None)
+                was_dead = True
+                await asyncio.sleep(2)
+            else:
+                print(f"   ❌ [WS 未知异常] {symbol} {timeframe}: {type(e).__name__} -> {e}")
+                await asyncio.sleep(5)
 
 async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听盘口流 (增量自动合并) """
@@ -126,7 +139,7 @@ async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_del
             # 🛡️ 【看门狗防线】：90秒收不到盘口变动，强制视为假死
             orderbook = await asyncio.wait_for(
                 exchange.watch_order_book(swap_symbol, limit=100),
-                timeout=90.0
+                timeout=180.0
             )
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}盘口深度流已成功恢复！")
@@ -137,7 +150,7 @@ async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_del
                 "asks": orderbook['asks']
             }
         except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 盘口深度超过 90 秒无变动，触发假死重连！")
+            print(f"   ⚠️ [WS 看门狗] {symbol} 盘口深度超过 180 秒无变动，触发假死重连！")
             for url, client in list(exchange.clients.items()):
                 for f in list(client.futures.values()):
                     if isinstance(f, list):
@@ -163,7 +176,7 @@ async def ticker_loop(exchange, symbol, swap_symbol, engine_type, startup_delay)
             # 🛡️ 【看门狗防线】：90秒收不到最新价跳动，强制视为假死
             ticker = await asyncio.wait_for(
                 exchange.watch_ticker(swap_symbol),
-                timeout=90.0
+                timeout=180.0
             )
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}最新价流已成功恢复！")
@@ -172,7 +185,7 @@ async def ticker_loop(exchange, symbol, swap_symbol, engine_type, startup_delay)
             market_data_store[symbol]["ticker"]["last"] = ticker['last']
             market_data_store[symbol]["status"] = "live"
         except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 最新价超过 90 秒无跳动，触发假死重连！")
+            print(f"   ⚠️ [WS 看门狗] {symbol} 最新价超过 180 秒无跳动，触发假死重连！")
             for url, client in list(exchange.clients.items()):
                 for f in list(client.futures.values()):
                     if isinstance(f, list):
@@ -235,7 +248,7 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
         try:
             trades = await asyncio.wait_for(
                 exchange.watch_trades(swap_symbol),
-                timeout=90.0
+                timeout=180.0
             )
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}逐笔成交流已成功恢复！")
@@ -280,7 +293,7 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
                 del bucket[k]
                 
         except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 逐笔成交超时 90 秒，触发重连！")
+            print(f"   ⚠️ [WS 看门狗] {symbol} 逐笔成交超时 180 秒，触发重连！")
             for url, client in list(exchange.clients.items()):
                 for f in list(client.futures.values()):
                     if isinstance(f, list):
@@ -302,7 +315,7 @@ async def mark_price_loop(exchange, symbol, swap_symbol):
             # 币安 U 本位 WebSocket 原生包含 markPriceUpdate，CCXT 封装为 watch_mark_price
             mark_data = await asyncio.wait_for(
                 exchange.watch_mark_price(swap_symbol),
-                timeout=90.0
+                timeout=180.0
             )
             # info 中通常包含 'p' (Mark Price) 和 'i' (Index Price) 或者原生溢价率
             # 为了严谨对齐你离线里的 premium_close，我们保存为时序队列

@@ -308,11 +308,17 @@ def run_live():
             # ---------------------------------------------------------
             # ⏱️ [30分钟级 Tick] 宏观情报低频轮询
             # ---------------------------------------------------------
+            needs_evaluation_log = False
+            trigger_reason = ""
+            
             # 超过 MACRO_CHECK_INTERVAL 才去读一次数据库更新宏观得分
             if current_time - last_macro_check > MACRO_CHECK_INTERVAL:
                 cached_macro_score = get_macro_sentiment_score()
                 last_macro_check = current_time
-                print(f"📡 [宏观雷达] 已刷新宏观情绪得分: {cached_macro_score:+.2f}")
+                current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"📡 [{current_time_str} UTC] [宏观雷达] 已刷新宏观情绪得分: {cached_macro_score:+.2f}")
+                needs_evaluation_log = True
+                trigger_reason = "宏观得分刷新"
 
             # ---------------------------------------------------------
             # ⏳ [1小时级 Tick] 深度学习微观特征矩阵推理
@@ -338,7 +344,10 @@ def run_live():
                         
                     cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
                     last_inferred_hour = latest_closed_ts
-                    print(f"✅ 微观推理完成！本小时基准概率 -> 📉空:{cached_p_down:.4f} | ⚪平:{cached_p_flat:.4f} | 📈多:{cached_p_up:.4f}")
+                    current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"✅ [{current_time_str} UTC] 微观推理完成！本小时基准概率 -> 📉空:{cached_p_down:.4f} | ⚪平:{cached_p_flat:.4f} | 📈多:{cached_p_up:.4f}")
+                    needs_evaluation_log = True
+                    trigger_reason = f"新K线闭合推理 & {trigger_reason}" if trigger_reason else "新K线闭合重新推理"
 
             # ---------------------------------------------------------
             # ⚔️ [10秒级 Tick] 实时高频信号撮合
@@ -390,6 +399,28 @@ def run_live():
                 signal = -1
                 dynamic_leverage = LEVERAGE_1
             
+            # 👇 新增：每次重推理（换线或宏观刷新）记录综合决策结论到前端
+            if needs_evaluation_log:
+                action_str = "按兵不动 (未达门槛)"
+                if signal == 1:
+                    action_str = f"🚀 触发做多 (推荐杠杆: {dynamic_leverage}x)"
+                elif signal == -1:
+                    action_str = f"🩸 触发做空 (推荐杠杆: {dynamic_leverage}x)"
+                    
+                is_duplicate = (latest_closed_ts == last_trade_hour and signal == last_trade_signal)
+                if signal != 0 and is_duplicate:
+                    action_str += " [静默跳过: 本K线已同向发车]"
+                    
+                eval_log = (
+                    f"【触发原因】{trigger_reason}\n"
+                    f"【微观基准概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
+                    f"【宏观修正概率】📈多:{adj_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{adj_p_down:.4f} (宏观情绪增幅: {macro_buff:+.4f})\n"
+                    f"【引擎决策】{action_str}"
+                )
+                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 综合评估汇报:\n{eval_log}\n")
+                log_system_alert("🧠 决策评估", SYMBOL, eval_log)
+
+
             if signal != 0:
                 # 完美物理对齐：使用 K 线闭合时间戳做锁定，彻底消灭物理时间的毫秒级误差！
                 if latest_closed_ts == last_trade_hour and signal == last_trade_signal:

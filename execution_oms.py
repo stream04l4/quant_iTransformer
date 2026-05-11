@@ -131,7 +131,7 @@ def safe_api_call(func, *args, max_retries=3, initial_wait=1.0, **kwargs):
 def log_system_alert(level, symbol, message):
     """将底层系统警报写入独立数据库供前端实时呈现"""
     try:
-        with sqlite3.connect(os.path.join(DATA_DIR, "engine_system_logs.db"), timeout=5.0, check_same_thread=False) as sys_conn:
+        with sqlite3.connect(os.path.join(LIVE_DATA_DIR, "engine_system_logs.db"), timeout=5.0, check_same_thread=False) as sys_conn:
             sys_cursor = sys_conn.cursor()
             sys_cursor.execute('PRAGMA journal_mode=WAL;')
             # 创建专门的系统警报表

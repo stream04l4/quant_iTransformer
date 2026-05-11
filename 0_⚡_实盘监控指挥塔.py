@@ -16,7 +16,11 @@ import requests  # 新增：用于发送 Webhook 请求
 # 👇 新增这两行，激活 .env 读取
 from dotenv import load_dotenv
 load_dotenv()
-from quant_config.config import SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR
+from quant_config.config import SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS
+
+# --- 核心配置路径 ---
+CONFIG_JSON_FILE = os.path.join(LIVE_DATA_DIR, "ui_config.json")
+ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
 
 # --- UI 页面配置与高频轮询开关 ---
 st.set_page_config(page_title="TimesFM 预测引擎", layout="wide")
@@ -48,9 +52,9 @@ def render_status_dashboard():
     
     # --- 1. 核心进程存活检查 ---
     engine_alive = False
-    engine_db = os.path.join(DATA_DIR, "engine_system_logs.db")
-    if os.path.exists(engine_db):
-        if (time.time() - os.path.getmtime(engine_db)) < 120:
+    engine_status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
+    if os.path.exists(engine_status_file):
+        if (time.time() - os.path.getmtime(engine_status_file)) < 60:
             engine_alive = True
 
     # 👇 【新增】：WebSocket 极速网关存活检查
@@ -74,7 +78,7 @@ def render_status_dashboard():
         total = info.total / 1024**3
         
         # 10 分钟滚动峰值记录器
-        peak_file = os.path.join(DATA_DIR, "gpu_peak_mem.json")
+        peak_file = os.path.join(LIVE_DATA_DIR, "gpu_peak_mem.json")
         mem_history = []
         now_ts = time.time()
         
@@ -293,7 +297,7 @@ test_ex_instance = get_test_exchange()
 # --- 资产组合监控模块 (Portfolio Monitor) ---
 def get_gate_portfolio():
     """ 架构解耦：直接读取 engine.py 在后台写好的本地 JSON 快照，0 网络请求！"""
-    state_file = os.path.join(DATA_DIR, "portfolio_state.json")
+    state_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json")
     if not os.path.exists(state_file):
         return None, [], []
     try:
@@ -384,8 +388,8 @@ st.title("TimesFM 预测引擎")
 # 🧠 V3 宏观情报横幅 (DeepSeek Marquee)
 # ==========================================
 try:
-    if os.path.exists(os.path.join(DATA_DIR, "macro_intelligence.db")):
-        with sqlite3.connect(os.path.join(DATA_DIR, "macro_intelligence.db"), timeout=2.0) as m_conn:
+    if os.path.exists(os.path.join(LIVE_DATA_DIR, "macro_intelligence.db")):
+        with sqlite3.connect(os.path.join(LIVE_DATA_DIR, "macro_intelligence.db"), timeout=2.0) as m_conn:
             m_cur = m_conn.cursor()
             m_cur.execute("SELECT score, marquee_text, urgency, decision_ts FROM llm_decisions ORDER BY decision_ts DESC LIMIT 1")
             m_row = m_cur.fetchone()
@@ -432,9 +436,9 @@ def render_realtime_portfolio():
         try:
             # 1. 提前读取吊灯内存，用于算全局保底
             chandelier_mem = {}
-            if os.path.exists(os.path.join(DATA_DIR, "chandelier_state.json")):
+            if os.path.exists(os.path.join(LIVE_DATA_DIR, "chandelier_state.json")):
                 try:
-                    with open(os.path.join(DATA_DIR, "chandelier_state.json"), "r") as f:
+                    with open(os.path.join(LIVE_DATA_DIR, "chandelier_state.json"), "r") as f:
                         chandelier_mem = json.load(f)
                 except Exception: 
                     pass
@@ -1167,7 +1171,7 @@ st.sidebar.markdown("### 🚨 引擎实时警报")
 def render_sidebar_alerts():
     # 👇 剥离 sidebar 定位，改为普通 st.expander
     with st.expander("查看底层巡逻兵异常日志", expanded=True):
-        log_db_path = os.path.join(DATA_DIR, "engine_system_logs.db")
+        log_db_path = os.path.join(LIVE_DATA_DIR, "engine_system_logs.db")
         if os.path.exists(log_db_path):
             try:
                 with sqlite3.connect(log_db_path, timeout=5.0) as conn:
@@ -1249,10 +1253,13 @@ else:
 # ---------------------------------------------------------
 # 1. 状态初始化：从硬盘配置中读取当前存活的币种
 if "ui_active_symbols_state" not in st.session_state:
-    st.session_state["ui_active_symbols_state"] = st.session_state.settings.get("active_symbols", SYMBOL).copy()
+    _active = st.session_state.settings.get("active_symbols", ALL_SYMBOLS)
+    if isinstance(_active, str):
+        _active = [_active]
+    st.session_state["ui_active_symbols_state"] = _active.copy()
 
 # 判断当前是否处于“全选”状态
-is_all_selected = len(st.session_state["ui_active_symbols_state"]) == len(SYMBOL)
+is_all_selected = len(st.session_state["ui_active_symbols_state"]) == len(ALL_SYMBOLS)
 
 # 2. 核心回调函数：负责内存与硬盘的同步
 def sync_symbols_to_disk():
@@ -1266,7 +1273,7 @@ def sync_symbols_to_disk():
 def toggle_all():
     """触发了【全选】按钮的回调"""
     if st.session_state["select_all_toggle"]:
-        st.session_state["ui_active_symbols_state"] = SYMBOL.copy()
+        st.session_state["ui_active_symbols_state"] = ALL_SYMBOLS.copy()
     else:
         st.session_state["ui_active_symbols_state"] = [SYMBOL]
         st.toast("⚠️ 已取消全选，但系统风控要求至少保留一个监控标的。", icon="⚠️")
@@ -1303,7 +1310,7 @@ with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
     )
 
     # 渲染【子节点列表】
-    for sym in SYMBOL:
+    for sym in ALL_SYMBOLS:
         st.checkbox(
             f"　🔸 {sym}", 
             value=(sym in st.session_state["ui_active_symbols_state"]),
@@ -1313,29 +1320,6 @@ with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
             disabled=lock_params
         )
 # ---------------------------------------------------------
-with st.sidebar.expander("🌍 宏观环境与基础过滤", expanded=False):
-    st.caption("AI 海选阶段的最基础底线。建议口径放宽，由 XGBoost 负责终审把关。")
-    st.markdown("#### 💡 宏观环境指标过滤")
-    user_prob_thresh = st.slider("核心方向概率 (看涨/跌)", min_value=0.50, max_value=0.90, value=float(st.session_state.settings.get("prob_thresh", 0.52)), step=0.01, key="ui_prob", on_change=save_settings, disabled=lock_params)
-    user_score_thresh = st.slider("综合动能得分", min_value=0.2, max_value=1.5, value=float(st.session_state.settings.get("score_thresh", 0.6)), step=0.05, key="ui_score_thresh", on_change=save_settings, disabled=lock_params)
-    user_base_z = st.slider("基础物理量能红线 (RVOL / Z-Score)", min_value=0.2, max_value=2.0, value=float(st.session_state.settings.get("base_z", 0.8)), step=0.1, key="ui_base_z", on_change=save_settings, disabled=lock_params)
-    user_funding_limit = st.slider("资金费率拥挤红线", min_value=0.0001, max_value=0.0010, value=float(st.session_state.settings.get("funding_limit", 0.0003)), step=0.0001, format="%.4f", key="ui_funding_limit", on_change=save_settings, disabled=lock_params)
-    st.markdown("#### 💡 AI 蒙特卡洛矩阵过滤")
-    user_min_conf = st.slider("AI 确定性 (信噪比)", min_value=0.1, max_value=2.0, value=float(st.session_state.settings.get("min_conf", 0.15)), step=0.05, key="ui_min_conf", on_change=save_settings, disabled=lock_params)
-    user_consistency = st.slider("AI 路径一致性 (%)", min_value=0.30, max_value=0.80, value=float(st.session_state.settings.get("consistency", 0.45)), step=0.01, key="ui_consistency", on_change=save_settings, disabled=lock_params)
-    user_choppy_thresh = st.slider("震荡过滤灵敏度", min_value=0.001, max_value=0.050, value=float(st.session_state.settings.get("choppy_thresh", 0.0010)), step=0.001, format="%.3f", key="ui_choppy_thresh", on_change=save_settings, disabled=lock_params)
-        
-with st.sidebar.expander("⚖️ 趋势博弈与均值干预", expanded=False):
-    st.markdown("#### 1. 顺逆势打分补贴")
-    user_trend_penalty = st.slider("逆势惩罚阻力 (越高越难开单)", min_value=1.0, max_value=2.0, value=float(st.session_state.settings.get("trend_penalty", 1.2)), step=0.1, key="ui_trend_penalty", on_change=save_settings, disabled=lock_params)
-    user_trend_reward = st.slider("顺势开仓折扣 (越低越易开单)", min_value=0.5, max_value=1.0, value=float(st.session_state.settings.get("trend_reward", 0.6)), step=0.05, key="ui_trend_reward", on_change=save_settings, disabled=lock_params)
-
-    st.markdown("#### 2. 极端画门抢反弹 (动态门槛放松)")
-    user_reversion_bias = st.slider("触发乖离率红线 (%)", min_value=1.0, max_value=5.0, value=float(st.session_state.settings.get("reversion_bias", 2.0)), step=0.5, key="ui_reversion_bias", on_change=save_settings, disabled=lock_params)
-
-    st.markdown("#### 3. 相对强弱与路径保护")
-    user_beta_thresh = st.slider("最小相对大饼强弱要求 (%)", -10.0, 10.0, float(st.session_state.settings.get("beta_thresh", 0.001) * 100), step=0.01, key="ui_beta_thresh", on_change=save_settings, disabled=lock_params) / 100.0
-    user_max_dd_limit = st.slider("最大允许插针回撤 (%)", 1.0, 10.0, float(st.session_state.settings.get("max_dd_limit", 5.0)), step=0.5, key="ui_max_dd_limit", on_change=save_settings, disabled=lock_params)
 with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     st.caption("基于波动率平价的机构级算仓防线。")
     user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
@@ -1360,113 +1344,6 @@ with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     user_bailout_atr_multi = st.slider("价格瀑布乘数 (ATR)", min_value=1.5, max_value=8.0, value=float(st.session_state.settings.get("bailout_atr_multi", 2.5)), step=0.1, key="ui_bailout_atr_multi", on_change=save_settings, disabled=lock_params, help="1分钟内跌幅超过该倍数的 ATR 才会触发警报")
     user_bailout_vol_multi = st.slider("异常爆量乘数 (Volume)", min_value=1.5, max_value=10.0, value=float(st.session_state.settings.get("bailout_vol_multi", 3.0)), step=0.5, key="ui_bailout_vol_multi", on_change=save_settings, disabled=lock_params, help="下跌时的成交量必须大于过去15分钟均量的该倍数，以过滤无量假摔插针")
 
-with st.sidebar.expander(" 🧠 AI 模型应用中心", expanded=False):
-    st.caption("使用非线性机器学习大模型进行实盘信号最终胜率审查。")
-    
-    # 👇 移上来：大模型终审开关放在最显眼的位置
-    user_use_xgboost = st.toggle(
-        "🟢 启用 XGBoost 终审拦截", 
-        value=bool(st.session_state.settings.get("use_xgboost", False)), 
-        key="ui_use_xgboost", 
-        on_change=save_settings, 
-        disabled=lock_params,
-        help="开启后，所有符合规则的信号必须经过 XGBoost 推演才能开仓。"
-    )
-
-    if user_use_xgboost:
-        st.success("✅ AI 模型拦截已开启！系统当前由 XGBoost 接管开仓终审权。")
-        
-        # 👈 【修复】：防御 null 穿透导致 Streamlit UI 渲染树崩溃
-        _min_win_val = st.session_state.settings.get("xgb_min_win_rate")
-        safe_min_win = float(_min_win_val if _min_win_val is not None else 0.50)
-        
-        _rev_win_val = st.session_state.settings.get("xgb_reverse_win_rate")
-        safe_rev_win = float(_rev_win_val if _rev_win_val is not None else 0.80)
-
-        user_xgb_min_win = st.slider(
-            "XGBoost 最小胜率红线", 
-            min_value=0.50, max_value=0.95, 
-            value=safe_min_win, 
-            step=0.01, key="ui_xgb_min_win", on_change=save_settings, disabled=lock_params
-        )
-        user_xgb_reverse_win = st.slider(
-            "XGBoost 反杀胜率红线 (防反杀)", 
-            min_value=0.50, max_value=0.95, 
-            value=safe_rev_win, 
-            step=0.01, key="ui_xgb_reverse_win", on_change=save_settings, disabled=lock_params,
-            help="当原方向信号被拦截时，反方向信号必须达到此胜率才会被执行。"
-        )
-    else:
-        st.warning("⏸️ XGBoost 未启用，当前完全由上方的规则参数驱动交易。")
-        
-    st.markdown("---")
-
-    # ==========================================
-    # 📦 MLOps 资产与版本控制台 (基于模型注册表)
-    # ==========================================
-    st.markdown("#### 📦 AI 模型管理")
-    # (数据采集打标版本 user_collection_version 已经被彻底删除，挪去实验室了)
-    
-    # 读取模型户口本
-    registry_file = os.path.join(MODEL_DIR, "model_registry.json")
-    registry_data = {}
-    if os.path.exists(registry_file):
-        try:
-            with open(registry_file, "r", encoding="utf-8") as f:
-                registry_data = json.load(f)
-        except: pass
-        
-    if registry_data:
-        sorted_uuids = sorted(registry_data.keys(), key=lambda x: registry_data[x]['created_at'], reverse=True)
-        def format_model_label(uid):
-            if uid in registry_data:
-                m = registry_data[uid]
-                return f"[{m['data_version']}] {m['name']} (胜率:{m['accuracy']})"
-            else:
-                return f"🌟 [旧版遗留模型] {uid}"
-        model_options = sorted_uuids
-        format_func = format_model_label
-    else:
-        model_options = ["v1.0"] 
-        format_func = lambda x: x
-
-    current_inf = str(st.session_state.settings.get("inference_version", model_options[0] if model_options else "v1.0"))
-    if current_inf not in model_options:
-        model_options.insert(0, current_inf)
-        
-    user_inference_version = st.selectbox(
-        "🧠 实盘应用主模型 (UUID)", 
-        options=model_options, format_func=format_func, index=model_options.index(current_inf), 
-        key="ui_inference_version", on_change=save_settings, disabled=lock_params
-    )
-    
-    st.markdown("##### 🔀 币种专属模型指派")
-    st.caption("为特定标的手动指派模型。未指派的将默认使用上方主模型。")
-
-    s_model_map = st.session_state.settings.get("symbol_model_map", {})
-    new_model_map = s_model_map.copy()
-
-    with st.container(height=350):
-        for sym in st.session_state["ui_active_symbols_state"]:
-            route_options = ["🌐 跟随全局默认"] + model_options
-            current_assigned = s_model_map.get(sym, "🌐 跟随全局默认")
-            try: assigned_idx = route_options.index(current_assigned)
-            except ValueError: assigned_idx = 0
-            
-            selected_route = st.selectbox(
-                f"🎯 {sym}", options=route_options,
-                format_func=lambda x: x if x == "🌐 跟随全局默认" else format_func(x),
-                index=assigned_idx, key=f"route_select_{sym}", disabled=lock_params
-            )
-            if selected_route == "🌐 跟随全局默认":
-                if sym in new_model_map: del new_model_map[sym]
-            else:
-                new_model_map[sym] = selected_route
-
-    if new_model_map != s_model_map:
-        st.session_state.settings["symbol_model_map"] = new_model_map
-        save_settings()
-
 st.sidebar.divider()
 
 # ==========================================
@@ -1478,7 +1355,9 @@ st.markdown("### 📡 实时全市场扫描雷达")
 @st.fragment(run_every=_run_every)
 def render_market_radar():
     # 👇 从 session_state 动态读取当前存活的币种池
-    active_radar_symbols = st.session_state.settings.get("active_symbols", SYMBOL)
+    active_radar_symbols = st.session_state.settings.get("active_symbols", ALL_SYMBOLS)
+    if isinstance(active_radar_symbols, str):
+        active_radar_symbols = [active_radar_symbols]
     
     if not active_radar_symbols:
         st.warning("暂无激活的监控币种。")
@@ -1496,23 +1375,49 @@ def render_market_radar():
         )
 
     try:
-        # 1. 从 API 获取实时 K 线与盘口数据
-        api_url = f"http://127.0.0.1:8000/api/snapshot/{target_symbol.replace('/', '_')}"
-        resp = requests.get(api_url, timeout=2.0)
-        if resp.status_code != 200:
-            st.warning("网关暂未返回该币种数据...")
-            return
-        snap_data = resp.json()
-        current_price = snap_data.get("latest_price", 0.0)
+        # 🎯 策略：优先从极速网关 API 获取最新的内存切片 (最快)
+        snap_data = {}
+        try:
+            # 去除符号中的斜杠以匹配网关可能的格式 (如 BTC/USDT -> BTCUSDT)
+            api_sym = target_symbol.replace("/", "")
+            api_url = f"http://127.0.0.1:8000/api/snapshot/{api_sym}"
+            resp = requests.get(api_url, timeout=1.0)
+            if resp.status_code == 200:
+                snap_data = resp.json()
+        except:
+            pass
+
+        current_price = snap_data.get("current_price", 0.0)
+        ohlcv_1h = snap_data.get("ohlcv_1h", [])
         
+        # 🛡️ 容错处理：如果 API 挂了或没数据，直接穿透到本地 SQLite 硬盘存储 (兜底)
+        if not ohlcv_1h or current_price == 0:
+            db_path = os.path.join(LIVE_DATA_DIR, "gateway_state.db")
+            if os.path.exists(db_path):
+                try:
+                    with sqlite3.connect(db_path, timeout=5.0) as conn:
+                        # 查找该币种最近的 168 根 1h K 线 (一周)
+                        df_db = pd.read_sql(
+                            f"SELECT timestamp as ts, open, high, low, close, volume FROM memory_1h WHERE symbol = '{target_symbol}' ORDER BY timestamp DESC LIMIT 168", 
+                            conn
+                        )
+                        if not df_db.empty:
+                            df_db = df_db.sort_values("ts")
+                            ohlcv_1h = df_db.values.tolist()
+                            current_price = df_db['close'].iloc[-1]
+                except:
+                    pass
+
         # 转换 1h K 线为 DataFrame
-        ohlcv_1h = snap_data.get("1h", [])
         df_actual = pd.DataFrame(ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"])
         if not df_actual.empty:
+            # 兼容性处理：API 返回的是 list，SQLite 返回的列名已对齐
             df_actual['ts'] = pd.to_datetime(df_actual['ts'], unit='ms')
+            # 🎯 仅保留最近一周 (168 小时) 的数据，防止图表过于拥挤
+            df_actual = df_actual.tail(168)
             
         # 2. 从 live_status.json 读取 AI 推理状态 (主要针对 BTCUSDT)
-        status_file = os.path.join(DATA_DIR, "live_status.json")
+        status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
         status_data = {}
         if os.path.exists(status_file):
             try:
@@ -1522,9 +1427,9 @@ def render_market_radar():
             
         # 填充展示指标 (适配精简架构)
         last_update = datetime.fromtimestamp(status_data.get("updated_at", time.time())).strftime("%Y-%m-%d %H:%M:%S")
-        target_ts = df_actual['ts'].iloc[-1] + pd.Timedelta(hours=1) if not df_actual.empty else pd.Timestamp.now()
         
         p_up = status_data.get("p_up", 0.33)
+        p_flat = status_data.get("p_flat", 0.34)
         p_down = status_data.get("p_down", 0.33)
         macro_score = status_data.get("macro_score", 0.0)
         adj_p_up = status_data.get("adj_p_up", p_up)
@@ -1537,50 +1442,24 @@ def render_market_radar():
         auto_leverage = float(st.session_state.settings.get("max_margin_utilization", 10.0)) * 10
         tp_pct = 0.08
         sl_pct = 0.04
-        pred_mean_price = current_price * (1.01 if up_prob >= 0.5 else 0.99)
         
         st.caption(f"⏱️ 引擎状态最后同步: `{last_update}` (基于 {target_symbol} 极速快照)")
         
         # ==========================================
-        # 🧠 第一行：核心决断与市场动量
+        # 🧠 第一行：iTransformer 大模型预测概率
         # ==========================================
-        st.markdown("##### 核心决断与市场动量")
-        c1, c2, c3, c4, c5 = st.columns(5)
+        st.markdown("##### iTransformer 大模型概率分布")
+        c1, c2, c3, c4 = st.columns(4)
         
-        c1.metric("当前标的价格", f"${current_price:,.4f}", delta=f"参考杠杆上限", delta_color="normal")
-        
-        prob_label = "核心方向概率(看涨) 🟢" if up_prob >= 0.5 else "核心方向概率(看跌) 🔴"
-        display_prob = up_prob if up_prob >= 0.5 else (1.0 - up_prob)
-        prob_thresh = float(st.session_state.settings.get("prob_thresh", 0.52))
-        c2.metric(prob_label, f"{display_prob:.2%}", delta=f"面板配置 ≧ {prob_thresh:.0%}", delta_color="normal" if display_prob >= prob_thresh else "inverse")
-        
-        c3.metric("宏观情绪得分", f"{macro_score:+.2f}", delta="基于 DeepSeek", delta_color="normal" if macro_score >= 0 else "inverse")
-        c4.metric("动态调整做多", f"{adj_p_up:.2%}", delta="宏观加持", delta_color="normal")
-        c5.metric("动态调整做空", f"{adj_p_down:.2%}", delta="宏观加持", delta_color="normal")
+        c1.metric("当前标的价格", f"${current_price:,.4f}")
+        c2.metric("看涨概率 (p_up)", f"{p_up:.2%}")
+        c3.metric("震荡概率 (p_flat)", f"{p_flat:.2%}")
+        c4.metric("看跌概率 (p_down)", f"{p_down:.2%}")
 
-        # ==========================================
-        # 🛡️ 第二行：宏观环境与风控管理
-        # ==========================================
-        st.markdown("##### 🛡️ 宏观环境与风控管理")
-        c6, c7, c8, c9, c10 = st.columns(5)
-        
-        regime_label = "🟢 偏多头" if is_uptrend_proxy else "🔴 偏空头"
-        c6.metric("简单基线环境", regime_label, delta="均线之上" if is_uptrend_proxy else "均线之下")
-        c7.metric("防抖 K线界标对齐", "已开启", delta="对齐 1h 拓扑边界")
-        c8.metric("XGBoost 终审拦截", "启用" if st.session_state.settings.get("use_xgboost", False) else "未启用")
-        c9.metric("物理动态止盈 (TP)", f"±{tp_pct:.2%}")
-        c10.metric("物理极限止损 (SL)", f"±{sl_pct:.2%}", delta_color="inverse")
-        
         # --- 绘制极简趋势预测图 ---
         fig = go.Figure()
         if not df_actual.empty and 'open' in df_actual.columns:
             fig.add_trace(go.Candlestick(x=df_actual['ts'], open=df_actual['open'], high=df_actual['high'], low=df_actual['low'], close=df_actual['close'], name="实时1h K 线"))
-        
-        fig.add_trace(go.Scatter(x=[df_actual['ts'].iloc[-1] if not df_actual.empty else pd.Timestamp.now(), target_ts], 
-                                y=[current_price, pred_mean_price], 
-                                mode='lines+markers', name="预估短期落点", 
-                                line=dict(color='cyan', width=2, dash='dash'),
-                                marker=dict(size=8, symbol='star')))
         
         fig.update_layout(title=f"{target_symbol} 实时盘口K线与推演", yaxis_title="Price (USDT)", 
                         template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0), xaxis_rangeslider_visible=False)
@@ -1589,52 +1468,3 @@ def render_market_radar():
     except Exception as e:
         st.error(f"渲染 {target_symbol} 雷达时出错: {e}")
 render_market_radar()
-# ==========================================
-# 📥 新增：终端控制塔：全市场信号雷达
-# ==========================================
-st.markdown("---")
-st.markdown("### 🔍 全市场信号中心")
-st.caption("实时透视后台量化引擎的运转内核，追踪各大币种没有开仓的致命阻挡原因。")
-@st.fragment(run_every=_run_every)
-def render_terminal_logs():
-    logs = []
-    active_radar_symbols = st.session_state.settings.get("active_symbols", SYMBOL)
-    
-    log_db_path = os.path.join(DATA_DIR, "engine_system_logs.db")
-    if os.path.exists(log_db_path):
-        try:
-            with sqlite3.connect(log_db_path, timeout=5.0) as conn:
-                for target_symbol in active_radar_symbols: 
-                    # 改为查询 system_alerts 表作为最后的诊断信息来源
-                    df_log = pd.read_sql(f"SELECT log_ts, message, level FROM system_alerts WHERE symbol = '{target_symbol}' ORDER BY log_ts DESC LIMIT 1", conn)
-                    if not df_log.empty and pd.notnull(df_log.iloc[0]['message']):
-                        log_text = df_log.iloc[0]['message']
-                        lvl = df_log.iloc[0]['level']
-                        
-                        if "🚨" in lvl or "❌" in lvl:
-                            status_icon = "⛔" 
-                        elif "⚠️" in lvl:
-                            status_icon = "⚠️"
-                        elif "✅" in log_text or "SUCCESS" in lvl:
-                            status_icon = "✅"
-                        elif "拦截" in log_text or "阻挡" in log_text:
-                            status_icon = "⏳"
-                        else:
-                            status_icon = "🔍"
-                            
-                        logs.append({
-                            "状态": status_icon,
-                            "交易平台标的": target_symbol,
-                            "引擎原生诊断 (最近动态)": log_text,
-                            "快照时间戳": df_log.iloc[0]['log_ts']
-                        })
-        except Exception:
-            pass
-
-    if logs:
-        df_logs = pd.DataFrame(logs)
-        st.dataframe(df_logs[['状态', '交易平台标的', '引擎原生诊断 (最近动态)', '快照时间戳']], hide_index=True, width='stretch')
-    else:
-        # 如果连 alerts 都没有，说明系统刚启动
-        st.info("🕒 等待后台监控进程抛出诊断事件...")
-render_terminal_logs()
