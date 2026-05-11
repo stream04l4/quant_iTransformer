@@ -42,7 +42,7 @@ def get_macro_sentiment_score():
 
     try:
         # 使用超时机制，防止高频引擎被数据库文件锁卡死
-        with sqlite3.connect(db_path, timeout=0.5) as conn:
+        with sqlite3.connect(db_path, timeout=1.0) as conn:
             cursor = conn.cursor()
             # 永远只取最新的一条宏观决策
             cursor.execute("SELECT score FROM llm_decisions ORDER BY decision_ts DESC LIMIT 1")
@@ -298,6 +298,30 @@ def run_live():
             snapshot = resp.json()
             current_time = time.time()
             current_price = snapshot['current_price']
+            
+            # --- 读入前端 UI 设置并应用 ---
+            ui_config = {}
+            ui_path = os.path.join(LIVE_DATA_DIR, "ui_config.json")
+            if os.path.exists(ui_path):
+                try:
+                    with open(ui_path, "r") as f:
+                        ui_config = json.load(f)
+                except:
+                    pass
+            
+            # 动态更新给右脑风控熔断器的参数
+            state.dynamic_settings["bailout_atr_multi"] = float(ui_config.get("bailout_atr_multi", 2.5))
+            state.dynamic_settings["bailout_vol_multi"] = float(ui_config.get("bailout_vol_multi", 3.0))
+            state.dynamic_settings["excursion"] = float(ui_config.get("excursion", 1.5))
+            
+            # 动态计算仓位保证金与止盈止损参数
+            initial_cap = float(ui_config.get("initial_capital", 10000.0))
+            base_risk = float(ui_config.get("base_risk_budget", 0.02))
+            dynamic_margin_usd = initial_cap * base_risk if initial_cap * base_risk > 0 else LIVE_RISK_MARGIN_USD
+            
+            target_risk = float(ui_config.get("target_risk", 30.0)) / 100.0
+            dynamic_sl = target_risk
+            dynamic_tp = target_risk * 1.5
 
             # 👇 【关键补充】将最新价格更新到全局状态机，供后端的 bailout_worker (阶梯止损) 随时读取
             try:
@@ -430,7 +454,7 @@ def run_live():
                     success, actual_margin = execute_gate_trade(
                         symbol=SYMBOL, signal=signal, leverage=dynamic_leverage,
                         current_price=current_price,
-                        tp_pct=HARD_TP, sl_pct=HARD_SL, risk_margin_usd=LIVE_RISK_MARGIN_USD
+                        tp_pct=dynamic_tp, sl_pct=dynamic_sl, risk_margin_usd=dynamic_margin_usd
                     )
                     if success:
                         print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")

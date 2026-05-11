@@ -237,30 +237,26 @@ def save_settings():
         "target_risk": st.session_state.get("ui_risk", s.get("target_risk")), # 保留兼容
         "excursion": st.session_state.get("ui_excursion", s.get("excursion")),
         "chandelier_multi": st.session_state.get("ui_chandelier_multi", s.get("chandelier_multi")),
-        "initial_capital": st.session_state.get("ui_initial_capital", s.get("initial_capital")),
-        "max_open_positions": st.session_state.get("ui_max_positions", s.get("max_open_positions")),
+        "initial_capital": st.session_state.get("ui_initial_capital", s.get("initial_capital", 10000.0)),
+        "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget", 0.02)),
+        "target_risk": st.session_state.get("ui_risk", s.get("target_risk", 30.0)),
+        "excursion": st.session_state.get("ui_excursion", s.get("excursion", 1.5)),
         "use_xgboost": st.session_state.get("ui_use_xgboost", s.get("use_xgboost")),
         "beta_thresh": st.session_state.get("ui_beta_thresh", s.get("beta_thresh", 0.001) * 100) / 100.0,
         "max_dd_limit": st.session_state.get("ui_max_dd_limit", s.get("max_dd_limit")),
-        "xgb_min_win_rate": st.session_state.get("ui_xgb_min_win", s.get("xgb_min_win_rate")), # 👈 【新增】：保存胜率红线
-        "xgb_reverse_win_rate": st.session_state.get("ui_xgb_reverse_win", s.get("xgb_reverse_win_rate")), # 👈 【新增】：保存反杀胜率红线
-        "collection_version": st.session_state.get("ui_collection_version", s.get("collection_version", "v1.0")), # 👈 数据采集版本
-        "inference_version": st.session_state.get("ui_inference_version", s.get("inference_version", "v1.0")),    # 👈 模型应用版本
+        "xgb_min_win_rate": st.session_state.get("ui_xgb_min_win", s.get("xgb_min_win_rate")), 
+        "xgb_reverse_win_rate": st.session_state.get("ui_xgb_reverse_win", s.get("xgb_reverse_win_rate")), 
+        "collection_version": st.session_state.get("ui_collection_version", s.get("collection_version", "v1.0")), 
+        "inference_version": st.session_state.get("ui_inference_version", s.get("inference_version", "v1.0")),    
         "inspect_version": st.session_state.get("ui_inspect_version", s.get("inspect_version", "v1.0")),
-        "target_train_version": st.session_state.get("ui_target_train_version", s.get("target_train_version", "v1.0")), # 👈 【新增】：持久化保存目标训练版本
-        "audit_model_version": st.session_state.get("ui_audit_model_version", s.get("audit_model_version")), # 👈 【新增】：持久化保存 AI 绩效审计选中的模型
+        "target_train_version": st.session_state.get("ui_target_train_version", s.get("target_train_version", "v1.0")), 
+        "audit_model_version": st.session_state.get("ui_audit_model_version", s.get("audit_model_version")), 
         "funding_limit": st.session_state.get("ui_funding_limit", s.get("funding_limit")),
-        "cooldown_mins": st.session_state.get("ui_cooldown_mins", s.get("cooldown_mins")),
-        "active_symbols": st.session_state.get("ui_active_symbols", s.get("active_symbols", SYMBOL)), # 👈 新增：保存激活的币种池
-        # 👇 新增：保存前端调整的右脑熔断阈值
-        "bailout_atr_multi": st.session_state.get("ui_bailout_atr_multi", s.get("bailout_atr_multi")),
-        "bailout_vol_multi": st.session_state.get("ui_bailout_vol_multi", s.get("bailout_vol_multi")),
-        # 静态红线直接继承硬盘配置
+        "active_symbols": st.session_state.get("ui_active_symbols_state", s.get("active_symbols", SYMBOL)),
+        "bailout_atr_multi": st.session_state.get("ui_bailout_atr_multi", s.get("bailout_atr_multi", 2.5)),
+        "bailout_vol_multi": st.session_state.get("ui_bailout_vol_multi", s.get("bailout_vol_multi", 3.0)),
         "max_margin_utilization": s.get("max_margin_utilization", 0.7),
-        "max_allowed_sl_distance": s.get("max_allowed_sl_distance", 0.15),
-        "min_order_notional": s.get("min_order_notional", 6.0),
-        "default_win_rate": s.get("default_win_rate", 0.52),
-        "default_profit_loss_ratio": s.get("default_profit_loss_ratio", 1.5)
+        "min_order_notional": s.get("min_order_notional", 6.0)
     }
     # 原子写入保持不变
     temp_file = f"{CONFIG_JSON_FILE}.tmp"
@@ -1171,7 +1167,7 @@ st.sidebar.markdown("### 🚨 引擎实时警报")
 def render_sidebar_alerts():
     # 👇 剥离 sidebar 定位，改为普通 st.expander
     with st.expander("查看底层巡逻兵异常日志", expanded=True):
-        log_db_path = os.path.join(LIVE_DATA_DIR, "engine_system_logs.db")
+        log_db_path = os.path.join(LIVE_DATA_DIR, "logs", "engine_system_logs.db")
         if os.path.exists(log_db_path):
             try:
                 with sqlite3.connect(log_db_path, timeout=5.0) as conn:
@@ -1321,22 +1317,13 @@ with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
         )
 # ---------------------------------------------------------
 with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
-    st.caption("基于波动率平价的机构级算仓防线。")
+    st.caption("基于波动率平价的机构级算仓防线与实时风控联动。")
     user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
-    user_max_positions = st.slider("全局最高并发持仓数量", min_value=1, max_value=20, value=int(st.session_state.settings.get("max_open_positions", 3)), step=1, key="ui_max_positions", on_change=save_settings, disabled=lock_params)
-    user_cooldown = st.slider("同向开仓物理冷却 (分钟)", min_value=5, max_value=120, value=int(st.session_state.settings.get("cooldown_mins", 45)), step=5, key="ui_cooldown", on_change=save_settings, disabled=lock_params)
-    # 【新增】：精确到小数点后两位的风险预算滑条
-    user_base_risk = st.slider("单笔风险预算", min_value=0.01, max_value=0.05, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params)
-    # 👇 补回缺失的 target_risk 调节器
-    user_target_risk = st.slider("单笔最高容忍 ROE 亏损", min_value=10.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", 30.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params)
-    st.markdown("#### 💡 物理 OCO vs 幽灵吊灯")
+    user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.05, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
+    user_target_risk = st.slider("单笔最高容忍 ROE 亏损 (%)", min_value=10.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", 30.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params, help="硬止损线 (如30%代表ROE亏损30%止损)")
     
-    # 👇 【新增核心提醒】：用醒目的 warning 框封锁危险操作区
-    st.warning("☢️ **规则重构区**：以下两个参数决定了 AI 训练时的盈亏评判标准。一旦修改，会导致旧模型产生认知撕裂。修改后强烈建议前往第四个标签页开创新版本并重新积累数据炼丹！")
-    
-    # 👇 修改：在 slider 的标题后加上醒目的 ⚠️ 标志
+    st.markdown("#### 💡 物理硬止损保护")
     user_excursion = st.slider("物理硬止损拉伸宽幅 ⚠️ (越大越防插针)", min_value=0.50, max_value=3.00, value=float(st.session_state.settings.get("excursion", 1.5)), step=0.1, key="ui_excursion", on_change=save_settings, disabled=lock_params)
-    user_chandelier_multi = st.slider("吊灯止损容忍乘数 ⚠️ (格局线)", min_value=1.5, max_value=5.0, value=float(st.session_state.settings.get("chandelier_multi", 2.8)), step=0.1, key="ui_chandelier_multi", on_change=save_settings, disabled=lock_params)
 
     # 👇 新增：右脑阈值专区
     st.markdown("#### 🧠 右脑高频熔断阈值")
@@ -1449,12 +1436,13 @@ def render_market_radar():
         # 🧠 第一行：iTransformer 大模型预测概率
         # ==========================================
         st.markdown("##### iTransformer 大模型概率分布")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         
         c1.metric("当前标的价格", f"${current_price:,.4f}")
-        c2.metric("看涨概率 (p_up)", f"{p_up:.2%}")
-        c3.metric("震荡概率 (p_flat)", f"{p_flat:.2%}")
-        c4.metric("看跌概率 (p_down)", f"{p_down:.2%}")
+        c2.metric("宏观情绪加成", f"{macro_score:+.2%}", delta_color="normal" if macro_score != 0 else "off")
+        c3.metric("看涨概率 (p_up)", f"{adj_p_up:.2%}", f"原始: {p_up:.2%}")
+        c4.metric("震荡概率 (p_flat)", f"{p_flat:.2%}")
+        c5.metric("看跌概率 (p_down)", f"{adj_p_down:.2%}", f"原始: {p_down:.2%}")
 
         # --- 绘制极简趋势预测图 ---
         fig = go.Figure()

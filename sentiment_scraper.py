@@ -386,14 +386,6 @@ def run_sentinel_pipeline():
         "market_position": pos_scraper.fetch(),
         "hot_news": news_scraper.fetch()
     }
-    
-    temp_log_file = os.path.join(LOG_DIR, "temp_raw_context.json")
-    try:
-        with open(temp_log_file, "w", encoding="utf-8") as f:
-            json.dump(current_context, f, ensure_ascii=False, indent=4)
-        logging.info(f"📄 原始切片数据已输出至 -> {temp_log_file}")
-    except: pass
-
     context_json_str = json.dumps(current_context, ensure_ascii=False)
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -466,8 +458,6 @@ def run_sentinel_pipeline():
             INSERT INTO llm_decisions (decision_ts, score, marquee_text, urgency, raw_context_id)
             VALUES (?, ?, ?, ?, ?)
         ''', (current_context["timestamp"], decision["score"], decision["marquee_text"], decision["urgency"], raw_id))
-        conn.commit()
-        
     logging.info(f"✅ DeepSeek 裁决完成！\n   [情绪打分]: {decision['score']}\n   [大局观]: {decision['marquee_text']}\n   [紧急度]: {decision['urgency'].upper()}")
 
 if __name__ == "__main__":
