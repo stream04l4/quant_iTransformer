@@ -342,10 +342,14 @@ def build_features():
             (pl.col("close").ewm_mean(span=12, adjust=False) - pl.col("close").ewm_mean(span=26, adjust=False)) 
             / (pl.col("close").ewm_mean(span=26, adjust=False) + 1e-9)
         ).alias("ppo_line"),
-        
+
+        # 🚨 [新增] MAX 因子 (彩票效应)：捕捉过去24小时内的最大单根K线涨幅，识别非理性拉升
+        (pl.col("log_return").rolling_max(window_size=24)).alias("max_ret_24h"),
+
         ((build_rsi_expr("close", 14) - 50) / 50.0).alias("rsi_14"),
         ((build_rsi_expr("close", 48) - 50) / 50.0).alias("rsi_48"),
-        (pl.col("taker_buy_volume") / (pl.col("volume") + 1e-9)).alias("taker_ratio"),
+        # 🚨 [修改] TBRD: 主动买入占比的差分(加速度)，捕捉资金突袭
+        (pl.col("taker_buy_volume") / (pl.col("volume") + 1e-9)).diff().alias("taker_ratio_delta"),
         (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("vpt"),
         
         # 🚨 Alpha 1: Open Interest 持仓动能与价格背离交叉乘积
@@ -354,8 +358,12 @@ def build_features():
         
         # 🚨 Alpha 3: Amihud 流动性消耗率
         (pl.col("log_return").abs() / (pl.col("quote_volume") + 1e-9)).alias("amihud_illiquidity"),
+        
+        # 🚨 [新增] RVTS: 波动率期限结构 (1h极短期波动 vs 24h基准波动)
+        (pl.col("realized_vol_1h") / (pl.col("realized_vol_1h").rolling_mean(window_size=24) + 1e-9)).alias("rv_term_structure"),
 
-        pl.col("last_funding_rate").alias("funding_rate"),
+        # 🚨 [修改] FRM: 资金费率动量 (24h均线 - 72h均线)，过滤长期极化噪音
+        (pl.col("last_funding_rate").rolling_mean(window_size=24) - pl.col("last_funding_rate").rolling_mean(window_size=72)).alias("funding_rate_momentum"),
         (pl.col("premium_close") - pl.col("premium_close").shift(1)).alias("premium_delta"),
         (pl.col("eth_btc_close").log() - pl.col("eth_btc_close").shift(1).log()).alias("eth_btc_return"),
         (pl.col("hour_timestamp").dt.hour() * (2 * np.pi / 24)).sin().alias("hour_sin"),
@@ -391,7 +399,8 @@ def build_features():
 
     # 🚨 时序平稳化：去除高度共线的 net_taker_vol，保留 vpt 和 cvd
     print("🌊 [时序平稳化] 正在对高维度绝对量特征进行 Robust Z-Score (MAD) 降维与截断...")
-    rolling_cols = ["vpt", "realized_vol_1h", "amihud_illiquidity"]
+    # 🚨 [剔除] vpt，因其逻辑已被更敏锐的 cvd_zscore 覆盖
+    rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct"]
     if "cvd" in features.columns:
         rolling_cols.extend(["cvd", "whale_net_flow"])
 
@@ -403,7 +412,7 @@ def build_features():
     features = features.with_columns([
         (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168).alias(f"{c}_mad") for c in rolling_cols
     ])
-    # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4] 防御极端针行情
+    # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4]
     zscore_exprs = [
         (0.6745 * (pl.col(c) - pl.col(f"{c}_median")) / (pl.col(f"{c}_mad") + 1e-9)).clip(-4.0, 4.0).alias(f"{c}_zscore") for c in rolling_cols
     ]
@@ -412,18 +421,26 @@ def build_features():
     # 步骤 4: 丢弃中间临时变量
     features = features.drop([f"{c}_median" for c in rolling_cols] + [f"{c}_mad" for c in rolling_cols])
 
-    # 🚨 终极核对：剔除冗余后的无共线性高信噪比特权列
+    # 🚨 [新增] COID: 高阶订单流背离 (CVD净买单偏离度减去总持仓偏离度)
+    if "cvd_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
+        features = features.with_columns(
+            (pl.col("cvd_zscore") - pl.col("oi_delta_pct_zscore")).alias("cvd_oi_divergence")
+        )
+
+    # 🚨 终极核对：新增 max_ret_24h，剔除 oi_price_cross 与 vpt_zscore
     final_cols = [
-        "hour_timestamp", "log_return", "ma_bias", "upper_shadow", "lower_shadow",
-        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", 
-        "vpt_zscore", "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
-        "oi_delta_pct", "oi_price_cross", "ls_ratio",
-        "price_pos_24h", "price_pos_72h", "price_pos_168h", # <- 新增的 3 个 MTF 突破特征
-        "funding_rate", "premium_delta", "eth_btc_return",
+        "hour_timestamp", "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
+        "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
+        "oi_delta_pct", "ls_ratio",
+        "price_pos_24h", "price_pos_72h", "price_pos_168h", 
+        "rv_term_structure", 
+        "funding_rate_momentum", "premium_delta", "eth_btc_return", 
         "hour_sin", "hour_cos", "week_sin", "week_cos", f"target_{FORECAST_HORIZON}h_return"
     ]
+    # 🌟 新增: COID 被放进含有深度订单流的分支中
     if "cvd" in features.columns:
-        final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "retail_ratio"])
+        final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence"])
 
     features = features.select(final_cols)
 

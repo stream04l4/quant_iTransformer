@@ -62,7 +62,7 @@ def render_status_dashboard():
     try:
         # 极速探测本地 8000 端口，只要没有抛出 ConnectionError 就说明网关健在
         test_sym = SYMBOL.replace("/", "_")
-        requests.get(f"http://127.0.0.1:8000/api/snapshot/{test_sym}", timeout=0.3)
+        requests.get(f"http://127.0.0.1:8000/api/snapshot/{test_sym}", timeout=1.0)
         ws_alive = True
     except Exception:
         pass
@@ -1160,13 +1160,11 @@ with dash_tab4:
     else:
         st.info("💡 暂无平仓流水。")
 # ==========================================
-# 🚨 侧边栏：引擎底层警报与异常状态监控器
+# 🚨 引擎底层警报与异常状态监控器 (挪至页末展示)
 # ==========================================
-st.sidebar.markdown("### 🚨 引擎实时警报")
-
-# 👇 新增：给侧边栏警报也穿上 15 秒局部刷新的战甲
 @st.fragment(run_every=_run_every)
-def render_sidebar_alerts():
+def render_bottom_alerts():
+    st.markdown("### 🚨 引擎实时警报")
     # 👇 剥离 sidebar 定位，改为普通 st.expander
     with st.expander("查看底层巡逻兵异常日志", expanded=True):
         log_db_path = os.path.join(LIVE_DATA_DIR, "logs", "engine_system_logs.db")
@@ -1236,9 +1234,6 @@ def render_sidebar_alerts():
                 st.info(f"🟢 警报数据库读取中: {e}")
         else:
             st.info("🟢 等待底层引擎生成警报库...")
-# 👇 【核心修复】：在调用时，从外部将其推入侧边栏
-with st.sidebar:
-    render_sidebar_alerts()
 # ---------------------------------------------------------
 # 【新增：全局参数安全锁】
 # ---------------------------------------------------------
@@ -1462,3 +1457,9 @@ def render_market_radar():
     except Exception as e:
         st.error(f"渲染 {target_symbol} 雷达时出错: {e}")
 render_market_radar()
+
+# ==========================================
+# 🚨 引擎底层警报与异常状态监控器 (挪至页末展示)
+# ==========================================
+st.markdown("---")
+render_bottom_alerts()

@@ -17,13 +17,13 @@ import torch
 # 1. 通宵级全维寻优空间 
 # ==========================================
 SEARCH_SPACE = {
-    'SEQ_LEN': [336],
-    'CLASS_THRESHOLD': [0.026,0.027,0.028],
-    'E_LAYERS': [2],
-    'D_MODEL': [512],
-    'DROPOUT': [0.4],
-    'LEARNING_RATE': [5e-5],
-    'BATCH_SIZE': [256],
+    'SEQ_LEN': [168, 336, 672],
+    'CLASS_THRESHOLD': [0.026],
+    'E_LAYERS': [2, 3],
+    'D_MODEL': [512, 768],
+    'DROPOUT': [0.4, 0.5],
+    'LEARNING_RATE': [5e-5, 1e-4],
+    'BATCH_SIZE': [256, 512],
     'EPOCHS': [50] 
 }
 
@@ -95,7 +95,7 @@ def run_experiment(params, save_models):
     if not save_models:
         try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
         except FileNotFoundError: pass
-        try: os.remove(TRAIN_DATA_DIR / f"backtest_probabilistic_{exp_id}.png")
+        try: os.remove(MODEL_DIR / f"backtest_probabilistic_{exp_id}.png")
         except FileNotFoundError: pass
     
     return res

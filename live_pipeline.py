@@ -435,9 +435,9 @@ def run_live():
                 signal = -1
                 dynamic_leverage = max([leverages[i] for i in range(5) if directions[i] == -1])
 
-            # 👇 新增：每次重推理（换线或宏观刷新）记录综合决策结论到前端
+            # 👇 优化：每次重推理（换线或宏观刷新）记录综合决策结论与联席会议明细到前端
             if needs_evaluation_log:
-                action_str = f"按兵不动 (投票: 涨{long_votes} 跌{short_votes})"
+                action_str = f"按兵不动 (最终投票: 涨{long_votes} 跌{short_votes})"
                 if signal == 1:
                     action_str = f"🚀 触发做多 (通过 {long_votes}/5 票, 最终杠杆: {dynamic_leverage}x)"
                 elif signal == -1:
@@ -446,11 +446,20 @@ def run_live():
                 is_duplicate = (latest_closed_ts == last_trade_hour and signal == last_trade_signal)
                 if signal != 0 and is_duplicate:
                     action_str += " [静默跳过: 本K线已同向发车]"
-                    
+                
+                # 展开 5 个模型的独立看板与投票意向
+                dir_map = {1: "📈看多", -1: "📉看空", 0: "⚪弃权"}
+                council_details = ""
+                for idx in range(5):
+                    m_p_down, m_p_flat, m_p_up = cached_probs_list[idx]
+                    # 记录每个模型加上宏观修正后的独立状态
+                    council_details += f"   ├─ 席位 {idx+1} | 多:{m_p_up:.4f} 平:{m_p_flat:.4f} 空:{m_p_down:.4f} | 投票意向: {dir_map.get(directions[idx], '未知')}\n"
+
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
-                    f"【微观基准概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
-                    f"【宏观修正概率】📈多:{adj_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{adj_p_down:.4f} (宏观情绪增幅: {macro_buff:+.4f})\n"
+                    f"【微观基准概率 (5席均值)】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
+                    f"【宏观修正概率 (5席均值)】📈多:{adj_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{adj_p_down:.4f} (宏观情绪增幅: {macro_buff:+.4f})\n"
+                    f"【联席会议明细】\n{council_details}"
                     f"【引擎决策】{action_str}"
                 )
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 综合评估汇报:\n{eval_log}\n")
