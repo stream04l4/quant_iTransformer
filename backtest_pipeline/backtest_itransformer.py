@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 import polars as pl
 import matplotlib
+import pandas as pd
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -13,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID,FEE_RATE,HOLD_PERIOD,HARD_TP,HARD_SL,LEVERAGE_1,LEVERAGE_2,LEVERAGE_3
 from historical_pipeline.train_itransformer import InvertedTransformer
+
 
 def run_backtest():
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
@@ -70,7 +72,8 @@ def run_backtest():
             return self.data[idx : idx + self.seq_len]
 
     dataset = FastSeqDataset(X_test_raw, SEQ_LEN)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
+    # 🚨 关闭锁页内存
+    loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
     
     with torch.no_grad():
         for batch_x in loader:
@@ -139,6 +142,10 @@ def run_backtest():
     
     print("\n⚔️ 正在执行工业级撮合 (1h 决策开仓 + 1m 盘中悲观碰撞)...")
     
+    # 🚨 补充实盘摩擦力参数
+    SLIPPAGE = 0.0002 # 单边滑点万分之二 (应对市价单冲击成本)
+    HOURLY_FUNDING_COST = 0.0001 / 8 # 假设平均资金费率为万分之一/8小时，均摊到每小时
+
     for i in range(len(predictions_probs)):
         # 🚨 增加进度回显，打破静默卡死错觉
         if i > 0 and i % 1000 == 0:
@@ -185,7 +192,7 @@ def run_backtest():
                 entry_time = ts_1h[exec_idx_1h]
                 
                 trade_start_equity = equity 
-                equity -= trade_start_equity * current_leverage * FEE_RATE
+                equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
                 
                 if target_pos == 1: long_trades += 1
                 if target_pos == -1: short_trades += 1
@@ -288,7 +295,7 @@ def run_backtest():
                 
             if close_position:
                 floating_equity = trade_start_equity * (1 - current_leverage * FEE_RATE + actual_exit_pct)
-                floating_equity -= trade_start_equity * current_leverage * FEE_RATE # 扣除平仓手续费
+                floating_equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE) # 扣除平仓手续费
                 equity = floating_equity
                 
                 trade_pnl = equity - trade_start_equity
@@ -304,6 +311,7 @@ def run_backtest():
             else:
                 # 若持仓跨越当前小时，账面浮盈以本小时最后一分钟收盘价计
                 equity = trade_start_equity * (1 - current_leverage * FEE_RATE + close_pnl_pct)
+                equity -= trade_start_equity * current_leverage * HOURLY_FUNDING_COST
                 # 将追踪起点推移至下一个 1 小时的开端
                 entry_time = chunk_end_time
                 
@@ -341,7 +349,7 @@ def run_backtest():
     else:
         win_rate = 0.0
         
-    returns_series = np.diff(equity_curve, prepend=1.0) / np.roll(equity_curve, 1)
+    returns_series = pd.Series(equity_curve).pct_change().fillna(0).to_numpy()
     returns_series[0] = 0 
     if np.std(returns_series) != 0:
         sharpe = (np.mean(returns_series) / np.std(returns_series)) * np.sqrt(8760)
@@ -373,9 +381,10 @@ def run_backtest():
     plt.legend(facecolor='#1e1e1e', labelcolor='white')
     plt.grid(True, alpha=0.1, color='white')
     
-    plot_path = TRAIN_DATA_DIR / f"backtest_probabilistic_{EXPERIMENT_ID}.png"
+    plot_path = MODEL_DIR / f"backtest_probabilistic_{EXPERIMENT_ID}.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='#121212')
     print(f"\n📈 最终资金曲线已生成: {plot_path}")
+    plt.close('all')
 
 if __name__ == "__main__":
     run_backtest()

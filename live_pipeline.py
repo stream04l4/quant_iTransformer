@@ -14,7 +14,7 @@ import sqlite3
 import os
 from datetime import datetime
 from quant_config.config import (
-    DATA_DIR, LIVE_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, CLASS_THRESHOLD, 
+    DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, SEQ_LEN, D_MODEL, E_LAYERS, CLASS_THRESHOLD, 
     MODEL_DIR, DROPOUT, SYMBOL, AUX_SYMBOLS,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD, 
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL
@@ -68,176 +68,159 @@ def fetch_gateway_snapshot(sym):
     except Exception:
         return None
 
-def fetch_derivatives_history(sym):
-    """直接从 Binance 拉取 fundingRate 和 premiumIndexKlines 的历史以修复时序特征崩塌"""
-    clean_sym = sym.replace('/', '')
-    try:
-        # 获取溢价指数历史 (1h), limit=500
-        url_premium = f"https://fapi.binance.com/fapi/v1/premiumIndexKlines?symbol={clean_sym}&interval=1h&limit=500"
-        r_premium = requests.get(url_premium, timeout=5)
-        if r_premium.status_code == 200:
-            premium_data = r_premium.json()
-            df_premium = pd.DataFrame(premium_data)
-            df_premium['hour_timestamp'] = pd.to_datetime(df_premium[0], unit='ms')
-            df_premium['premium_close'] = df_premium[4].astype(float)
-            df_premium = df_premium[['hour_timestamp', 'premium_close']]
-        else:
-            df_premium = None
-            
-        # 获取资金费率历史
-        url_funding = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={clean_sym}&limit=500"
-        r_funding = requests.get(url_funding, timeout=5)
-        if r_funding.status_code == 200:
-            funding_data = r_funding.json()
-            df_funding = pd.DataFrame(funding_data)
-            df_funding['hour_timestamp'] = pd.to_datetime(df_funding['fundingTime'], unit='ms')
-            df_funding['funding_rate'] = df_funding['fundingRate'].astype(float)
-            df_funding = df_funding[['hour_timestamp', 'funding_rate']]
-        else:
-            df_funding = None
-            
-        return df_premium, df_funding
-    except Exception as e:
-        print(f"⚠️ 拉取衍生品历史失败: {e}")
-        return None, None
-
 def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
-    """根据主备网关快照，严格重组 23 维特征矩阵。出现任何缺失值直接报错"""
+    """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
-    # 1. 重建主 K 线体系
+    # 1. 基础 K 线体系
     df = pd.DataFrame(main_snap['ohlcv_1h'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    
-    # 🚨 【核心修复】：物理剔除当前正在生成的“未闭合”K线，保持与离线训练的绝对同构！
-    # 获取当前整点小时的时间戳 (毫秒)
     current_hour_ts = int(datetime.utcnow().timestamp() / 3600) * 3600000
     if df['timestamp'].iloc[-1] >= current_hour_ts:
-        df = df.iloc[:-1] # 毫不留情地丢弃它，只用已闭合的历史
-        
+        df = df.iloc[:-1]
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    # 【门槛校验】：至少需要 336(模型窗口) + 168(Z-Score窗口) = 504 根 K 线
-    required_len = SEQ_LEN + 168
-    if len(df) < required_len:
-        raise ValueError(f"主K线历史长度不足 (需>={required_len}，当前{len(df)})，拒绝产生信号。")
+    if len(df) < (SEQ_LEN + 168):
+        raise ValueError(f"主K线历史长度不足 (需>={SEQ_LEN + 168}，当前{len(df)})")
 
-    # 2. 缝合横截面辅助数据 (严密防守现货接口丢包)
-    df_eth = pd.DataFrame(eth_usdt_snap['ohlcv_1h'], columns=['timestamp', 'open_e', 'high_e', 'low_e', 'eth_usdt_close', 'volume_e'])
-    df_ethbtc = pd.DataFrame(eth_btc_snap['ohlcv_1h'], columns=['timestamp', 'open_eb', 'high_eb', 'low_eb', 'eth_btc_close', 'volume_eb'])
-    
-    df = df.merge(df_eth[['timestamp', 'eth_usdt_close']], on='timestamp', how='left')
-    df = df.merge(df_ethbtc[['timestamp', 'eth_btc_close']], on='timestamp', how='left')
-    
-    # 🚨 缝合衍生品历史 (修复时序坍塌)
-    df_premium, df_funding = fetch_derivatives_history(SYMBOL)
-    if df_premium is not None:
-        df = df.merge(df_premium, on='hour_timestamp', how='left')
-    else:
-        df['premium_close'] = 0.0
-        
-    if df_funding is not None:
-        df = df.merge(df_funding, on='hour_timestamp', how='left')
-    else:
-        df['funding_rate'] = 0.0
-        
-    # 🚨 核心对齐：复刻离线的 strategy="forward"，防止单点丢包引发整个矩阵崩溃
-    df['eth_usdt_close'] = df['eth_usdt_close'].ffill().bfill()
-    df['eth_btc_close'] = df['eth_btc_close'].ffill().bfill()
-    df['premium_close'] = df['premium_close'].ffill().bfill()
-    df['funding_rate'] = df['funding_rate'].ffill().bfill()
-
-    # === 3. 基础指标计算 (同离线一致) ===
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
-    df['body_strength'] = (df['close'] - df['open']) / df['open']
+
+    # 2. 横截面辅助缝合
+    df_ethbtc = pd.DataFrame(eth_btc_snap['ohlcv_1h'], columns=['timestamp', 'open_eb', 'high_eb', 'low_eb', 'eth_btc_close', 'volume_eb'])
+    df = df.merge(df_ethbtc[['timestamp', 'eth_btc_close']], on='timestamp', how='left')
+
+    # 3. 衍生品历史缝合
+    if main_snap.get('premium_history'):
+        df_prem = pd.DataFrame(main_snap['premium_history'], columns=['ts', 'premium_close'])
+        df_prem['hour_timestamp'] = pd.to_datetime(df_prem['ts'], unit='ms')
+        df = df.merge(df_prem[['hour_timestamp', 'premium_close']], on='hour_timestamp', how='left')
+    else: df['premium_close'] = np.nan
+
+    if main_snap.get('funding_history'):
+        df_fund = pd.DataFrame(main_snap['funding_history'], columns=['ts', 'funding_rate'])
+        df_fund['hour_timestamp'] = pd.to_datetime(df_fund['ts'], unit='ms').dt.floor('h')
+        df = df.merge(df_fund[['hour_timestamp', 'funding_rate']], on='hour_timestamp', how='left')
+    else: df['funding_rate'] = np.nan
+
+    if main_snap.get('oi_history'):
+        df_oi = pd.DataFrame(main_snap['oi_history'], columns=['ts', 'sum_open_interest'])
+        df_oi['hour_timestamp'] = pd.to_datetime(df_oi['ts'], unit='ms')
+        df = df.merge(df_oi[['hour_timestamp', 'sum_open_interest']], on='hour_timestamp', how='left')
+    else: df['sum_open_interest'] = np.nan
+
+    if main_snap.get('ls_history'):
+        df_ls = pd.DataFrame(main_snap['ls_history'], columns=['ts', 'ls_ratio'])
+        df_ls['hour_timestamp'] = pd.to_datetime(df_ls['ts'], unit='ms')
+        df = df.merge(df_ls[['hour_timestamp', 'ls_ratio']], on='hour_timestamp', how='left')
+    else: df['ls_ratio'] = np.nan
+
+    # 🚨 修复 1：严格限制填充范围，杜绝无限回填。对齐离线 limit=8 与 limit=3 的物理设定
+    df['funding_rate'] = df['funding_rate'].ffill(limit=8)
+    state_cols = ['eth_btc_close', 'premium_close', 'sum_open_interest', 'ls_ratio']
+    df[state_cols] = df[state_cols].ffill(limit=3)
+
+    # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的 35000 根纯净 1m K线
+    if 'ohlcv_1m' in main_snap and len(main_snap['ohlcv_1m']) > 0:
+        live_1m = pd.DataFrame(main_snap['ohlcv_1m'], columns=['ts', 'o', 'h', 'l', 'close', 'v'])
+        live_1m['timestamp'] = pd.to_datetime(live_1m['ts'], unit='ms')
+        live_1m['log_ret'] = np.log(live_1m['close'] / live_1m['close'].shift(1))
+        live_1m['hour_timestamp'] = live_1m['timestamp'].dt.floor('h')
+        
+        rv_df = live_1m.groupby('hour_timestamp')['log_ret'].apply(lambda x: np.sqrt((x**2).sum())).reset_index(name='realized_vol_1h')
+        df = df.merge(rv_df, on='hour_timestamp', how='left')
+    else:
+        df['realized_vol_1h'] = np.nan
+
+    # 5. 订单流特征
+    taker_stats = main_snap.get('taker_stats_1h', {})
+    if taker_stats:
+        taker_df = pd.DataFrame.from_dict(taker_stats, orient='index')
+        taker_df.index = pd.to_datetime(taker_df.index.astype(int), unit='ms')
+        df = df.merge(taker_df, left_on='hour_timestamp', right_index=True, how='left')
+        
+        df['taker_ratio'] = df['taker_buy_volume'] / (df['volume'] + 1e-9)
+        df['vpt'] = df['quote_volume'] / (df['count'] + 1e-9)
+        df['cvd'] = df['taker_buy_volume'] - df['taker_sell_volume']
+        df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
+        df['retail_ratio'] = df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)
+        df['amihud_illiquidity'] = df['log_return'].abs() / (df['quote_volume'] + 1e-9)
+    else:
+        for col in ['taker_ratio', 'vpt', 'cvd', 'whale_net_flow', 'retail_ratio', 'amihud_illiquidity']:
+            df[col] = np.nan
+
+    # 6. 基础技术与 MTF
     ma_200 = df['close'].ewm(span=200, adjust=False).mean()
     df['ma_bias'] = (df['close'] - ma_200) / ma_200
     
-    high_low_range = df['high'] - df['low'] + 1e-9
-    max_open_close = df[['open', 'close']].max(axis=1)
-    min_open_close = df[['open', 'close']].min(axis=1)
-    df['upper_shadow'] = (df['high'] - max_open_close) / high_low_range
-    df['lower_shadow'] = (min_open_close - df['low']) / high_low_range
+    hl_range = df['high'] - df['low'] + 1e-9
+    df['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / hl_range
+    df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / hl_range
     
-    rolling_mean_20 = df['close'].rolling(window=20).mean()
-    rolling_std_20 = df['close'].rolling(window=20).std()
-    df['bb_squeeze'] = (rolling_std_20 * 4) / (rolling_mean_20 + 1e-9)
+    std_20 = df['close'].rolling(window=20).std()
+    df['bb_squeeze'] = (std_20 * 4) / (df['close'].rolling(window=20).mean() + 1e-9)
     
-    ppo_line = (df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()) / (df['close'].ewm(span=26, adjust=False).mean() + 1e-9)
-    ppo_signal = ppo_line.ewm(span=9, adjust=False).mean()
-    df['ppo_hist'] = ppo_line - ppo_signal
+    # 🚨 修复 3：补齐 adjust=False，彻底对齐离线 Polars 的平滑算法
+    ppo = (df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()) / (df['close'].ewm(span=26, adjust=False).mean() + 1e-9)
+    df['ppo_hist'] = ppo - ppo.ewm(span=9, adjust=False).mean()
     
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
-    df['rsi_14'] = ((100 - (100 / (1 + gain / (loss + 1e-9)))) - 50) / 50.0
+    for p in [14, 48]:
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0).ewm(span=p, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(span=p, adjust=False).mean()
+        df[f'rsi_{p}'] = ((100 - (100 / (1 + gain / (loss + 1e-9)))) - 50) / 50.0
+
+    for w in [24, 72, 168]:
+        low_min = df['low'].rolling(window=w).min()
+        high_max = df['high'].rolling(window=w).max()
+        df[f'price_pos_{w}h'] = (df['close'] - low_min) / (high_max - low_min + 1e-9)
+
+    # 🚨 修复 4：还原原生三阶中心矩偏度公式，消除 Pandas 样本偏度带来的 6.7% 黑盒误差
+    m1 = df['log_return'].rolling(window=24, min_periods=1).mean()
+    m2 = (df['log_return']**2).rolling(window=24, min_periods=1).mean()
+    m3 = (df['log_return']**3).rolling(window=24, min_periods=1).mean()
+    var = (m2 - m1**2).abs()
+    df['vol_skew_24h'] = (m3 - 3 * m1 * m2 + 2 * m1**3) / (var**1.5 + 1e-9)
     
-    gain_48 = delta.clip(lower=0).ewm(span=48, adjust=False).mean()
-    loss_48 = (-delta.clip(upper=0)).ewm(span=48, adjust=False).mean()
-    df['rsi_48'] = ((100 - (100 / (1 + gain_48 / (loss_48 + 1e-9)))) - 50) / 50.0
-    
+    df['oi_delta_pct'] = (df['sum_open_interest'] - df['sum_open_interest'].shift(1)) / (df['sum_open_interest'].shift(1) + 1e-9)
+    df['oi_price_cross'] = np.sign(df['log_return']) * df['oi_delta_pct']
+
+    # 7. 免疫断层的 Z-Score
+    rolling_cols = ["vpt", "cvd", "whale_net_flow", "amihud_illiquidity", "realized_vol_1h"]
+    for c in rolling_cols:
+        if c in df.columns:
+            median = df[c].rolling(window=168, min_periods=1).median()
+            mad = (df[c] - median).abs().rolling(window=168, min_periods=1).median()
+            df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
+        else:
+            df[f"{c}_zscore"] = np.nan
+
+    df['eth_btc_return'] = np.log(df['eth_btc_close'] / df['eth_btc_close'].shift(1))
+    df['premium_delta'] = df['premium_close'].diff()
     df['hour_sin'] = np.sin(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['hour_cos'] = np.cos(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['week_sin'] = np.sin(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
     df['week_cos'] = np.cos(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
-    
-    df['eth_log_return'] = np.log(df['eth_usdt_close'] / df['eth_usdt_close'].shift(1))
-    df['eth_btc_return'] = np.log(df['eth_btc_close'] / df['eth_btc_close'].shift(1))
 
-    # === 4. 微观订单流时序重组 ===
-    taker_stats = main_snap.get('taker_stats_1h', {})
-    if not taker_stats:
-        raise ValueError("微观特征提取失败：网关未返回任何 taker_stats_1h 数据。")
-        
-    taker_df = pd.DataFrame.from_dict(taker_stats, orient='index')
-    taker_df.index.name = 'timestamp'
-    taker_df.index = taker_df.index.astype('int64') 
-    taker_df = taker_df.reset_index()
-    
-    # 物理左连接对齐 K 线时间轴
-    df = df.merge(taker_df, on='timestamp', how='left')
-    
-    # 衍生订单流计算 (精准对齐离线方程)
-    df['taker_ratio'] = df['taker_buy_volume'] / (df['volume'] + 1e-9)
-    df['net_taker_vol'] = df['taker_buy_volume'] - df['taker_sell_volume']
-    df['vpt'] = df['quote_volume'] / (df['count'] + 1e-9)
-    df['cvd'] = df['taker_buy_volume'] - df['taker_sell_volume']
-    df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
-    
-    # 🚨 核心对齐：使用真实撮合总量作为分母，取代粗糙的 K 线 volume
-    df['total_trade_vol'] = df['taker_buy_volume'] + df['taker_sell_volume']
-    df['retail_ratio'] = df['retail_vol'] / (df['total_trade_vol'] + 1e-9)
-
-    # === 5. 衍生品特征衍生 ===
-    # 此时 funding_rate 已在第 2 步成功 join 并且带有真实的 8 小时阶梯特征
-    # premium_close 也已带有真实的 1 小时时序波动
-    df['premium_delta'] = df['premium_close'] - df['premium_close'].shift(1)
-
-    # === 6. 严苛的 168 小时 Z-Score 截断 (Pandas 复刻 Polars MAD) ===
-    rolling_cols = ["vpt", "net_taker_vol", "cvd", "whale_net_flow"]
-    for c in rolling_cols:
-        median = df[c].rolling(window=168, min_periods=1).median()
-        mad = (df[c] - median).abs().rolling(window=168, min_periods=1).median()
-        df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
-
-    # 🚨 防御 inf 污染：将除法可能产生的 inf 踢回为 NaN，交由熔断器处理
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # === 7. 特征列切片与终极物理熔断 ===
-    feature_cols = [
-        "log_return", "body_strength", "ma_bias", "upper_shadow", "lower_shadow",
-        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", "vpt_zscore", "net_taker_vol_zscore",
-        "funding_rate", "premium_delta", "eth_log_return", "eth_btc_return",
-        "hour_sin", "hour_cos", "week_sin", "week_cos", "cvd_zscore", "whale_net_flow_zscore", "retail_ratio"
+    # 8. 终极截取与熔断防线
+    final_cols = [
+        "log_return", "ma_bias", "upper_shadow", "lower_shadow",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", 
+        "vpt_zscore", "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
+        "oi_delta_pct", "oi_price_cross", "ls_ratio",
+        "price_pos_24h", "price_pos_72h", "price_pos_168h",
+        "funding_rate", "premium_delta", "eth_btc_return",
+        "hour_sin", "hour_cos", "week_sin", "week_cos", 
+        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio"
     ]
     
-    final_df = df[feature_cols].copy()
+    for col in final_cols:
+        if col not in df.columns: df[col] = np.nan
+
+    inference_window = df[final_cols].iloc[-SEQ_LEN:]
     
-    # 截取最后的 SEQ_LEN 给模型推断
-    inference_window = final_df.iloc[-SEQ_LEN:]
-    
-    # 🚨 物理熔断机制：拒绝任何形态的空值！
     if inference_window.isnull().any().any():
         missing_cols = inference_window.columns[inference_window.isnull().any()].tolist()
-        raise ValueError(f"🚨 实盘数据特征矩阵出现断层！包含空值的列: {missing_cols}。拒绝输出预测信号！")
+        raise ValueError(f"🚨 引擎熔断！网关传入数据在以下特征存在断层: {missing_cols}。拒绝输出预测信号！")
         
     return inference_window
 
@@ -364,7 +347,7 @@ def run_live():
                 
                 # 只有跨入新的一小时，才执行沉重的 Transformer 张量计算
                 if latest_closed_ts != last_inferred_hour:
-                    print(f"\n🔄 [换线时刻] 侦测到 K 线闭合 (TS: {latest_closed_ts})，开始重构 23 维张量...")
+                    print(f"\n🔄 [换线时刻] 侦测到 K 线闭合 (TS: {latest_closed_ts})，开始重构 29 维张量...")
                     
                     eth_usdt_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[0]}").json()
                     eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()

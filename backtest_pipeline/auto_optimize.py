@@ -8,22 +8,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import time
 import sys
+import argparse
+import uuid
+import gc
+import torch
 
 # ==========================================
 # 1. 通宵级全维寻优空间 
 # ==========================================
 SEARCH_SPACE = {
-    'SEQ_LEN': [168],
-    'CLASS_THRESHOLD': [0.024],
+    'SEQ_LEN': [336],
+    'CLASS_THRESHOLD': [0.026,0.027,0.028],
     'E_LAYERS': [2],
-    'D_MODEL': [64],
+    'D_MODEL': [512],
     'DROPOUT': [0.4],
     'LEARNING_RATE': [5e-5],
     'BATCH_SIZE': [256],
-    'EPOCHS': [100] 
+    'EPOCHS': [50] 
 }
 
-SINGLE_MODE_REPEATS = 48
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
@@ -52,8 +55,8 @@ def extract_metrics(output):
         pass
     return metrics
 
-def run_experiment(params, is_grid_search):
-    exp_id = f"EXP_{hash(frozenset(params.items()) if is_grid_search else str(time.time())) % 1000000}"
+def run_experiment(params, save_models):
+    exp_id = f"EXP_{uuid.uuid4().hex[:8].upper()}"
     
     env = os.environ.copy()
     env["OPT_EXP_ID"] = exp_id
@@ -82,33 +85,41 @@ def run_experiment(params, is_grid_search):
     
     # 子进程内的即时清理 (防积压第一道防线)
     model_file_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
-    if is_grid_search:
+    if not save_models:
         try: os.remove(model_file_path) 
         except FileNotFoundError: pass
-        res['model_file'] = "Deleted (Grid Search)"
+        res['model_file'] = "Deleted"
     else:
         res['model_file'] = model_file_path.name
 
-    try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
-    except FileNotFoundError: pass
-    try: os.remove(TRAIN_DATA_DIR / f"backtest_probabilistic_{exp_id}.png")
-    except FileNotFoundError: pass
+    if not save_models:
+        try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
+        except FileNotFoundError: pass
+        try: os.remove(TRAIN_DATA_DIR / f"backtest_probabilistic_{exp_id}.png")
+        except FileNotFoundError: pass
     
     return res
 
 def main():
-    keys, values = zip(*SEARCH_SPACE.items())
-    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    
-    is_grid_search = len(combinations) > 1
-    
-    if not is_grid_search:
-        print(f"🔍 模式切换：检测到参数唯一，进入【稳健性盲盒模式】...")
-        combinations = [combinations[0] for _ in range(SINGLE_MODE_REPEATS)]
-    else:
-        print(f"🔥 模式切换：进入【海量并发寻优模式】...")
+    parser = argparse.ArgumentParser(description='Auto Optimize iTransformer')
+    parser.add_argument('--repeats', type=int, default=1, help='Number of repeats for each parameter combination')
+    parser.add_argument('--save-models', action='store_true', help='Whether to save models and dynamic thresholds')
+    args = parser.parse_args()
 
-    MAX_WORKERS = 16 
+    keys, values = zip(*SEARCH_SPACE.items())
+    base_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    combinations = []
+    for combo in base_combinations:
+        for _ in range(args.repeats):
+            combinations.append(combo.copy())
+            
+    print(f"🔥 模式切换：进入【统一寻优模式】...")
+    print(f"   参数组合数: {len(base_combinations)}")
+    print(f"   每组重复次数: {args.repeats}")
+    print(f"   是否保存模型: {'是' if args.save_models else '否'}")
+
+    MAX_WORKERS = 8 
     total_tasks = len(combinations)
     
     # 🚨 核心逻辑：将任务切分为多个批次 (Chunking)
@@ -125,7 +136,7 @@ def main():
         print(f"\n🚀 正在拉起第 {batch_idx}/{len(batches)} 批次 (包含 {len(batch)} 组模型) ...")
         
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(run_experiment, params, is_grid_search): params for params in batch}
+            futures = {executor.submit(run_experiment, params, args.save_models): params for params in batch}
             
             for future in as_completed(futures):
                 res = future.result()
@@ -144,19 +155,19 @@ def main():
         # 🚨 每个批次结束后的“第二道防线”：物理级强制扫盘清场
         pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
         
-        if is_grid_search:
-            swept_files = 0
+        swept_files = 0
+        if not args.save_models:
             for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
                 try: os.remove(f); swept_files += 1 
                 except Exception: pass
             for f in TRAIN_DATA_DIR.glob("backtest_probabilistic_EXP_*.png"):
                 try: os.remove(f); swept_files += 1
                 except Exception: pass
-            for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
+            for f in MODEL_DIR.glob("itransformer_*_best_EXP_*.pth"):
                 try: os.remove(f); swept_files += 1 
                 except Exception: pass
             
-        print(f"🧹 第 {batch_idx} 批次收尾完毕 | CSV已更新 | 强制清场扫描清理了 {swept_files if is_grid_search else 0} 个僵尸残余。")
+        print(f"🧹 第 {batch_idx} 批次收尾完毕 | CSV已更新 | 强制清场扫描清理了 {swept_files} 个僵尸残余。")
 
     print("=" * 70)
     print(f"🎉 寻优任务大功告成！总耗时: {(time.time() - start_time) / 60:.2f} 分钟。")

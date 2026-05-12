@@ -29,8 +29,8 @@ all_symbols = [SYMBOL] + AUX_SYMBOLS
 
 for sym in all_symbols:
     market_data_store[sym] = {
-        "1m": deque(maxlen=120),
-        "1h": deque(maxlen=500), 
+        "1m": deque(maxlen=35000), # 增加长度以支撑 1m RV 计算
+        "1h": deque(maxlen=1000), # 从 500 提升到 1000，确保满足 504 需求
         "orderbook": {"bids": [], "asks": []},
         "ticker": {"last": None},
         "liquidations": deque(maxlen=1000), 
@@ -342,6 +342,16 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
                 oi_data = await exchange.fetch_open_interest(swap_symbol)
             market_data_store[symbol]["open_interest"] = float(oi_data.get('openInterestAmount', oi_data.get('baseVolume', 0.0)))
             
+            # 🚨 新增：拉取币安原生大户多空持仓比
+            async with rest_semaphore:
+                ls_ratio_data = await exchange.fapiDataGetTopLongShortPositionRatio({
+                    'symbol': exchange.market_id(swap_symbol),
+                    'period': '5m',
+                    'limit': 1
+                })
+                if ls_ratio_data and len(ls_ratio_data) > 0:
+                    market_data_store[symbol]["ls_ratio"] = float(ls_ratio_data[0]['longShortRatio'])
+
             # 新增：拉取溢价指数 K 线 (最近 2 根 1h)
             async with rest_semaphore:
                 # CCXT 底层透传 Binance 专属 API
@@ -360,73 +370,44 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
         await asyncio.sleep(60 + random.uniform(0, 5.0))
 
 async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
-    """ 智能补隙与预热引擎：查验本地库 -> 计算断层时间差 -> 增量拉取 -> 灌入内存 """
-    print(f"🔍 [冷启动引擎] 正在校验 {symbol} 本地记忆库...")
+    """
+    自愈式预热：检查本地库是否存在时间空隙 (Gaps)，发现即重拉，绝不补0。
+    """
+    print(f"🔍 [网关自愈] 正在校验 {symbol} 历史数据的连续性...")
     
     with sqlite3.connect(DB_PATH) as conn:
+        # 获取最近 1000 根 K 线的时间戳
         cursor = conn.cursor()
-        cursor.execute("SELECT MAX(timestamp) FROM memory_1h WHERE symbol=?", (symbol,))
-        last_ts = cursor.fetchone()[0]
+        cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1000", (symbol,))
+        ts_list = [r[0] for r in cursor.fetchall()]
 
-    limit = 504 # 默认最大拉取 21 天 (覆盖 Z-score 168 + 模型 336)
-    params = {}
-    
-    if last_ts:
-        # 计算距离现在断层了多少个小时
-        gap_hours = int((datetime.utcnow().timestamp() * 1000 - last_ts) / 3600000)
-        if gap_hours <= 0:
-            print(f"   ✅ {symbol} 本地数据已是最新，无缝启动。")
-            limit = 0
+    if len(ts_list) < 2:
+        # 初次启动，拉取全量
+        print(f"   🆕 {symbol} 本地无数据，执行全量预热...")
+        await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, limit=1000)
+    else:
+        # 检查时间轴空隙
+        ts_list.reverse()
+        gaps = []
+        for i in range(len(ts_list) - 1):
+            if ts_list[i+1] - ts_list[i] != 3600000: # 1h 差值应为 3600000ms
+                gaps.append((ts_list[i], ts_list[i+1]))
+        
+        if gaps:
+            print(f"   ⚠️ {symbol} 侦测到 {len(gaps)} 处数据空隙，正在强制回填物理数据...")
+            for start, end in gaps:
+                # 针对每一处空隙，精准拉取
+                await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=start+1, limit=500)
         else:
-            print(f"   ⚠️ {symbol} 发现数据断层，正在从 {datetime.fromtimestamp(last_ts/1000)} 追赶 {gap_hours} 小时数据...")
-            params['startTime'] = last_ts + 1  # 严格从上一根之后开始接力
-            limit = min(gap_hours + 1, 1000)   # 防止单次拉取击穿交易所上限
+            print(f"   ✅ {symbol} 时间轴完美连续。")
 
-    if limit > 0:
-        try:
-            async with rest_semaphore:
-                if not is_spot:
-                    # 💡 主币种 (合约)：绕开 CCXT 标准壳，直击 Binance 底层 API，抠出 12 维量价密码
-                    klines = await exchange.fapiPublicGetKlines({'symbol': exchange.market_id(swap_symbol), 'interval': '1h', 'limit': limit, **params})
-                else:
-                    # 辅币种 (现货)：只需基础 K 线，用标准 CCXT 足矣
-                    klines = await exchange.fetch_ohlcv(swap_symbol, '1h', limit=limit, params=params)
-
-            new_records = []
-            for k in klines:
-                ts = int(k[0])
-                vol = float(k[5])
-                
-                # 现货没这些数据，统统 0 兜底；合约则精准剥离
-                q_vol = float(k[7]) if not is_spot and len(k) > 7 else 0.0
-                cnt = int(k[8]) if not is_spot and len(k) > 8 else 0
-                tb_vol = float(k[9]) if not is_spot and len(k) > 9 else 0.0
-
-                new_records.append((
-                    symbol, ts,
-                    float(k[1]), float(k[2]), float(k[3]), float(k[4]), vol,
-                    q_vol, cnt, tb_vol, vol - tb_vol,
-                    0.0, 0.0, vol * 0.1 # 预热阶段的大户/散户使用中性值过渡
-                ))
-
-            if new_records:
-                with sqlite3.connect(DB_PATH) as conn:
-                    # INSERT OR REPLACE 完美处理时间轴重叠问题
-                    conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new_records)
-                    conn.commit()
-                print(f"   💾 {symbol} 追赶完毕，已将 {len(new_records)} 根断层特征安全落库。")
-                
-        except Exception as e:
-            print(f"   ❌ {symbol} 追赶拉取失败: {e}")
-
-    # ================= 终极步骤：将本地无瑕疵的 504 根记录全量灌入内存 =================
+# ================= 终极步骤：将完美的 1000 根数据灌入内存 =================
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 504", (symbol,))
+        cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1000", (symbol,))
         rows = cursor.fetchall()
 
-    rows.reverse() # 倒序，按时间先后顺序推入 deque
-
+    rows.reverse()
     for r in rows:
         ts = r[1]
         market_data_store[symbol]["1h"].append([ts, r[2], r[3], r[4], r[5], r[6]])
@@ -436,6 +417,79 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
                 "taker_buy_volume": r[9], "taker_sell_volume": r[10],
                 "whale_buy": r[11], "whale_sell": r[12], "retail_vol": r[13]
             }
+    # === 新增：网关包揽 1m K线与所有衍生品的历史时序拉取 ===
+    if not is_spot:
+        print(f"🔍 [网关自愈] 正在拉取 {symbol} 衍生品时序与 1m 显微镜底座...")
+        try:
+            print(f"🔍 [网关自愈] 正在全量拉取 {symbol} 过去 504 小时的 1m 显微数据 (约3万根)...")
+            end_time = int(time.time() * 1000)
+            start_time = end_time - 505 * 3600 * 1000 # 多拉 1 小时容错
+            all_1m = []
+            curr_ts = start_time
+
+            while curr_ts < end_time:
+                batch = await exchange.fetch_ohlcv(swap_symbol, '1m', since=curr_ts, limit=1500)
+                if not batch:
+                    break
+                all_1m.extend(batch)
+                curr_ts = batch[-1][0] + 60000 # 步进 1 分钟
+                await asyncio.sleep(0.1) # 防护 API 速率限制
+
+            market_data_store[symbol]["1m"].clear()
+            market_data_store[symbol]["1m"].extend(all_1m)
+            print(f"   ✅ {symbol} 1m 高频数据装填完毕，共 {len(all_1m)} 根。")
+
+            raw_sym = exchange.market_id(swap_symbol)
+
+            # 2. 补齐溢价指数时序 (500小时)
+            prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 500})
+            market_data_store[symbol]["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines]
+
+            # 3. 补齐资金费率时序 (500个节点)
+            fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
+            market_data_store[symbol]["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist]
+
+            # 4. 补齐 Open Interest 时序 (500小时)
+            oi_hist = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500})
+            market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist]
+
+            # 5. 补齐大户多空比时序 (500小时)
+            ls_hist = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500})
+            market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist]
+            
+        except Exception as e:
+            print(f"⚠️ {symbol} 衍生品时序拉取异常: {e}")
+async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=None, limit=500):
+    """通用拉取并落库逻辑，直接从交易所获取物理真实 K 线"""
+    params = {'startTime': startTime} if startTime else {}
+    try:
+        async with rest_semaphore:
+            if not is_spot:
+                # 合约使用 fapi 获取全维度数据
+                klines = await exchange.fapiPublicGetKlines({'symbol': exchange.market_id(swap_symbol), 'interval': '1h', 'limit': limit, **params})
+            else:
+                klines = await exchange.fetch_ohlcv(swap_symbol, '1h', params=params)
+        
+        new_records = []
+        for k in klines:
+            # 这里的 index 严格对应你的 memory_1h 表结构
+            # 绝不手动填充 0，直接使用交易所返回的物理值
+            vol = float(k[5])
+            new_records.append((
+                symbol, int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), vol,
+                float(k[7]) if len(k)>7 else 0.0, # quote_volume
+                int(k[8]) if len(k)>8 else 0,     # count
+                float(k[9]) if len(k)>9 else 0.0, # taker_buy
+                vol - float(k[9]) if len(k)>9 else 0.0,
+                0.0, 0.0, vol * 0.1 # 权重过渡
+            ))
+        
+        if new_records:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new_records)
+                conn.commit()
+    except Exception as e:
+        print(f"   ❌ {symbol} 物理回填失败: {e}")
 
 async def db_persist_loop():
     """ 自动存档守护进程：将 WebSocket 即时揉出的微观流，每分钟刷入硬盘 """
@@ -612,8 +666,11 @@ async def get_market_snapshot(symbol: str):
     if clean_sym == SYMBOL or clean_sym.replace("/", "") == SYMBOL:
         response.update({
             "taker_stats_1h": data.get("taker_stats_1h", {}),
-            "premium_index": list(data.get("premium_index", [])),
-            "funding_rate": data.get("funding_rate", 0.0),
+            "ohlcv_1m": list(data.get("1m", [])),
+            "premium_history": data.get("premium_history", []),
+            "funding_history": data.get("funding_history", []),
+            "oi_history": data.get("oi_history", []),
+            "ls_history": data.get("ls_history", [])
         })
 
     return response

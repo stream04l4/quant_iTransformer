@@ -67,7 +67,8 @@ def check_distribution():
     
     # 🚨 核心修复 2：使用 DataLoader 进行大批量并行推断
     dataset = FastSeqDataset(X_baseline, SEQ_LEN)
-    loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
+    # 🚨 关闭锁页内存，释放操作系统的页表管理压力
+    loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
     
     p_down_list, p_flat_list, p_up_list = [], [], []
     

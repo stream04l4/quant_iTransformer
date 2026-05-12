@@ -85,13 +85,13 @@ HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
 # ==========================================
 EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
-SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 168))
+SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 336))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
 LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-5))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 512))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.024))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.026))
