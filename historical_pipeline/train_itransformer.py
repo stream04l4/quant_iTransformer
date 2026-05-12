@@ -85,8 +85,10 @@ class CryptoDataset(Dataset):
         if is_train:
             self.X, self.Y = X[:split_idx], Y_class[:split_idx]
         else:
-            self.X, self.Y = X[split_idx:], Y_class[split_idx:]
-        
+            # 🚨 核心修复：强行隔离！验证集起点必须向后退让 FORECAST_HORIZON，切断特征与训练集标签的未来交叉
+            val_start_idx = split_idx + FORECAST_HORIZON
+            self.X, self.Y = X[val_start_idx:], Y_class[val_start_idx:]
+            
         self.seq_len = seq_len
 
     def __len__(self):
@@ -159,11 +161,14 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda')
     
+    # 🚨 终极修复：废弃 F1，回归 Val Loss 置信度监控，并引入容忍度极低的早停机制
     best_val_loss = float('inf')
+    patience = 7                  # 容忍度：连续 5 个 Epoch 验证集 Loss 不降则强行停止 (对于高噪金融数据，5已足够)
+    patience_counter = 0          # 早停计数器
     
-    print("\n🔥 开始炼丹 (分类模式 Training Loop)...")
+    print("\n🔥 开始炼丹 (引入置信度监控与防过拟合机制)...")
     for epoch in range(EPOCHS):
-        # --- 训练阶段 ---
+        # --- 训练阶段 (保持你原有的训练逻辑不变) ---
         model.train()
         train_loss = 0.0
         train_correct = 0
@@ -182,8 +187,6 @@ def train_model():
             scaler.update()
             
             train_loss += loss.item()
-            
-            # 计算训练准确率
             preds = torch.argmax(output, dim=1)
             train_correct += (preds == batch_y).sum().item()
             train_total += batch_y.size(0)
@@ -205,31 +208,28 @@ def train_model():
                     v_loss = criterion(output, batch_y)
                     
                 val_loss += v_loss.item()
-                
-                # 计算验证准确率
                 preds = torch.argmax(output, dim=1)
+                
                 val_correct += (preds == batch_y).sum().item()
                 val_total += batch_y.size(0)
-        
+                
         avg_val_loss = val_loss / len(val_loader)
         val_acc = (val_correct / val_total) * 100
         
         scheduler.step()
         
         current_lr = optimizer.param_groups[0]['lr']
-        # 打印日志加入了准确率 (Acc) 的展示
         print(f"Epoch [{epoch+1:02d}/{EPOCHS}] | LR: {current_lr:.2e} | "
               f"Train Loss: {avg_train_loss:.4f} (Acc: {train_acc:.2f}%) | "
               f"Val Loss: {avg_val_loss:.4f} (Acc: {val_acc:.2f}%)")
         
-        # --- 保存机制 (保持不变) ---
+        # --- 置信度选优与早停保存机制 ---
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            patience_counter = 0  # 创下置信度新高，重置早停计数器
+            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
             save_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth"
-            
-            #for old_model in MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_*.pth"):
-            #    old_model.unlink()
             
             torch.save({
                 'epoch': epoch,
@@ -238,7 +238,16 @@ def train_model():
                 'val_loss': best_val_loss,
                 'val_acc': val_acc
             }, save_path)
-            print(f"   ⭐ 新的最优模型已保存! 当前 Val Acc: {val_acc:.2f}%")
+            print(f"    ⭐ 泛化能力最强的权重已保存! 当前最低 Val Loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"    ⚠️ Val Loss 出现抬头迹象，未改善 ({patience_counter}/{patience})")
+
+        # 🚨 熔断判定：强行切断死记硬背
+        if patience_counter >= patience:
+            print("\n🛑 触发早停机制 (Early Stopping)：验证集置信度已连续恶化，强行终止训练！")
+            print(f"🎯 最终采用的是第 {epoch - patience_counter + 1} 轮保存的最优泛化权重。")
+            break  # 砸碎炼丹炉，跳出训练
 
     print(f"\n🎉 训练全部完成！最终模型路径: {save_path}")
 

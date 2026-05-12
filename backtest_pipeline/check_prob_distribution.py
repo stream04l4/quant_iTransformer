@@ -67,25 +67,28 @@ def check_distribution():
     
     # 🚨 核心修复 2：使用 DataLoader 进行大批量并行推断
     dataset = FastSeqDataset(X_baseline, SEQ_LEN)
-    # 🚨 关闭锁页内存，释放操作系统的页表管理压力
+    # 关闭锁页内存，释放操作系统的页表管理压力
     loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
     
-    p_down_list, p_flat_list, p_up_list = [], [], []
+    # 🚨 产业界优化：改用 Chunk (块) 收集法，消除数百万次 list.extend 带来的极度内存碎片化和降速
+    p_down_chunks, p_flat_chunks, p_up_chunks = [], [], []
     
     with torch.no_grad():
         for batch_x in loader:
             batch_x = batch_x.to(DEVICE)
             with torch.amp.autocast('cuda'):
                 logits = model(batch_x)
+                # 直接按 batch 块保留 numpy 数组
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
                 
-            p_down_list.extend(probs[:, 0])
-            p_flat_list.extend(probs[:, 1])
-            p_up_list.extend(probs[:, 2])
+            p_down_chunks.append(probs[:, 0])
+            p_flat_chunks.append(probs[:, 1])
+            p_up_chunks.append(probs[:, 2])
 
-    p_down = np.array(p_down_list)
-    p_flat = np.array(p_flat_list)
-    p_up = np.array(p_up_list)
+    # 循环结束后，在 C 语言底层一次性完成连续内存的拼接，速度提升数十倍
+    p_down = np.concatenate(p_down_chunks)
+    p_flat = np.concatenate(p_flat_chunks)
+    p_up = np.concatenate(p_up_chunks)
 
     print("\n📊 模型输出概率分位数统计 (基于历史基准防止未来函数):")
     print("=" * 60)

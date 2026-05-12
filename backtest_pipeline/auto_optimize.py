@@ -17,13 +17,13 @@ import torch
 # 1. 通宵级全维寻优空间 
 # ==========================================
 SEARCH_SPACE = {
-    'SEQ_LEN': [168, 336, 672],
+    'SEQ_LEN': [336],
     'CLASS_THRESHOLD': [0.026],
-    'E_LAYERS': [2, 3],
-    'D_MODEL': [512, 768],
-    'DROPOUT': [0.4, 0.5],
-    'LEARNING_RATE': [5e-5, 1e-4],
-    'BATCH_SIZE': [256, 512],
+    'E_LAYERS': [1],
+    'D_MODEL': [256],
+    'DROPOUT': [0.4],
+    'LEARNING_RATE': [5e-5],
+    'BATCH_SIZE': [512],
     'EPOCHS': [50] 
 }
 

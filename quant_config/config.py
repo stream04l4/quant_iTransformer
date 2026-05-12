@@ -75,7 +75,7 @@ HARD_SL = 0.3           # 绝对止损线 50%
 # --- 实盘专用风控与仓位参数 ---
 LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
 TRADE_COOLDOWN_SEC = 3600            # 开仓后防连续发车冷却时间(秒)
-MAX_MACRO_IMPACT = 0.015            # 宏观情绪对模型输出概率的最大干预幅度
+MAX_MACRO_IMPACT = 0.03            # 宏观情绪对模型输出概率的最大干预幅度
 MACRO_CHECK_INTERVAL = 1800         # 宏观情报拉取间隔(秒)
 HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
 
@@ -88,10 +88,10 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 336))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-5))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-5))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 512))
-E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 256))
+E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 1))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
 CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.026))

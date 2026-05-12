@@ -12,7 +12,12 @@ from pathlib import Path
 import json
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID,FEE_RATE,HOLD_PERIOD,HARD_TP,HARD_SL,LEVERAGE_1,LEVERAGE_2,LEVERAGE_3
+from quant_config.config import (
+    SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
+    SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID,
+    FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, LEVERAGE_1, LEVERAGE_2, LEVERAGE_3,
+    FORECAST_HORIZON  # 🚨 新增：引入预测窗口长度
+)
 from historical_pipeline.train_itransformer import InvertedTransformer
 
 
@@ -54,7 +59,7 @@ def run_backtest():
     X_raw = df.select(feature_cols).to_numpy().astype('float32')
     timestamps = df.select("hour_timestamp").to_series().to_numpy()
     
-    split_idx = int(len(X_raw) * 0.8)
+    split_idx = int(len(X_raw) * 0.8) + FORECAST_HORIZON
     X_test_raw = X_raw[split_idx:]
     test_timestamps = timestamps[split_idx:]
     
@@ -128,6 +133,7 @@ def run_backtest():
     trade_start_equity = 1.0 
     current_leverage = 0.0   
     entry_time = None
+    cumulative_funding = 0.0  # 🚨 新增：单笔交易累计资金费率追踪器
     
     max_unrealized_pnl = 0.0 
     is_trailing = False      
@@ -193,6 +199,7 @@ def run_backtest():
                 
                 trade_start_equity = equity 
                 equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
+                cumulative_funding = 0.0  # 🚨 新增：每次全新开仓时，重置资金费累加器
                 
                 if target_pos == 1: long_trades += 1
                 if target_pos == -1: short_trades += 1
@@ -295,7 +302,8 @@ def run_backtest():
                 
             if close_position:
                 floating_equity = trade_start_equity * (1 - current_leverage * FEE_RATE + actual_exit_pct)
-                floating_equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE) # 扣除平仓手续费
+                floating_equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE) # 扣除平仓滑点和手续费
+                floating_equity -= cumulative_funding  # 🚨 核心修复：真实扣除持有期间累计产生的资金费率
                 equity = floating_equity
                 
                 trade_pnl = equity - trade_start_equity
@@ -309,9 +317,10 @@ def run_backtest():
                 current_pos = 0 
                 current_leverage = 0.0
             else:
-                # 若持仓跨越当前小时，账面浮盈以本小时最后一分钟收盘价计
-                equity = trade_start_equity * (1 - current_leverage * FEE_RATE + close_pnl_pct)
-                equity -= trade_start_equity * current_leverage * HOURLY_FUNDING_COST
+                # 🚨 核心修复：将本小时的真实资金费率滚入累计池
+                cumulative_funding += trade_start_equity * current_leverage * HOURLY_FUNDING_COST
+                # 若持仓跨越当前小时，账面浮盈以本小时最后一分钟收盘价计，并扣减所有历史累计资金费
+                equity = trade_start_equity * (1 - current_leverage * FEE_RATE + close_pnl_pct) - cumulative_funding
                 # 将追踪起点推移至下一个 1 小时的开端
                 entry_time = chunk_end_time
                 

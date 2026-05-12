@@ -219,8 +219,9 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
 
 def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
     delta = pl.col(price_col).diff()
-    gain = pl.when(delta > 0).then(delta).otherwise(0).ewm_mean(span=period, adjust=False)
-    loss = pl.when(delta < 0).then(-delta).otherwise(0).ewm_mean(span=period, adjust=False)
+    # 使用 Wilder's Smoothing 标准的 alpha=1/period，而非 EMA 的 2/(N+1)
+    gain = pl.when(delta > 0).then(delta).otherwise(0).ewm_mean(alpha=1.0/period, adjust=False)
+    loss = pl.when(delta < 0).then(-delta).otherwise(0).ewm_mean(alpha=1.0/period, adjust=False)
     return 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
 # ==========================================
@@ -260,6 +261,30 @@ def build_features():
     if btc_premium is not None: master_df = master_df.join(btc_premium, on="hour_timestamp", how="left")
     if eth_usdt is not None: master_df = master_df.join(eth_usdt, on="hour_timestamp", how="left")
     if btc_metrics is not None: master_df = master_df.join(btc_metrics, on="hour_timestamp", how="left")
+
+    # ==========================================
+    # 🚨 核心修复：强制时间轴连续化，消除断网/维护造成的 shift/rolling 未来信息错位
+    # ==========================================
+    master_df = master_df.upsample(
+        time_column="hour_timestamp", 
+        every="1h"
+    ).with_columns([
+        # 价格、衍生品等状态类特征使用前向填充
+        pl.col("open").fill_null(strategy="forward"),
+        pl.col("high").fill_null(strategy="forward"),
+        pl.col("low").fill_null(strategy="forward"),
+        pl.col("close").fill_null(strategy="forward"),
+        pl.col("eth_usdt_close").fill_null(strategy="forward"),
+        pl.col("last_funding_rate").fill_null(strategy="forward"),
+        pl.col("premium_close").fill_null(strategy="forward"),
+        pl.col("sum_open_interest").fill_null(strategy="forward"),
+        pl.col("sum_toptrader_long_short_ratio").fill_null(strategy="forward"),
+        # 交易量维度数据若缺失，视为该小时 0 成交，绝不能 forward fill
+        pl.col("volume").fill_null(0.0),
+        pl.col("quote_volume").fill_null(0.0),
+        pl.col("count").fill_null(0),
+        pl.col("taker_buy_volume").fill_null(0.0)
+    ])
 
     # 🚨 产业界三角合成法：用 ETH/USDT 除以 BTC/USDT (即当前的 close) 生成 ETH/BTC
     if "eth_usdt_close" in master_df.columns:
@@ -350,7 +375,7 @@ def build_features():
         ((build_rsi_expr("close", 48) - 50) / 50.0).alias("rsi_48"),
         # 🚨 [修改] TBRD: 主动买入占比的差分(加速度)，捕捉资金突袭
         (pl.col("taker_buy_volume") / (pl.col("volume") + 1e-9)).diff().alias("taker_ratio_delta"),
-        (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("vpt"),
+        (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("avg_trade_size"), # 修正命名逻辑，真实含义为平均交易粒度
         
         # 🚨 Alpha 1: Open Interest 持仓动能与价格背离交叉乘积
         ((pl.col("sum_open_interest") - pl.col("sum_open_interest").shift(1)) / (pl.col("sum_open_interest").shift(1) + 1e-9)).alias("oi_delta_pct"),
@@ -392,7 +417,8 @@ def build_features():
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
             pl.col("cvd").fill_null(0),
             pl.col("whale_net_flow").fill_null(0),
-            pl.col("retail_ratio").fill_null(strategy="forward").fill_null(strategy="backward").fill_null(0.1)
+            # 剔除 backward 填充，防止开局缺失时使用未来行倒填，直接使用 0.1(10%) 兜底
+            pl.col("retail_ratio").fill_null(strategy="forward").fill_null(0.1)
         ])
     else:
         print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")

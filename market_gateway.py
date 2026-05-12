@@ -329,44 +329,82 @@ async def mark_price_loop(exchange, symbol, swap_symbol):
             await asyncio.sleep(5)
 
 async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
-    print(f"📡 [REST] 启动 {symbol} {engine_type} 衍生品数据轮询...")
+    print(f"📡 [REST] 启动 {symbol} {engine_type} 衍生品数据轮询 (维护底层时序数组)...")
     await asyncio.sleep(random.uniform(5.0, 25.0))
     
+    raw_sym = exchange.market_id(swap_symbol)
+
     while True:
         try:
+            # 1. 维护 1h 溢价指数时序 (Premium Index)
             async with rest_semaphore:
-                fr_data = await exchange.fetch_funding_rate(swap_symbol)
-            market_data_store[symbol]["funding_rate"] = float(fr_data.get('fundingRate', 0.0))
-            
-            async with rest_semaphore:
-                oi_data = await exchange.fetch_open_interest(swap_symbol)
-            market_data_store[symbol]["open_interest"] = float(oi_data.get('openInterestAmount', oi_data.get('baseVolume', 0.0)))
-            
-            # 🚨 新增：拉取币安原生大户多空持仓比
-            async with rest_semaphore:
-                ls_ratio_data = await exchange.fapiDataGetTopLongShortPositionRatio({
-                    'symbol': exchange.market_id(swap_symbol),
-                    'period': '5m',
-                    'limit': 1
+                prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({
+                    'symbol': raw_sym, 'interval': '1h', 'limit': 2
                 })
-                if ls_ratio_data and len(ls_ratio_data) > 0:
-                    market_data_store[symbol]["ls_ratio"] = float(ls_ratio_data[0]['longShortRatio'])
+            if prem_klines:
+                hist = market_data_store[symbol].setdefault("premium_history", [])
+                for k in prem_klines:
+                    ts, val = int(k[0]), float(k[4]) # 4 is close
+                    if not hist or ts > hist[-1][0]:
+                        hist.append([ts, val])
+                    elif ts == hist[-1][0]:
+                        hist[-1] = [ts, val]
 
-            # 新增：拉取溢价指数 K 线 (最近 2 根 1h)
+            # 2. 维护 1h 未平仓合约量时序 (Open Interest)
             async with rest_semaphore:
-                # CCXT 底层透传 Binance 专属 API
-                premium_klines = await exchange.fapiPublicGetPremiumIndexKlines({
-                    'symbol': exchange.market_id(swap_symbol),
-                    'interval': '1h',
-                    'limit': 2
+                oi_hist_data = await exchange.fapiDataGetOpenInterestHist({
+                    'symbol': raw_sym, 'period': '1h', 'limit': 2
                 })
-                # 将最后收盘价压入队列
-                if premium_klines and len(premium_klines) > 0:
-                    latest_premium_close = float(premium_klines[-1][4]) # index 4 is close
-                    market_data_store[symbol]["premium_index"].append(latest_premium_close)
-            
+            if oi_hist_data:
+                hist = market_data_store[symbol].setdefault("oi_history", [])
+                for x in oi_hist_data:
+                    ts, val = int(x['timestamp']), float(x['sumOpenInterest'])
+                    if not hist or ts > hist[-1][0]:
+                        hist.append([ts, val])
+                    elif ts == hist[-1][0]:
+                        hist[-1] = [ts, val]
+
+            # 3. 维护 1h 大户多空比时序 (Long/Short Ratio)
+            async with rest_semaphore:
+                ls_hist_data = await exchange.fapiDataGetTopLongShortPositionRatio({
+                    'symbol': raw_sym, 'period': '1h', 'limit': 2
+                })
+            if ls_hist_data:
+                hist = market_data_store[symbol].setdefault("ls_history", [])
+                for x in ls_hist_data:
+                    ts, val = int(x['timestamp']), float(x['longShortRatio'])
+                    if not hist or ts > hist[-1][0]:
+                        hist.append([ts, val])
+                    elif ts == hist[-1][0]:
+                        hist[-1] = [ts, val]
+
+            # 4. 维护资金费率时序 (Funding Rate)
+            async with rest_semaphore:
+                fr_hist_data = await exchange.fapiPublicGetFundingRate({
+                    'symbol': raw_sym, 'limit': 2
+                })
+            if fr_hist_data:
+                hist = market_data_store[symbol].setdefault("funding_history", [])
+                for x in fr_hist_data:
+                    ts, val = int(x['fundingTime']), float(x['fundingRate'])
+                    if not hist or ts > hist[-1][0]:
+                        hist.append([ts, val])
+                    elif ts == hist[-1][0]:
+                        hist[-1] = [ts, val]
+
+            # ==========================================
+            # 🧹 内存泄露防护：控制历史数组的最大长度 (对齐历史预热的 500)
+            # ==========================================
+            for key in ["premium_history", "oi_history", "ls_history", "funding_history"]:
+                if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > 600:
+                    # 裁剪头部冗余数据，保留最新 600 个时间节点
+                    market_data_store[symbol][key] = market_data_store[symbol][key][-600:]
+
         except Exception as e:
-            pass 
+            # 去除之前的 pass，将网络抖动和底层 API 拒载显式抛出
+            print(f"   ⚠️ [REST 衍生品轮询异常] {symbol} 发生级联错误: {type(e).__name__} -> {e}")
+            
+        # 轮询抖动设计：防止触发 Binance 每分钟请求权重超限
         await asyncio.sleep(60 + random.uniform(0, 5.0))
 
 async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
