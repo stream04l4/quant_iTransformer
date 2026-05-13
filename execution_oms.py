@@ -310,8 +310,9 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         
         # 基于真实的成交均价，计算物理止盈止损位
         # 统一量纲：传入的 tp_pct 和 sl_pct 是带杠杆的预期收益率/亏损率，因此需要除以杠杆得到实际的 K 线涨跌幅
-        actual_tp_move = abs(tp_pct) / leverage
-        actual_sl_move = abs(sl_pct) / leverage
+        actual_tp_move = abs(tp_pct) 
+        actual_sl_move = abs(sl_pct) 
+        
         tp_price = actual_fill_price * (1 + actual_tp_move) if side == 'buy' else actual_fill_price * (1 - actual_tp_move)
         sl_price = actual_fill_price * (1 - actual_sl_move) if side == 'buy' else actual_fill_price * (1 + actual_sl_move)
 
@@ -405,8 +406,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     log_system_alert("✅ 超时抢救", symbol, msg_ok)
                     
                     # 👇 【修复 2：兜底价格计算】因为断网拿不到实际成交价，强制用当前盘口价测算防线
-                    actual_tp_move = abs(tp_pct) / leverage
-                    actual_sl_move = abs(sl_pct) / leverage
+                    actual_tp_move = abs(tp_pct)
+                    actual_sl_move = abs(sl_pct)
                     fallback_tp_price = current_price * (1 + actual_tp_move) if side == 'buy' else current_price * (1 - actual_tp_move)
                     fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
                     

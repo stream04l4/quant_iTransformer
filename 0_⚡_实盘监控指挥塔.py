@@ -207,6 +207,9 @@ defaults = {
     "default_win_rate": 0.52, "default_profit_loss_ratio": 1.5,
     # 👇 新增：右脑高频熔断阈值默认值
     "bailout_atr_multi": 2.5, "bailout_vol_multi": 3.0
+    # 👇 新增：核心动态追踪止盈止损 (Trailing Stop)
+    "trailing_trigger_roe": 5.0,  # 赚到 5% ROE 开始上移防线
+    "trailing_lock_roe": 2.0,     # 触发后，硬性保底 2% 的 ROE 利润
 }
 
 if 'settings' not in st.session_state:
@@ -260,8 +263,10 @@ def save_settings():
         "active_symbols": st.session_state.get("ui_active_symbols_state", s.get("active_symbols", SYMBOL)),
         "bailout_atr_multi": st.session_state.get("ui_bailout_atr_multi", s.get("bailout_atr_multi", 2.5)),
         "bailout_vol_multi": st.session_state.get("ui_bailout_vol_multi", s.get("bailout_vol_multi", 3.0)),
-        "max_margin_utilization": s.get("max_margin_utilization", 0.7),
-        "min_order_notional": s.get("min_order_notional", 6.0)
+        "max_margin_utilization": st.session_state.get("max_margin_utilization", 0.7),
+        "min_order_notional": st.session_state.get("min_order_notional", 6.0),
+        "trailing_trigger_roe": st.session_state.get("ui_trailing_trigger_roe", s.get("trailing_trigger_roe", 5.0)),
+        "trailing_lock_roe": st.session_state.get("ui_trailing_lock_roe", s.get("trailing_lock_roe", 2.0))
     }
     # 原子写入保持不变
     temp_file = f"{CONFIG_JSON_FILE}.tmp"
@@ -1330,7 +1335,9 @@ with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     st.caption("防插针过滤：结合量价的三重并发锁，识别真伪瀑布。")
     user_bailout_atr_multi = st.slider("价格瀑布乘数 (ATR)", min_value=1.5, max_value=8.0, value=float(st.session_state.settings.get("bailout_atr_multi", 2.5)), step=0.1, key="ui_bailout_atr_multi", on_change=save_settings, disabled=lock_params, help="1分钟内跌幅超过该倍数的 ATR 才会触发警报")
     user_bailout_vol_multi = st.slider("异常爆量乘数 (Volume)", min_value=1.5, max_value=10.0, value=float(st.session_state.settings.get("bailout_vol_multi", 3.0)), step=0.5, key="ui_bailout_vol_multi", on_change=save_settings, disabled=lock_params, help="下跌时的成交量必须大于过去15分钟均量的该倍数，以过滤无量假摔插针")
-
+    st.markdown("#### 🏃 动态追踪锁润 (Trailing Stop)")
+    user_trailing_trigger = st.slider("激活追踪的本金收益率 (ROE %)", 1.0, 50.0, float(st.session_state.settings.get("trailing_trigger_roe", 5.0)))
+    user_trailing_lock_roe = st.slider("硬性保底收益率 (ROE %)", 0.5, 20.0, float(st.session_state.settings.get("trailing_lock_roe", 2.0)), step=0.5)
     # 👇 新增：宏观干预专区
     st.markdown("#### 🌐 宏观情报干预")
     user_macro_impact = st.slider("宏观情绪干预幅度 (%)", min_value=0.0, max_value=5.0, value=float(st.session_state.settings.get("max_macro_impact", 1.5)), step=0.1, key="ui_macro_impact", on_change=save_settings, disabled=lock_params, help="宏观得分对AI原始概率的最大增减幅度 (如1.5%代表情绪极度狂热时，看涨概率强行增加1.5%)")

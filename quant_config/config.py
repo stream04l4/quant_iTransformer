@@ -63,14 +63,14 @@ METRICS_COLS = [
 # ==========================================
 # 这些参数在调优时需要频繁变动，集中管理以防止回测与实盘错配
 LEVERAGE_1 = 1.0           # 杠杆倍数
-LEVERAGE_2 = 2.0           # 杠杆倍数
-LEVERAGE_3 = 3.0           # 杠杆倍数
+LEVERAGE_2 = 3.0           # 杠杆倍数
+LEVERAGE_3 = 5.0           # 杠杆倍数
 
 FEE_RATE = 0.0005        # 交易所单边手续费 (币安市价单 Taker 万五)
 
 HOLD_PERIOD = 24         
-HARD_TP = 0.6           # 绝对止盈线 60% 
-HARD_SL = 0.3           # 绝对止损线 30% 
+HARD_TP = 0.05           # 绝对止盈线 6% 
+HARD_SL = 0.02           # 绝对止损线 2% 
 
 # --- 实盘专用风控与仓位参数 ---
 LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
@@ -80,7 +80,6 @@ MACRO_CHECK_INTERVAL = 1800         # 宏观情报拉取间隔(秒)
 HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
 MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC最大notional
 MAX_NOTIONAL_BTC = 100000            # 实盘BTC最大notional
-
 
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)

@@ -79,11 +79,14 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
         print(f"   ⚠️ 右脑熔断清仓失败: {e}")
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
 def bailout_worker():
-    """右脑主循环：每 1 秒高频巡视活体仓位 (微秒级本地感知)"""
-    print("🛡️ [右脑] 高频微观熔断器已启动 (1秒巡视机制，已接入本地极速网关)")
+    """右脑主循环：每 1 秒高频巡视活体仓位 (融合防插针熔断与 ROE 动态追踪锁润)"""
+    print("🛡️ [右脑] 高频微观熔断与动态锁润器已启动 (1秒巡视，微秒级本地感知)")
     bailout_ex = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     bailout_ex.set_sandbox_mode(True)
     bailout_cooldown_locks = {}
+    
+    # 🧠 虚拟吊灯内存池 (记录每个币种的历史最高收益率)
+    chandelier_mem = {}
     
     while True:
         try:
@@ -93,13 +96,18 @@ def bailout_worker():
             if not current_positions:
                 time.sleep(1)
                 continue
-                
+            
+            # 清理已经平仓的遗留状态
+            active_syms = [p['symbol'].split(':')[0].replace('/', '') for p in current_positions]
+            for k in list(chandelier_mem.keys()):
+                if k not in active_syms:
+                    del chandelier_mem[k]
+                    
             import concurrent.futures
             
             def fetch_snap(p):
                 base_sym = p['symbol'].split(':')[0].replace('/', '')
                 try:
-                    # 【优化1】：将 timeout 从 1.0 降低到 0.2。本地网关 200ms 拿不到数据直接丢弃，不要阻塞主轮询
                     resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym}", timeout=0.2)
                     if resp.status_code == 200:
                         return p, base_sym, resp.json()
@@ -107,7 +115,6 @@ def bailout_worker():
                     pass
                 return p, base_sym, None
                 
-            # 【优化2】：动态扩容线程池，确保一次性全量并发，而不是分批排队
             worker_count = max(30, len(current_positions) + 5)
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                 results = list(executor.map(fetch_snap, current_positions))
@@ -122,23 +129,73 @@ def bailout_worker():
                 if not data: continue
                 
                 try:
+                    current_close = float(data['current_price'])
+                    entry_px = float(p.get('entryPrice', p['info'].get('entry_price', p['info'].get('avgPx', 0))))
+                    pos_lev = float(p.get('leverage', p['info'].get('leverage', p['info'].get('lever', 1))))
+                    if pos_lev <= 0: pos_lev = 10.0
+                    
+                    # ==========================================
+                    # 📈 1. 动态 ROE 追踪锁润 (Trailing Profit Lock)
+                    # ==========================================
+                    # 读取前端 UI 动态设定的目标参数 (默认赚 5% 开始追踪，回撤 3% 也就是保底 2% 就平仓)
+                    dyn_trailing_trigger = float(state.dynamic_settings.get("trailing_trigger_roe", 5.0)) / 100.0
+                    dyn_trailing_pullback = float(state.dynamic_settings.get("trailing_pullback_roe", 3.0)) / 100.0
+                    
+                    if entry_px > 0:
+                        # 计算物理涨跌并放大为本金 ROE
+                        if pos_side == 'LONG':
+                            physical_move_pct = (current_close - entry_px) / entry_px
+                        else:
+                            physical_move_pct = (entry_px - current_close) / entry_px
+                            
+                        current_roe = physical_move_pct * pos_lev
+                        
+                        # 初始化或更新最高水位线 (High-Water Mark)
+                        if base_sym not in chandelier_mem:
+                            chandelier_mem[base_sym] = {'max_roe': 0.0, 'current_stop': 0.0}
+                            
+                        ch_state = chandelier_mem[base_sym]
+                        if current_roe > ch_state['max_roe']:
+                            ch_state['max_roe'] = current_roe
+                            
+                        # 如果最高收益曾经跨过起征点，激活锁润机制！
+                        if ch_state['max_roe'] >= dyn_trailing_trigger:
+                            # 计算需要硬性保底的利润率
+                            locked_roe = ch_state['max_roe'] - dyn_trailing_pullback
+                            required_physical_move = locked_roe / pos_lev
+                            
+                            # 将保底利润率反推回物理止盈价
+                            if pos_side == 'LONG':
+                                virtual_sl_px = entry_px * (1 + required_physical_move)
+                                ch_state['current_stop'] = max(ch_state['current_stop'], virtual_sl_px) if ch_state['current_stop'] > 0 else virtual_sl_px
+                            else:
+                                virtual_sl_px = entry_px * (1 - required_physical_move)
+                                ch_state['current_stop'] = min(ch_state['current_stop'], virtual_sl_px) if ch_state['current_stop'] > 0 else virtual_sl_px
+                                
+                            # 🎯 物理触发判定
+                            if ch_state['current_stop'] > 0:
+                                if (pos_side == 'LONG' and current_close <= ch_state['current_stop']) or \
+                                   (pos_side == 'SHORT' and current_close >= ch_state['current_stop']):
+                                    
+                                    execute_bailout(bailout_ex, base_sym, p, f"🎯 动态追踪止盈 (已锁定 ROE: {locked_roe*100:+.1f}%)", current_close)
+                                    bailout_cooldown_locks[base_sym] = time.time()
+                                    del chandelier_mem[base_sym]
+                                    continue # 已经平仓，跳过下面的瀑布防插针检查
+
+                    # ==========================================
+                    # 🆘 2. 原始高频瀑布插针熔断 (原封不动保留)
+                    # ==========================================
                     ohlcv_1m = data['ohlcv_1m']
                     if len(ohlcv_1m) < 14: continue
                     
-                    current_close = float(data['current_price'])
-                    
-                    # 【优化3】：彻底剥离 Pandas，使用原生 Python List 和 Math 进行微秒级运算
-                    # ohlcv 格式通常为: [ts, open, high, low, close, volume]
                     current_high = max(float(ohlcv_1m[-1][2]), current_close)
                     current_low = min(float(ohlcv_1m[-1][3]), current_close)
                     current_vol = float(ohlcv_1m[-1][5])
                     
-                    # 计算前序周期的平均量能
                     past_vols = [x[5] for x in ohlcv_1m[:-1]]
                     avg_vol = sum(past_vols) / len(past_vols) if past_vols else 1e-8
                     
-                    # 极速计算 14 周期 ATR (True Range: Max(H-L, abs(H-P_C), abs(L-P_C)))
-                    recent_15 = ohlcv_1m[-15:] # 取 15 根以计算 14 个 TR
+                    recent_15 = ohlcv_1m[-15:]
                     tr_list = []
                     for i in range(1, len(recent_15)):
                         prev_close = float(recent_15[i-1][4])
@@ -158,7 +215,6 @@ def bailout_worker():
                     
                     min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
                     
-                    # 🛡️ 门槛一：空间锁 (Price Delta)
                     if pos_side == 'LONG':
                         drop_amt = current_high - current_close
                         if drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
@@ -170,12 +226,9 @@ def bailout_worker():
                             
                     if not (is_flash_crash or is_flash_surge): continue
                     
-                    # 🛡️ 门槛二：真实抛压弹药锁 (Volume Spike)
                     actual_vol_multi = current_vol / (avg_vol + 1e-8)
-                    if actual_vol_multi < dyn_vol_multi: 
-                        continue
+                    if actual_vol_multi < dyn_vol_multi: continue
                         
-                    # 🛡️ 门槛三：盘口流动性枯竭锁 (OBI)
                     ob = data['orderbook']
                     bid_vol = sum([float(o[0]) * float(o[1]) for o in ob['bids'][:20]])
                     ask_vol = sum([float(o[0]) * float(o[1]) for o in ob['asks'][:20]])
@@ -193,6 +246,16 @@ def bailout_worker():
                             bailout_cooldown_locks[base_sym] = time.time()
                             
                 except Exception: pass
+                
+            # 🔄 每秒将最新的虚拟吊灯状态写入硬盘，供前端 UI 页面读取展示
+            try:
+                tmp_path = os.path.join(LIVE_DATA_DIR, "chandelier_state.json.tmp")
+                target_path = os.path.join(LIVE_DATA_DIR, "chandelier_state.json")
+                with open(tmp_path, "w") as f:
+                    json.dump(chandelier_mem, f)
+                os.replace(tmp_path, target_path)
+            except Exception: pass
+                
         except Exception: pass
         
         time.sleep(1)

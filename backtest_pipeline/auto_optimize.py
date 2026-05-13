@@ -19,11 +19,11 @@ import torch
 SEARCH_SPACE = {
     'SEQ_LEN': [336],
     'CLASS_THRESHOLD': [0.026],
-    'E_LAYERS': [1],
-    'D_MODEL': [256],
-    'DROPOUT': [0.4],
-    'LEARNING_RATE': [2e-5],
-    'BATCH_SIZE': [512],
+    'E_LAYERS': [1, 2],
+    'D_MODEL': [128, 256],
+    'DROPOUT': [0.4, 0.5],
+    'LEARNING_RATE': [1e-5],
+    'BATCH_SIZE': [128, 256, 512],
     'EPOCHS': [50] 
 }
 
@@ -37,21 +37,39 @@ RESULTS_CSV = TRAIN_DATA_DIR / "optimization_results.csv"
 def extract_metrics(output):
     metrics = {
         'win_rate': 0.0, 'final_equity': 0.0, 'sharpe': 0.0, 'trades': 0,
-        'max_drawdown': 0.0, 'profit_factor': 0.0, 'calmar': 0.0, 'ls_ratio': 0.0
+        'max_drawdown': 0.0, 'profit_factor': 0.0, 'calmar': 0.0, 'ls_ratio': 0.0,
+        'recovery_factor': 0.0, 'expectancy_pct': 0.0,
+        # 👇 新增四种出场指纹的计数列
+        'exit_reversal': 0, 'exit_hard_sl': 0, 'exit_trailing': 0, 'exit_timeout': 0
     }
     try:
-        if match := re.search(r"胜率 \(Win Rate\): ([\d\.]+)% \| 盈亏比.*: ([\d\.inf]+)", output): 
-            metrics['win_rate'] = float(match.group(1))
-            metrics['profit_factor'] = float(match.group(2)) if match.group(2) != 'inf' else 999.0
-        if match := re.search(r"期末策略净值: ([\d\.]+)", output): metrics['final_equity'] = float(match.group(1))
-        if match := re.search(r"估算年化夏普: ([\-\d\.]+) \| 卡玛比率: ([\-\d\.inf]+)", output): 
-            metrics['sharpe'] = float(match.group(1))
-            metrics['calmar'] = float(match.group(2)) if match.group(2) != 'inf' else 999.0
-        if match := re.search(r"最大回撤.*: ([\-\d\.]+)%", output): metrics['max_drawdown'] = float(match.group(1))
-        if match := re.search(r"共计交易: (\d+) 笔 .*多空比: ([\d\.inf]+)", output): 
+        # 基础指标
+        if match := re.search(r"▪ 撮合交易数 : (\d+) 笔 \(多:(\d+) \| 空:(\d+)\)", output):
             metrics['trades'] = int(match.group(1))
-            metrics['ls_ratio'] = float(match.group(2)) if match.group(2) != 'inf' else 999.0
-    except Exception: 
+            shorts = int(match.group(3))
+            metrics['ls_ratio'] = (int(match.group(2)) / shorts) if shorts > 0 else 999.0
+            
+        if match := re.search(r"▪ 最终净值\s+: ([\-\+\d\.]+)", output): metrics['final_equity'] = float(match.group(1))
+        if match := re.search(r"▪ 胜率 \(WR\)\s+: ([\-\+\d\.]+)%", output): metrics['win_rate'] = float(match.group(1))
+        if match := re.search(r"▪ 盈亏比 \(PF\):\s*([\-\+\d\.inf]+)", output): 
+            metrics['profit_factor'] = float(match.group(1)) if match.group(1) != 'inf' else 999.0
+        if match := re.search(r"▪ 夏普比率\s+: ([\-\+\d\.]+)", output): metrics['sharpe'] = float(match.group(1))
+        if match := re.search(r"▪ 卡玛比率\s+: ([\-\+\d\.inf]+)", output): 
+            metrics['calmar'] = float(match.group(1)) if match.group(1) != 'inf' else 999.0
+        if match := re.search(r"▪ 最大回撤\s+: ([\-\+\d\.]+)%", output): metrics['max_drawdown'] = float(match.group(1))
+        if match := re.search(r"▪ 恢复因子\s+: ([\-\+\d\.inf]+)", output): 
+            metrics['recovery_factor'] = float(match.group(1)) if match.group(1) != 'inf' else 999.0
+        if match := re.search(r"▪ 交易期望值 : ([\-\+\d\.]+)%", output): 
+            metrics['expectancy_pct'] = float(match.group(1))
+
+        # 👇 捕获行为诊断 (出场分布)
+        if match := re.search(r"▪ REVERSAL_EXIT\s+:\s*(\d+)\s*次", output): metrics['exit_reversal'] = int(match.group(1))
+        if match := re.search(r"▪ HARD_SL_EXIT\s+:\s*(\d+)\s*次", output): metrics['exit_hard_sl'] = int(match.group(1))
+        if match := re.search(r"▪ TRAILING_EXIT\s+:\s*(\d+)\s*次", output): metrics['exit_trailing'] = int(match.group(1))
+        if match := re.search(r"▪ TIME_LIMIT_EXIT\s+:\s*(\d+)\s*次", output): metrics['exit_timeout'] = int(match.group(1))
+            
+    except Exception as e: 
+        print(f"正则提取异常: {e}")
         pass
     return metrics
 
@@ -150,7 +168,8 @@ def main():
                 if "error" in res:
                     print(f"   {progress_str} ❌ 失败: {res['error'].splitlines()[0]}") # 只打首行防刷屏
                 else:
-                    print(f"   {progress_str} ✅ 夏普: {res['sharpe']:>5.2f} | 净值: {res['final_equity']:>5.2f} | 回撤: {res['max_drawdown']:>6.2f}%")
+                    # 👇 替换为包含期望值、恢复因子的豪华数据看板
+                    print(f"   {progress_str} ✅ 期望值: {res['expectancy_pct']:>+6.3f}% | 恢复因子: {res['recovery_factor']:>5.2f} | 夏普: {res['sharpe']:>5.2f} | 回撤: {res['max_drawdown']:>6.2f}%")
         
         # 🚨 每个批次结束后的“第二道防线”：物理级强制扫盘清场
         pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)

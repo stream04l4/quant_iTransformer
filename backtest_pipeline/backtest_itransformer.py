@@ -152,6 +152,15 @@ def run_backtest():
     SLIPPAGE = 0.0002 # 单边滑点万分之二 (应对市价单冲击成本)
     HOURLY_FUNDING_COST = 0.0001 / 8 # 假设平均资金费率为万分之一/8小时，均摊到每小时
 
+    # 新增出场原因计数器
+    exit_reasons = {
+        "REVERSAL_EXIT": 0,    # 概率反转直接斩仓
+        "HARD_SL_EXIT": 0,     # 触碰硬止损线
+        "TRAILING_EXIT": 0,    # 追踪止盈/止损出场
+        "TIME_LIMIT_EXIT": 0   # 24小时到期斩仓
+    }
+    pnl_list = [] # 记录每笔交易的纯利润，用于算偏度
+
     for i in range(len(predictions_probs)):
         # 🚨 增加进度回显，打破静默卡死错觉
         if i > 0 and i % 1000 == 0:
@@ -204,11 +213,13 @@ def run_backtest():
                 if target_pos == 1: long_trades += 1
                 if target_pos == -1: short_trades += 1
                 
-                max_unrealized_pnl = 0.0
-                is_trailing = False
+                # 👇 【修改：初始化纯物理追踪状态机】
+                max_unrealized_phys_pnl = 0.0   # 最高水位线 (物理幅度)
+                trailing_active = False         # 追踪止盈状态开关
+                dynamic_sl_phys = -abs(HARD_SL) # 动态止损线，初始以硬止损兜底
 
         # ------------------------------------------
-        # 2. 1分钟级别显微镜追踪持仓 (盘中碰撞)
+        # 2. 1分钟级别显微镜追踪持仓 (盘中碰撞与状态机跃迁)
         # ------------------------------------------
         if current_pos != 0:
             start_1m_idx = np.searchsorted(ts_1m, entry_time)
@@ -217,78 +228,118 @@ def run_backtest():
             
             close_position = False
             actual_exit_pct = 0.0
-            close_pnl_pct = 0.0 # 初始化，防止当小时无数据
+            close_pnl_pct = 0.0 
+            close_return = 0.0
             
-            for m_idx in range(start_1m_idx, end_1m_idx):
-                if m_idx >= len(closes_1m): break
+            # 👇 【触发器 1：换线时刻的概率反转判定】
+            # 在每小时拿到最新预测概率的瞬间，立即进行预判
+            is_reversal = False
+            if current_pos == 1 and p_down > th["down_top_1"]:
+                is_reversal = True
+            elif current_pos == -1 and p_up > th["up_top_1"]:
+                is_reversal = True
                 
-                m_high = highs_1m[m_idx]
-                m_low = lows_1m[m_idx]
-                m_close = closes_1m[m_idx]
+            if is_reversal:
+                # 获取该小时开盘瞬间的物理盈亏
+                current_hour_open = opens_1h[exec_idx_1h]
+                current_phys_profit = (current_hour_open - entry_price) / entry_price if current_pos == 1 else (entry_price - current_hour_open) / entry_price
                 
-                if current_pos == 1:
-                    worst_intra = (m_low - entry_price) / entry_price
-                    best_intra = (m_high - entry_price) / entry_price
-                    close_return = (m_close - entry_price) / entry_price
+                if current_phys_profit < 0.005:
+                    # 状态一：小于 0.5%，立即斩仓
+                    close_position = True
+                    actual_exit_pct = current_phys_profit * current_leverage
+                    exit_reasons["REVERSAL_EXIT"] += 1 # 记录反转斩仓
                 else:
-                    worst_intra = (entry_price - m_high) / entry_price
-                    best_intra = (entry_price - m_low) / entry_price
-                    close_return = (entry_price - m_close) / entry_price
-
-                worst_pnl_pct = current_leverage * worst_intra
-                best_pnl_pct = current_leverage * best_intra
-                close_pnl_pct = current_leverage * close_return
-                
-                if best_pnl_pct > max_unrealized_pnl:
-                    max_unrealized_pnl = best_pnl_pct
+                    # 状态二：大于等于 0.5%，锁定 0.5% 止损线并激活追踪
+                    trailing_active = True
+                    dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
+            
+            # 如果在小时边界存活，进入 1 分钟盘中微观碰撞
+            if not close_position:
+                for m_idx in range(start_1m_idx, end_1m_idx):
+                    if m_idx >= len(closes_1m): break
                     
-                hold_timer_mins -= 1
-                
-                # 分钟级极限爆仓检测
-                if trade_start_equity * (1 - current_leverage * FEE_RATE + worst_pnl_pct) <= 0:
-                    liquidated = True
-                    break
+                    m_high = highs_1m[m_idx]
+                    m_low = lows_1m[m_idx]
+                    m_close = closes_1m[m_idx]
                     
-                active_sl_pct = -abs(HARD_SL)
-                if is_trailing:
-                    # 💡 修正：正常的阶梯追踪止损，跟随最高浮盈上移。
-                    # 当且仅当浮盈减去回撤容忍度(5%)后依然大于0时，止损线才会变成正数锁定利润。
-                    # 否则，允许止损线在硬止损 (HARD_SL) 和成本线之间活动，给予行情呼吸空间。
-                    trailing_sl = max_unrealized_pnl - 0.05
-                    active_sl_pct = max(-abs(HARD_SL), trailing_sl)
-                
-                # 🚨 极其严苛的回测规则：同一分钟内若既触发止损又触发止盈，【优先判定止损】！
-                # 这能彻底消灭“天地针”带来的回测虚假乐观。
-                
-                # 🎯 盘中悲观离场：跌破止损线 / 跌破保本线
-                if worst_pnl_pct <= active_sl_pct:
-                    close_position = True
-                    actual_exit_pct = min(active_sl_pct, close_pnl_pct)
-                    break 
-
-                # 🎯 盘中绝对止盈离场：瞬间碰触 50% 止盈线
-                if best_pnl_pct >= abs(HARD_TP):
-                    close_position = True
-                    actual_exit_pct = abs(HARD_TP)
-                    break
-                
-                # 🎯 时间锁到期判定
-                if hold_timer_mins <= 0:
-                    if close_pnl_pct <= 0:
-                        close_position = True
-                        actual_exit_pct = close_pnl_pct
-                        break
+                    # 统一使用无杠杆的物理涨跌幅进行刻度衡量
+                    if current_pos == 1:
+                        worst_intra = (m_low - entry_price) / entry_price
+                        best_intra = (m_high - entry_price) / entry_price
+                        close_return = (m_close - entry_price) / entry_price
                     else:
-                        is_trailing = True
+                        worst_intra = (entry_price - m_high) / entry_price
+                        best_intra = (entry_price - m_low) / entry_price
+                        close_return = (entry_price - m_close) / entry_price
 
-            # 如果这 1 小时走完了都没触发平仓，检查 AI 是否发生了概率反转
-            if not close_position and not liquidated:
-                if current_pos == 1 and p_down > th["down_top_1"]:
-                    close_position = True
-                    actual_exit_pct = close_pnl_pct
-                elif current_pos == -1 and p_up > th["up_top_1"]:
-                    close_position = True
-                    actual_exit_pct = close_pnl_pct
+                    hold_timer_mins -= 1
+
+                    # ==========================================
+                    # 💀 第一关：问生死 (用这1分钟的最低价，去撞【上一分钟】定下的老防线)
+                    # ==========================================
+                    worst_pnl_pct = current_leverage * worst_intra
+                    # 1. 极限爆仓检测 (资金毁灭，优先级最高)
+                    if trade_start_equity * (1 - current_leverage * FEE_RATE + worst_pnl_pct) <= 0:
+                        liquidated = True
+                        break
+                        
+                    # 2. 击穿当前存续的物理防线
+                    if worst_intra <= dynamic_sl_phys:
+                        close_position = True
+                        actual_exit_pct = dynamic_sl_phys * current_leverage
+                        
+                        # 👇 补齐：通过追踪开关，智能判断是硬止损还是移动止盈
+                        if trailing_active:
+                            exit_reasons["TRAILING_EXIT"] += 1
+                        else:
+                            exit_reasons["HARD_SL_EXIT"] += 1
+                        break
+
+                    # ==========================================
+                    # 💰 第二关：论富贵 (活下来了，才能用这1分钟的最高价去更新水位)
+                    # ==========================================
+                    if best_intra > max_unrealized_phys_pnl:
+                        max_unrealized_phys_pnl = best_intra
+                        
+                    # 【触发器 2：触及止盈线 (超过硬止盈 0.5%)】
+                    if max_unrealized_phys_pnl >= abs(HARD_TP) + 0.005:
+                        trailing_active = True
+                        dynamic_sl_phys = max(dynamic_sl_phys, abs(HARD_TP))
+                        
+                    # 【触发器 3：超过 24 小时时间锁到期】
+                    if hold_timer_mins <= 0 and not trailing_active:
+                        if close_return < 0.005:
+                            close_position = True
+                            actual_exit_pct = close_return * current_leverage
+                            
+                            # 👇 补齐：耗尽时间亏损离场
+                            exit_reasons["TIME_LIMIT_EXIT"] += 1
+                            break
+                        else:
+                            trailing_active = True
+                            dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
+                            
+                    # 【追踪算法：应用 1% 的实际盈亏步长回撤限制】
+                    if trailing_active:
+                        dynamic_sl_phys = max(dynamic_sl_phys, max_unrealized_phys_pnl - 0.01)
+
+                    # ==========================================
+                    # 🗡️ 第三关：防插针回马枪 (提完防线后，防范同 1 分钟内的天地针)
+                    # ==========================================
+                    if worst_intra <= dynamic_sl_phys:
+                        close_position = True
+                        actual_exit_pct = dynamic_sl_phys * current_leverage
+                        
+                        # 👇 补齐：逻辑与第一关完全一致
+                        if trailing_active:
+                            exit_reasons["TRAILING_EXIT"] += 1
+                        else:
+                            exit_reasons["HARD_SL_EXIT"] += 1
+                        break
+
+                # 记录本小时结束时的带杠杆收益率，供隔夜资金费结算
+                close_pnl_pct = close_return * current_leverage
 
             # 统一交割结算
             if liquidated:
@@ -316,6 +367,9 @@ def run_backtest():
                 trade_count += 1
                 current_pos = 0 
                 current_leverage = 0.0
+                
+                # 👇 【核心补漏】：把这笔交易“扣除所有摩擦成本后”的纯粹净收益率记入账本
+                pnl_list.append(trade_pnl / trade_start_equity)
             else:
                 # 🚨 核心修复：将本小时的真实资金费率滚入累计池
                 cumulative_funding += trade_start_equity * current_leverage * HOURLY_FUNDING_COST
@@ -365,17 +419,39 @@ def run_backtest():
     else:
         sharpe = 0.0
 
-    print("\n📊 终极 3分类动态杠杆 回测结果:")
-    print("-" * 45)
-    print(f"总回测时长: {len(predictions_probs)} 小时")
-    print(f"共计交易: {trade_count} 笔 (多头: {long_trades} | 空头: {short_trades} | 多空比: {ls_ratio:.2f})")
-    print(f"胜率 (Win Rate): {win_rate:.2f}% | 盈亏比 (Profit Factor): {profit_factor:.2f}")
+    # --- 深度性能指标计算 ---
+    total_net_profit = equity_curve[-1] - 1.0
+    avg_win = np.mean([p for p in pnl_list if p > 0]) if any(p > 0 for p in pnl_list) else 0
+    avg_loss = np.mean([p for p in pnl_list if p <= 0]) if any(p <= 0 for p in pnl_list) else 0
+    expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
+    recovery_factor = total_net_profit / (abs(max_drawdown)/100) if max_drawdown != 0 else 0
+
+    print("\n" + "="*50)
+    print(f" 📜 TimesFM 引擎终极回测审计报告 | {SYMBOL}")
+    print("="*50)
+    
+    print(f"【1. 基础战况】")
+    print(f" ▪ 总回测时长 : {len(predictions_probs)} 小时")
+    print(f" ▪ 撮合交易数 : {trade_count} 笔 (多:{long_trades} | 空:{short_trades})")
+    print(f" ▪ 最终净值   : {equity_curve[-1]:.4f}")
+    
+    print(f"\n【2. 核心绩效】")
+    print(f" ▪ 胜率 (WR)  : {win_rate:.2f}%")
+    print(f" ▪ 盈亏比 (PF): {profit_factor:.2f}")
+    print(f" ▪ 夏普比率   : {sharpe:.2f}")
+    print(f" ▪ 卡玛比率   : {calmar:.2f}")
+    print(f" ▪ 最大回撤   : {max_drawdown:+.2f}%")
+    print(f" ▪ 恢复因子   : {recovery_factor:.2f}")
+    print(f" ▪ 交易期望值 : {expectancy * 100:+.3f}% (每次发车平均净赚本金比例)")
+
+    print(f"\n【3. 行为诊断 (出场分布)】")
+    for reason, count in exit_reasons.items():
+        ratio = (count / trade_count * 100) if trade_count > 0 else 0
+        print(f" ▪ {reason:<16} : {count} 次 ({ratio:.1f}%)")
+
     if liquidated:
-        print(f"⚠️ 状态: 已爆仓 (账户归零)")
-    print(f"期末策略净值: {equity_curve[-1]:.4f}")
-    print(f"最大回撤 (Max Drawdown): {max_drawdown:.2f}%")
-    print(f"估算年化夏普: {sharpe:.2f} | 卡玛比率: {calmar:.2f}")
-    print("-" * 45)
+        print(f"\n💀 警报：该参数组合在回测期间触发了强制平仓(爆仓)！")
+    print("="*50 + "\n")
 
     plt.figure(figsize=(14, 7))
     plt.plot(valid_timestamps, benchmark_curve, label='BTC Buy & Hold', color='gray', alpha=0.5)

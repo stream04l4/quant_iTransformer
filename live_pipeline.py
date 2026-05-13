@@ -321,7 +321,7 @@ def run_live():
             base_risk = float(ui_config.get("base_risk_budget", 0.02))
             dynamic_margin_usd = initial_cap * base_risk if initial_cap * base_risk > 0 else LIVE_RISK_MARGIN_USD
             
-            # 优先读取前端 UI 的止盈止损，若无则使用 config.py 作为保底
+            # 从 UI 读取 6.0 并转为 0.06。现在的语义是：标的资产物理涨跌 6.0%
             dynamic_sl = float(ui_config.get("target_risk", HARD_SL * 100.0)) / 100.0
             dynamic_tp = float(ui_config.get("target_profit", HARD_TP * 100.0)) / 100.0
 
