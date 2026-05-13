@@ -69,8 +69,8 @@ LEVERAGE_3 = 3.0           # 杠杆倍数
 FEE_RATE = 0.0005        # 交易所单边手续费 (币安市价单 Taker 万五)
 
 HOLD_PERIOD = 24         
-HARD_TP = 0.6           # 绝对止盈线 50% 
-HARD_SL = 0.3           # 绝对止损线 50% 
+HARD_TP = 0.6           # 绝对止盈线 60% 
+HARD_SL = 0.3           # 绝对止损线 30% 
 
 # --- 实盘专用风控与仓位参数 ---
 LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
@@ -78,6 +78,8 @@ TRADE_COOLDOWN_SEC = 3600            # 开仓后防连续发车冷却时间(秒)
 MAX_MACRO_IMPACT = 0.03            # 宏观情绪对模型输出概率的最大干预幅度
 MACRO_CHECK_INTERVAL = 1800         # 宏观情报拉取间隔(秒)
 HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
+MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC最大notional
+MAX_NOTIONAL_BTC = 100000            # 实盘BTC最大notional
 
 
 # ==========================================
@@ -95,3 +97,16 @@ E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 1))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
 CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.026))
+
+# ==========================================
+# 6.1 实盘模型拓扑与架构超参数 (严格隔离命名空间)
+# ==========================================
+# 使用 LIVE_ 前缀，即使与回测在同一个环境中运行，也不会发生全局变量污染
+LIVE_SEQ_LEN = int(os.environ.get("LIVE_SEQ_LEN", 336))
+
+# BATCH_SIZE, EPOCHS, LEARNING_RATE 是训练期算子参数，不参与实盘推理，故不予设立
+
+LIVE_D_MODEL = int(os.environ.get("LIVE_D_MODEL", 256))
+LIVE_E_LAYERS = int(os.environ.get("LIVE_E_LAYERS", 1))
+LIVE_DROPOUT = float(os.environ.get("LIVE_DROPOUT", 0.4)) 
+LIVE_CLASS_THRESHOLD = float(os.environ.get("LIVE_CLASS_THRESHOLD", 0.026))

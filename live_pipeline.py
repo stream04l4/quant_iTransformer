@@ -14,8 +14,8 @@ import sqlite3
 import os
 from datetime import datetime
 from quant_config.config import (
-    DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, SEQ_LEN, D_MODEL, E_LAYERS, CLASS_THRESHOLD, 
-    MODEL_DIR, DROPOUT, SYMBOL, AUX_SYMBOLS,
+    DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
+    LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD, 
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL
 )
@@ -78,8 +78,8 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df = df.iloc[:-1]
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    if len(df) < (SEQ_LEN + 168):
-        raise ValueError(f"主K线历史长度不足 (需>={SEQ_LEN + 168}，当前{len(df)})")
+    if len(df) < (LIVE_SEQ_LEN + 168):
+        raise ValueError(f"主K线历史长度不足 (需>={LIVE_SEQ_LEN + 168}，当前{len(df)})")
 
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
 
@@ -136,14 +136,13 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         taker_df.index = pd.to_datetime(taker_df.index.astype(int), unit='ms')
         df = df.merge(taker_df, left_on='hour_timestamp', right_index=True, how='left')
         
-        df['taker_ratio'] = df['taker_buy_volume'] / (df['volume'] + 1e-9)
-        df['vpt'] = df['quote_volume'] / (df['count'] + 1e-9)
-        df['cvd'] = df['taker_buy_volume'] - df['taker_sell_volume']
-        df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
-        df['retail_ratio'] = df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)
+        df['taker_ratio_delta'] = (df['taker_buy_volume'] / (df['volume'] + 1e-9)).diff()
+        df['cvd'] = (df['taker_buy_volume'] - df['taker_sell_volume']).fillna(0)
+        df['whale_net_flow'] = (df['whale_buy'] - df['whale_sell']).fillna(0)
+        df['retail_ratio'] = (df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)).ffill().fillna(0.1)
         df['amihud_illiquidity'] = df['log_return'].abs() / (df['quote_volume'] + 1e-9)
     else:
-        for col in ['taker_ratio', 'vpt', 'cvd', 'whale_net_flow', 'retail_ratio', 'amihud_illiquidity']:
+        for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'retail_ratio', 'amihud_illiquidity']:
             df[col] = np.nan
 
     # 6. 基础技术与 MTF
@@ -180,10 +179,14 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     df['vol_skew_24h'] = (m3 - 3 * m1 * m2 + 2 * m1**3) / (var**1.5 + 1e-9)
     
     df['oi_delta_pct'] = (df['sum_open_interest'] - df['sum_open_interest'].shift(1)) / (df['sum_open_interest'].shift(1) + 1e-9)
-    df['oi_price_cross'] = np.sign(df['log_return']) * df['oi_delta_pct']
+    
+    # 🚨 新增：补齐缺失的高阶特征
+    df['max_ret_24h'] = df['log_return'].rolling(window=24).max()
+    df['rv_term_structure'] = df['realized_vol_1h'] / (df['realized_vol_1h'].rolling(window=24).mean() + 1e-9)
+    df['funding_rate_momentum'] = df['funding_rate'].rolling(window=24).mean() - df['funding_rate'].rolling(window=72).mean()
 
-    # 7. 免疫断层的 Z-Score
-    rolling_cols = ["vpt", "cvd", "whale_net_flow", "amihud_illiquidity", "realized_vol_1h"]
+    # 7. 免疫断层的 Z-Score (🚨 修正：剔除 vpt，加入 oi_delta_pct)
+    rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct", "cvd", "whale_net_flow"]
     for c in rolling_cols:
         if c in df.columns:
             median = df[c].rolling(window=168, min_periods=1).median()
@@ -191,6 +194,9 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
             df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
         else:
             df[f"{c}_zscore"] = np.nan
+            
+    # 🚨 新增：基于 Z-Score 计算的高阶背离特征
+    df['cvd_oi_divergence'] = df['cvd_zscore'] - df['oi_delta_pct_zscore']
 
     df['eth_btc_return'] = np.log(df['eth_btc_close'] / df['eth_btc_close'].shift(1))
     df['premium_delta'] = df['premium_close'].diff()
@@ -201,22 +207,23 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # 8. 终极截取与熔断防线
+    # 8. 终极截取与熔断防线 (🚨 像素级对齐训练集特征与顺序)
     final_cols = [
-        "log_return", "ma_bias", "upper_shadow", "lower_shadow",
-        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio", 
-        "vpt_zscore", "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
-        "oi_delta_pct", "oi_price_cross", "ls_ratio",
-        "price_pos_24h", "price_pos_72h", "price_pos_168h",
-        "funding_rate", "premium_delta", "eth_btc_return",
+        "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
+        "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
+        "oi_delta_pct", "ls_ratio",
+        "price_pos_24h", "price_pos_72h", "price_pos_168h", 
+        "rv_term_structure", 
+        "funding_rate_momentum", "premium_delta", "eth_btc_return", 
         "hour_sin", "hour_cos", "week_sin", "week_cos", 
-        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio"
+        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence"
     ]
     
     for col in final_cols:
         if col not in df.columns: df[col] = np.nan
 
-    inference_window = df[final_cols].iloc[-SEQ_LEN:]
+    inference_window = df[final_cols].iloc[-LIVE_SEQ_LEN:]
     
     if inference_window.isnull().any().any():
         missing_cols = inference_window.columns[inference_window.isnull().any()].tolist()
@@ -235,8 +242,8 @@ def run_live():
     thresholds_list = []
     feature_cols = None
     
-    dynamic_n_heads = max(2, D_MODEL // 16) 
-    dynamic_d_ff = D_MODEL * 4
+    dynamic_n_heads = max(2, LIVE_D_MODEL // 16) 
+    dynamic_d_ff = LIVE_D_MODEL * 4
     
     for i in range(1, 6):
         m_path = MODEL_DIR / f"itransformer_BTCUSDT_best_{i}.pth"
@@ -247,14 +254,15 @@ def run_live():
         if feature_cols is None:
             feature_cols = checkpoint['feature_cols']
             
+        # 使用实盘专属网络拓扑参数实例化议员模型
         model = InvertedTransformer(
             num_variates=len(feature_cols), 
-            seq_len=SEQ_LEN, 
-            d_model=D_MODEL, 
+            seq_len=LIVE_SEQ_LEN, 
+            d_model=LIVE_D_MODEL, 
             n_heads=dynamic_n_heads, 
             d_ff=dynamic_d_ff, 
-            e_layers=E_LAYERS,
-            dropout=DROPOUT
+            e_layers=LIVE_E_LAYERS,
+            dropout=LIVE_DROPOUT
         ).to(DEVICE)
         
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -353,7 +361,8 @@ def run_live():
                     eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
                     
                     features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
-                    input_raw = features_df.iloc[-SEQ_LEN:].values.astype('float32')
+                    # 🚨 终极安全锁：强行用模型自带的 feature_cols 抓取数据，切断底层硬编码带来的维度错乱风险
+                    input_raw = features_df[feature_cols].iloc[-LIVE_SEQ_LEN:].values.astype('float32')
                     x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                     
                     with torch.no_grad():

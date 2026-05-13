@@ -16,7 +16,7 @@ import requests  # 新增：用于发送 Webhook 请求
 # 👇 新增这两行，激活 .env 读取
 from dotenv import load_dotenv
 load_dotenv()
-from quant_config.config import SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS
+from quant_config.config import SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS, HARD_TP, HARD_SL
 
 # --- 核心配置路径 ---
 CONFIG_JSON_FILE = os.path.join(LIVE_DATA_DIR, "ui_config.json")
@@ -191,7 +191,9 @@ defaults = {
     "funding_limit": 0.0003,"cooldown_mins": 45,
     # 资金与风控出场
     "initial_capital": 10000.0, "max_open_positions": 3,
-    "target_risk": 40.0, "excursion": 1.5, "chandelier_multi": 2.8,
+    "target_risk": HARD_SL * 100.0,     # 👈 自动把 config 的 0.4 映射为 UI 的 40.0
+    "target_profit": HARD_TP * 100.0,   # 👈 自动把 config 的 0.6 映射为 UI 的 60.0
+    "excursion": 1.5, "chandelier_multi": 2.8,
     # 架构与运维
     "use_xgboost": False, 
     "collection_version": "v1.0", "inference_version": "v1.0", # 👈 替换掉原来的 data_version
@@ -234,7 +236,8 @@ def save_settings():
         "consistency": st.session_state.get("ui_consistency", s.get("consistency")),
         "choppy_thresh": st.session_state.get("ui_choppy_thresh", s.get("choppy_thresh")),
         "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget")),
-        "target_risk": st.session_state.get("ui_risk", s.get("target_risk")), # 保留兼容
+        "target_risk": st.session_state.get("ui_risk", s.get("target_risk", HARD_SL * 100.0)),
+        "target_profit": st.session_state.get("ui_profit", s.get("target_profit", HARD_TP * 100.0)),
         "excursion": st.session_state.get("ui_excursion", s.get("excursion")),
         "chandelier_multi": st.session_state.get("ui_chandelier_multi", s.get("chandelier_multi")),
         "initial_capital": st.session_state.get("ui_initial_capital", s.get("initial_capital", 10000.0)),
@@ -1317,8 +1320,8 @@ with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     st.caption("基于波动率平价的机构级算仓防线与实时风控联动。")
     user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
     user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.5, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
-    user_target_profit = st.slider("单笔目标 ROE 止盈 (%)", min_value=10.0, max_value=200.0, value=float(st.session_state.settings.get("target_profit", 60.0)), step=5.0, key="ui_profit", on_change=save_settings, disabled=lock_params, help="硬止盈线 (如60%代表ROE盈利60%止盈)")
-    user_target_risk = st.slider("单笔最高容忍 ROE 亏损 (%)", min_value=10.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", 30.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params, help="硬止损线 (如30%代表ROE亏损30%止损)")
+    user_target_profit = st.slider("单笔目标 ROE 止盈 (%)", min_value=5.0, max_value=100.0, value=float(st.session_state.settings.get("target_profit", HARD_TP * 100.0)), step=5.0, key="ui_profit", on_change=save_settings, disabled=lock_params, help="硬止盈线 (如60%代表ROE盈利60%止盈)")
+    user_target_risk = st.slider("单笔最高容忍 ROE 亏损 (%)", min_value=5.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", HARD_SL * 100.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params, help="硬止损线 (如30%代表ROE亏损30%止损)")
     
     st.markdown("#### 💡 物理硬止损保护")
     user_excursion = st.slider("物理硬止损拉伸宽幅 ⚠️ (越大越防插针)", min_value=0.50, max_value=3.00, value=float(st.session_state.settings.get("excursion", 1.5)), step=0.1, key="ui_excursion", on_change=save_settings, disabled=lock_params)

@@ -22,7 +22,7 @@ SEARCH_SPACE = {
     'E_LAYERS': [1],
     'D_MODEL': [256],
     'DROPOUT': [0.4],
-    'LEARNING_RATE': [5e-5],
+    'LEARNING_RATE': [2e-5],
     'BATCH_SIZE': [512],
     'EPOCHS': [50] 
 }

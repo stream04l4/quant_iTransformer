@@ -198,8 +198,23 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # 2. 面值与张数计算 (工业级精度适配与风控智能压降)
         # ---------------------------------------------------------
         markets = state.gate_markets
+        
+        # 👇 【阻击冷启动竞态条件 (Cold Start Race Condition)】
+        # 如果主引擎光速触发了第一笔交易，而后台供货线程还在请求队列中，
+        # 此时 markets 必定为空。强制主线程同步阻塞式拉取，补齐时序差。
+        if not markets:
+            print("⏳ [系统保护] 静态市场字典尚未就绪，正强制同步 Gate.io 市场规则...")
+            try:
+                markets = exchange_private.load_markets(True)
+                state.gate_markets = markets
+            except Exception as e:
+                print(f"   ⚠️ 紧急加载市场规则失败，可能遭遇网络限流: {e}")
+                
         if gate_symbol not in markets:
-            msg = f"🚧 模拟盘受限拦截：Gate.io 未上架 {gate_symbol} 永续合约，已跳过。"
+            # 加入 CCXT 探针：如果真的被跳过，将前 5 个物理存在的交易对名称打印出来，
+            # 供我们排查是否是 Gate.io 测试网悄悄变更了永续合约的命名规范
+            sample_markets = list(markets.keys())[:5] if markets else "网络拉取失败"
+            msg = f"🚧 模拟盘受限拦截：Gate.io 未上架 {gate_symbol} 永续合约，已跳过。(当前测试网探测到: {sample_markets}...)"
             print("⚠️", msg)
             log_system_alert("⚠️ 拦截", symbol, msg)
             return False, 0.0
@@ -211,10 +226,14 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # 👇 【智能修复 1：动态风险限额压降 (Risk Limit Capping)】
         # 山寨币默认风控限额为 5000。如果触碰红线，自动压降至安全水位 (4800)
         base_coin = symbol.split('/')[0]
-        safe_notional_limit = MAX_NOTIONAL_BTC_ETH if base_coin in ['BTC', 'ETH'] else MAX_NOTIONAL_ALTS
+        _max_btc_eth = globals().get('MAX_NOTIONAL_BTC_ETH', 100000.0)  # 主流币默认最高 10 万 U
+        _max_alts = globals().get('MAX_NOTIONAL_ALTS', 5000.0)          # 山寨币默认最高 5 千 U
+        
+        safe_notional_limit = _max_btc_eth if base_coin in ['BTC', 'ETH'] else _max_alts
+        
         if target_notional > safe_notional_limit:
             target_notional = safe_notional_limit
-            msg_limit = f"⚠️ 触发交易所风控限额，名义价值已自动压降至 {safe_notional_limit} USDT"
+            msg_limit = f"⚠️ 触发风控红线，名义价值已自动压降至 {safe_notional_limit} USDT"
             print(f"   {msg_limit}")
             log_system_alert("📉 仓位降级", symbol, msg_limit)
         
