@@ -191,9 +191,9 @@ defaults = {
     "funding_limit": 0.0003,"cooldown_mins": 45,
     # 资金与风控出场
     "initial_capital": 10000.0, "max_open_positions": 3,
-    "target_risk": HARD_SL * 100.0,     # 👈 自动把 config 的 0.4 映射为 UI 的 40.0
-    "target_profit": HARD_TP * 100.0,   # 👈 自动把 config 的 0.6 映射为 UI 的 60.0
-    "excursion": 1.5, "chandelier_multi": 2.8,
+    "target_risk": HARD_SL * 100.0,     
+    "target_profit": HARD_TP * 100.0,   
+    "chandelier_multi": 2.8, # (如果你其他地方也没用到 chandelier_multi，这行也可以删掉)
     # 架构与运维
     "use_xgboost": False, 
     "collection_version": "v1.0", "inference_version": "v1.0", # 👈 替换掉原来的 data_version
@@ -206,10 +206,7 @@ defaults = {
     "max_allowed_sl_distance": 0.15, "min_order_notional": 6.0,
     "default_win_rate": 0.52, "default_profit_loss_ratio": 1.5,
     # 👇 新增：右脑高频熔断阈值默认值
-    "bailout_atr_multi": 2.5, "bailout_vol_multi": 3.0
-    # 👇 新增：核心动态追踪止盈止损 (Trailing Stop)
-    "trailing_trigger_roe": 5.0,  # 赚到 5% ROE 开始上移防线
-    "trailing_lock_roe": 2.0,     # 触发后，硬性保底 2% 的 ROE 利润
+    "bailout_atr_multi": 2.5, "bailout_vol_multi": 3.0,  # 👈 修复：在这里补上英文逗号
 }
 
 if 'settings' not in st.session_state:
@@ -247,7 +244,6 @@ def save_settings():
         "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget", 0.02)),
         "target_risk": st.session_state.get("ui_risk", s.get("target_risk", 30.0)),
         "target_profit": st.session_state.get("ui_profit", s.get("target_profit", 60.0)),
-        "excursion": st.session_state.get("ui_excursion", s.get("excursion", 1.5)),
         "max_macro_impact": st.session_state.get("ui_macro_impact", s.get("max_macro_impact", 1.5)),
         "use_xgboost": st.session_state.get("ui_use_xgboost", s.get("use_xgboost")),
         "beta_thresh": st.session_state.get("ui_beta_thresh", s.get("beta_thresh", 0.001) * 100) / 100.0,
@@ -265,8 +261,6 @@ def save_settings():
         "bailout_vol_multi": st.session_state.get("ui_bailout_vol_multi", s.get("bailout_vol_multi", 3.0)),
         "max_margin_utilization": st.session_state.get("max_margin_utilization", 0.7),
         "min_order_notional": st.session_state.get("min_order_notional", 6.0),
-        "trailing_trigger_roe": st.session_state.get("ui_trailing_trigger_roe", s.get("trailing_trigger_roe", 5.0)),
-        "trailing_lock_roe": st.session_state.get("ui_trailing_lock_roe", s.get("trailing_lock_roe", 2.0))
     }
     # 原子写入保持不变
     temp_file = f"{CONFIG_JSON_FILE}.tmp"
@@ -333,17 +327,17 @@ def load_trade_history_for_symbol(symbol):
             if cursor.fetchone() is None:
                 return pd.DataFrame()
 
-            try:
-                cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
-            except sqlite3.OperationalError:
-                pass
+            # 自动升级旧表结构，确保所有列存在
+            for col in ['leverage', 'margin_used', 'order_id']:
+                try: 
+                    cursor.execute(f"ALTER TABLE live_trades ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError: 
+                    pass
 
+            # 读取时使用 fillna 填充缺失值，防止计算崩溃
             df_live = pd.read_sql("SELECT * FROM live_trades ORDER BY exec_ts ASC", conn)
             if df_live.empty:
                 return pd.DataFrame()
-
-            df_live['exec_ts'] = pd.to_datetime(df_live['exec_ts'], format='mixed', errors='coerce')
-            df_live = df_live.dropna(subset=['exec_ts']).sort_values('exec_ts')
 
             try:
                 df_pred = pd.read_sql(
@@ -647,16 +641,6 @@ def render_realtime_portfolio():
                         oco_roe = (entry_px - physical_sl_px) / entry_px * leverage_used * 100
                     oco_min_roe_str = f"{oco_roe:+.2f}%"
 
-                # 2. 计算幽灵虚拟吊灯的保底 ROE
-                virtual_min_roe_str = "计算中 ⏳"
-                if virtual_sl_px > 0 and entry_px > 0:
-                    if pos_side == 'LONG':
-                        virtual_roe = (virtual_sl_px - entry_px) / entry_px * leverage_used * 100
-                    else:
-                        virtual_roe = (entry_px - virtual_sl_px) / entry_px * leverage_used * 100
-                    # 巧妙融合：既显示收益率，又在括号内保留原有的价格信息
-                    virtual_min_roe_str = f"{virtual_roe:+.2f}% ({virtual_sl})"
-
                 pos_data.append({
                     "交易对": symbol_raw,
                     "方向": "🟢 做多" if pos_side == 'LONG' else "🔴 做空",
@@ -669,8 +653,7 @@ def render_realtime_portfolio():
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
                     "收益率 (ROE)": f"{upl_ratio:+.2f}%", 
                     # 👇 重组字段名，并将双防线保底收益移到表格最末端，方便横向对比
-                    "保底收益 (OCO)": oco_min_roe_str,
-                    "保底收益 (虚拟吊灯)": virtual_min_roe_str
+                    "保底收益 (OCO)": oco_min_roe_str
                 })
             st.dataframe(pd.DataFrame(pos_data), hide_index=True, width='stretch')
             pass
@@ -710,81 +693,53 @@ if hist_data:
         sym = row['交易对']
         side = row['side']
         px = float(row['fill_price'])
-        tp = float(row['tp_price'])
-        sl = float(row['sl_price'])
-        lev = float(row['effective_leverage']) 
         ts = pd.to_datetime(row['exec_ts'])
         
-        # 【新增】：提取底层的真实开仓保证金，如果老数据没有则兜底 500U
-        margin_used = float(row['margin_used']) if 'margin_used' in row and pd.notnull(row['margin_used']) else 500.0
-        
-        is_rev = False # 👈 默认非反杀
-        
+        # 提取开仓信息
         if side in ['buy', 'sell']:
-            # 👇 判定当前开仓是否为反杀
-            orig = row.get('original_signal_direction', None)
-            if pd.notnull(orig):
-                if side == 'buy' and float(orig) == -1: is_rev = True
-                if side == 'sell' and float(orig) == 1: is_rev = True
-
-            xgb_p = row['xgb_prob'] if pd.notnull(row['xgb_prob']) else 0.0
-            v_tag = row['trade_version'] if pd.notnull(row['trade_version']) else "v1.0"
-            
+            # 记录入场点
             entry_memory[sym] = {
-                'px': px, 'side': side, 'lev': lev, 'ts': ts, 
-                'margin': margin_used, 'xgb': xgb_p, 'version': v_tag,
-                'is_rev': is_rev # 👈 存入内存，供未来的平仓单继承
+                'px': px, 
+                'side': side, 
+                'lev': float(row.get('leverage', 3.0)), 
+                'ts': ts, 
+                'margin': float(row.get('margin_used', 100.0)),
+                'is_rev': row.get('is_ai_rev', False)
             }
-            tp_pct = (abs(tp - px) / px) * lev if px > 0 else 0
-            sl_pct = (abs(sl - px) / px) * lev if px > 0 else 0
-            target_info_list.append(f"⏳ 预期: +{tp_pct*100:.2f}% / -{sl_pct*100:.2f}%")
+            # 计算回测同款物理预期 (6% TP / 3% SL)
+            tp_move = abs(HARD_TP)
+            sl_move = abs(HARD_SL)
+            target_info_list.append(f"⏳ 预期: +{tp_move*100:.1f}% / -{sl_move*100:.1f}% (K线)")
             
-            rev_flags.append(is_rev) # 记录本行状态
-            
-        # 👇 【修改 1】：把 bailout_close 加入到平仓动作名单里
-        elif side in ['close_long', 'close_short', 'exchange_close', 'bailout_close']:
+        # 识别平仓动作 (兼容新旧标签)
+        elif side in ['close_long', 'close_short', 'exchange_close', 'bailout_close', 'bailout_panic_sell']:
             mem = entry_memory.get(sym)
             if mem and mem['px'] > 0:
-                is_rev = mem.get('is_rev', False) # 👈 平仓时，完美继承开仓时的反杀状态！
-                
                 entry_px = mem['px']
                 entry_side = mem['side']
-                entry_lev = mem['lev']
-                entry_margin = mem.get('margin', 500.0)
                 
-                # 👇 【修改 2】：把 bailout_close 加进方向判断里
-                if side == 'close_long' or (side in ['exchange_close', 'bailout_close'] and entry_side == 'buy'):
+                # 核心逻辑：根据开仓方向判断盈亏量纲
+                if entry_side == 'buy':
                     raw_pnl = (px - entry_px) / entry_px
-                elif side == 'close_short' or (side in ['exchange_close', 'bailout_close'] and entry_side == 'sell'):
-                    raw_pnl = (entry_px - px) / entry_px
                 else:
-                    raw_pnl = 0.0
-                    
-                real_roe = raw_pnl * entry_lev
-                absolute_usdt_profit = real_roe * entry_margin
-                account_impact = absolute_usdt_profit / initial_cap
+                    raw_pnl = (entry_px - px) / entry_px
+                
+                real_roe = raw_pnl * mem['lev']
                 
                 closed_records.append({
                     'exec_ts': ts,
                     'symbol': sym,
-                    'real_roe': real_roe, 
-                    'account_impact': account_impact, 
-                    'hold_hours': (ts - mem['ts']).total_seconds() / 3600,
-                    'version': mem.get('version', 'v1.0'), 
-                    'xgb_prob': mem.get('xgb', 0.0) 
+                    'real_roe': real_roe,
+                    'account_impact': (real_roe * mem['margin']) / initial_cap,
+                    'hold_hours': (ts - mem['ts']).total_seconds() / 3600
                 })
                 
-                sign = "+" if real_roe > 0 else ""
                 color = "🟢" if real_roe > 0 else "🔴"
-                target_info_list.append(f"{color} 实际: {sign}{real_roe*100:.2f}%")
-                
-                # 👇 【核心新增：防止 PnL 重复计算的物理锁】
-                entry_memory[sym] = {'px': 0, 'side': '', 'is_rev': False}
-                
+                target_info_list.append(f"{color} 实际: {real_roe:+.2%}")
+                # 清除内存锁，等待下一次开仓
+                entry_memory[sym] = {'px': 0}
             else:
-                target_info_list.append("💰 实际: 未知 (跨期残影或记录重复)")
-            
-            rev_flags.append(is_rev) # 记录本行状态
+                target_info_list.append("💰 历史遗留单 (匹配失败)")
         else:
             target_info_list.append("-")
             rev_flags.append(False)
@@ -817,16 +772,14 @@ with st.expander("查看由机器人自动执行的历史订单记录", expanded
             
         def map_side(row):
             x = row['方向']
-            # 直接从刚才我们挂载的全局状态列中读取真实血统
             is_rev = row.get('is_ai_rev', False)
             flag = " 🔄(AI反杀)" if is_rev else ""
 
-            if x == 'buy': return "🟢 进多" + flag
-            if x == 'sell': return "🔴 进空" + flag
-            if x == 'close_long': return "🏁 动态平多" + flag
-            if x == 'close_short': return "🏁 动态平空" + flag
-            if x == 'exchange_close': return "🎯 物理 OCO 触发" + flag
-            if x == 'bailout_close': return "🆘 高频熔断跳伞" + flag
+            if x == 'buy': return "🟢 智能开多" + flag
+            if x == 'sell': return "🔴 智能开空" + flag
+            if x == 'bailout_close': return "🎯 状态机止盈/损"
+            if x == 'bailout_panic_sell': return "🆘 右脑紧急熔断"
+            if x == 'exchange_close': return "🏁 交易所 OCO 触发"
             return x
             
         # 👇 【终极修复：先翻译中文方向，再根据中文方向决定是否显示胜率】
@@ -1325,19 +1278,28 @@ with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
     st.caption("基于波动率平价的机构级算仓防线与实时风控联动。")
     user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
     user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.5, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
-    user_target_profit = st.slider("单笔目标 ROE 止盈 (%)", min_value=5.0, max_value=100.0, value=float(st.session_state.settings.get("target_profit", HARD_TP * 100.0)), step=5.0, key="ui_profit", on_change=save_settings, disabled=lock_params, help="硬止盈线 (如60%代表ROE盈利60%止盈)")
-    user_target_risk = st.slider("单笔最高容忍 ROE 亏损 (%)", min_value=5.0, max_value=100.0, value=float(st.session_state.settings.get("target_risk", HARD_SL * 100.0)), step=5.0, key="ui_risk", on_change=save_settings, disabled=lock_params, help="硬止损线 (如30%代表ROE亏损30%止损)")
-    
-    st.markdown("#### 💡 物理硬止损保护")
-    user_excursion = st.slider("物理硬止损拉伸宽幅 ⚠️ (越大越防插针)", min_value=0.50, max_value=3.00, value=float(st.session_state.settings.get("excursion", 1.5)), step=0.1, key="ui_excursion", on_change=save_settings, disabled=lock_params)
+    st.markdown("#### 🧱 初始底层 OCO 硬防线")
+    st.caption("无视杠杆，完全锚定标的资产的 K 线真实物理涨跌幅。")
+    user_target_profit = st.slider(
+        "K 线物理硬止盈 (%)", 
+        min_value=0.5, max_value=20.0, 
+        value=float(st.session_state.settings.get("target_profit", HARD_TP * 100.0)), 
+        step=0.5, key="ui_profit", on_change=save_settings, disabled=lock_params, 
+        help="触碰该物理涨幅后，右脑将接管并将止损线上移至此。如 6.0 代表 K线涨 6%。"
+    )
+    user_target_risk = st.slider(
+        "K 线兜底硬止损 (%)", 
+        min_value=0.5, max_value=15.0, 
+        value=float(st.session_state.settings.get("target_risk", HARD_SL * 100.0)), 
+        step=0.1, key="ui_risk", on_change=save_settings, disabled=lock_params, 
+        help="最坏情况下的物理防线。如 3.0 代表 K线跌 3% 无条件斩仓。"
+    )
 
     st.markdown("#### 🧠 右脑高频熔断阈值")
     st.caption("防插针过滤：结合量价的三重并发锁，识别真伪瀑布。")
     user_bailout_atr_multi = st.slider("价格瀑布乘数 (ATR)", min_value=1.5, max_value=8.0, value=float(st.session_state.settings.get("bailout_atr_multi", 2.5)), step=0.1, key="ui_bailout_atr_multi", on_change=save_settings, disabled=lock_params, help="1分钟内跌幅超过该倍数的 ATR 才会触发警报")
     user_bailout_vol_multi = st.slider("异常爆量乘数 (Volume)", min_value=1.5, max_value=10.0, value=float(st.session_state.settings.get("bailout_vol_multi", 3.0)), step=0.5, key="ui_bailout_vol_multi", on_change=save_settings, disabled=lock_params, help="下跌时的成交量必须大于过去15分钟均量的该倍数，以过滤无量假摔插针")
-    st.markdown("#### 🏃 动态追踪锁润 (Trailing Stop)")
-    user_trailing_trigger = st.slider("激活追踪的本金收益率 (ROE %)", 1.0, 50.0, float(st.session_state.settings.get("trailing_trigger_roe", 5.0)))
-    user_trailing_lock_roe = st.slider("硬性保底收益率 (ROE %)", 0.5, 20.0, float(st.session_state.settings.get("trailing_lock_roe", 2.0)), step=0.5)
+
     # 👇 新增：宏观干预专区
     st.markdown("#### 🌐 宏观情报干预")
     user_macro_impact = st.slider("宏观情绪干预幅度 (%)", min_value=0.0, max_value=5.0, value=float(st.session_state.settings.get("max_macro_impact", 1.5)), step=0.1, key="ui_macro_impact", on_change=save_settings, disabled=lock_params, help="宏观得分对AI原始概率的最大增减幅度 (如1.5%代表情绪极度狂热时，看涨概率强行增加1.5%)")
@@ -1414,7 +1376,7 @@ def render_market_radar():
             # 🎯 仅保留最近一周 (168 小时) 的数据，防止图表过于拥挤
             df_actual = df_actual.tail(168)
             
-        # 2. 从 live_status.json 读取 AI 推理状态 (主要针对 BTCUSDT)
+        # 2. 从 live_status.json 读取 AI 推理状态 (适配全新的嵌套结构树)
         status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
         status_data = {}
         if os.path.exists(status_file):
@@ -1423,15 +1385,22 @@ def render_market_radar():
                     status_data = json.load(f)
             except: pass
             
-        # 填充展示指标 (适配精简架构)
-        last_update = datetime.fromtimestamp(status_data.get("updated_at", time.time())).strftime("%Y-%m-%d %H:%M:%S")
+        # 填充展示指标 (优先使用根节点的 timestamp，适配新 Payload)
+        last_update_ts = status_data.get("timestamp", time.time())
+        last_update = datetime.fromtimestamp(last_update_ts).strftime("%Y-%m-%d %H:%M:%S")
         
-        p_up = status_data.get("p_up", 0.33)
-        p_flat = status_data.get("p_flat", 0.34)
-        p_down = status_data.get("p_down", 0.33)
         macro_score = status_data.get("macro_score", 0.0)
-        adj_p_up = status_data.get("adj_p_up", p_up)
-        adj_p_down = status_data.get("adj_p_down", p_down)
+        
+        # 安全提取嵌套的 model_inference 数据
+        inference_data = status_data.get("model_inference", {})
+        
+        p_up = inference_data.get("raw_prob_up", 0.33)
+        p_down = inference_data.get("raw_prob_down", 0.33)
+        # 通过多空原始概率动态推导震荡概率 (保证和为1)
+        p_flat = max(0.0, 1.0 - p_up - p_down)
+        
+        adj_p_up = inference_data.get("adj_prob_up", p_up)
+        adj_p_down = inference_data.get("adj_prob_down", p_down)
         
         is_uptrend_proxy = current_price > (df_actual['close'].mean() if not df_actual.empty else current_price)
         ema_macro_slope = 0.001 if is_uptrend_proxy else -0.001

@@ -162,32 +162,18 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # ---------------------------------------------------------
         # 1. 仓位互斥锁与反转引擎：防止重复同向开仓，支持反向平仓反转
         # ---------------------------------------------------------
-        order_sent = False # 👇 新增标志位
+        order_sent = False 
         positions = exchange_private.fetch_positions([gate_symbol])
         for pos in positions:
             if float(pos.get('contracts', 0)) > 1e-8:
                 current_pos_side = str(pos.get('side', '')).lower()
                 
-                # 侦测到信号反转：当前持有长单但新信号是空单，或者相反
+                # 👇 【修改点1：反转拦截移交右脑】
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
-                    msg = f"🔄 侦测到 AI 预测反转信号！当前持有 {current_pos_side.upper()}，最新强烈预测方向为 {side.upper()}。执行平仓反转逻辑。"
+                    msg = f"🔄 侦测到 AI 预测反转信号！主引擎已挂起，交由右脑风控 (risk_manager) 评估执行 0.5% 锁润或强制平仓。"
                     print("⚠️", msg)
-                    log_system_alert("🔄 信号反转", symbol, msg)
-                    
-                    close_side = 'buy' if current_pos_side == 'short' else 'sell'
-                    try:
-                        # 1. 市价平旧仓
-                        exchange_private.create_order(symbol=gate_symbol, type='market', side=close_side, amount=float(pos['contracts']), params={'reduceOnly': True})
-                        # 2. 清扫旧的 OCO 止盈止损单
-                        for o in exchange_private.fetch_open_orders(gate_symbol, params={'stop': True}):
-                            try: exchange_private.cancel_order(o['id'], gate_symbol, params={'stop': True})
-                            except: pass
-                            
-                        print(f"✅ 旧有 {current_pos_side.upper()} 仓位已平仓完毕。为严格对齐回测，将进入冷却期等待下一个时间窗口...")
-                        return True, 0.0 # 👈 核心修正：仅平仓并返回，交由 live_pipeline 的冷却机制等待下个周期
-                    except Exception as e:
-                        print(f"❌ 反转平仓失败，为保护保证金，拒绝开启反向仓位: {e}")
-                        return False, 0.0
+                    log_system_alert("🔄 信号反转拦截", symbol, msg)
+                    return False, 0.0 # 阻断主引擎开新仓，等待右脑完成状态机结算
                 else:
                     msg = f"🔒 仓位锁拦截：{gate_symbol} 当前已有同向存续仓位，拒绝重复加仓。"
                     print("⚠️", msg)
@@ -317,44 +303,32 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         sl_price = actual_fill_price * (1 - actual_sl_move) if side == 'buy' else actual_fill_price * (1 + actual_sl_move)
 
         # ---------------------------------------------------------
-        # 【核心修复 1：使用 Gate.io 原生条件平仓单 (彻底解决互斥与占用)】
+        # 【修改点2：移除硬止盈，只挂兜底硬止损 (给追踪止盈让路)】
         # ---------------------------------------------------------
-        # 使用 Gate.io 底层 API，size=0 且 close=True 代表“平当前全部仓位”
-        # 这种模式下，止盈和止损不会互相锁定保证金，形成完美的 OCO 机制
-        
-        # 挂载并捕获结果
+        # 挂载物理硬止损
         sl_success = safe_post_condition(sl_rule, sl_price, "sl")
         
-        # 👇 【核心药方：强制休眠 0.5 秒，彻底斩断连环 502】
-        time.sleep(0.5) 
-        
-        tp_success = safe_post_condition(tp_rule, tp_price, "tp")
-
         # 终极物理校验
-        time.sleep(1.5) # 必须等待 1.5 秒给交易所撮合引擎落库时间
+        time.sleep(1.5) 
         try:
             verify_stops = exchange_private.fetch_open_orders(gate_symbol, params={'stop': True})
-            # 【核心修复】：穿透 Gate.io 奇葩的嵌套结构读取 text，并加入 len() 数量双重校验
             active_texts = [o.get('clientOrderId', '') or o['info'].get('initial', {}).get('text', '') for o in verify_stops]
             
-            if len(verify_stops) >= 2 or ('sl' in active_texts and 'tp' in active_texts):
-                print("🔔 交易所底层 OCO 止盈止损【挂单且物理校验成功】！")
+            # 校验只查 SL 是否存在即可
+            if len(verify_stops) >= 1 or 'sl' in active_texts:
+                print("🔔 交易所底层 OCO 兜底止损单【挂单且物理校验成功】！")
             else:
-                msg_oco_fail = f"OCO 条件单校验未完全通过 (现存: {len(verify_stops)}个)，可能存在遗漏，将交由幽灵雷达兜底。"
+                msg_oco_fail = f"物理兜底止损单校验未完全通过 (现存: {len(verify_stops)}个)，可能存在遗漏，交由右脑兜底。"
                 print(f"❌ 警告：{gate_symbol} {msg_oco_fail}")
-                # 👇 【修改点 4：把开单时的条件单残缺警告推给前端】
                 log_system_alert("⚠️ 挂单残缺", symbol, msg_oco_fail)
         except Exception as e:
-             print(f"⚠️ 校验请求被限流，假定挂单状态 (SL:{sl_success}/TP:{tp_success}): {e}")
-             # 可选：校验限流不一定代表挂单失败，作为黄色警告上报
-             log_system_alert("⚠️ 校验限流", symbol, "因频率限制无法立即校验 OCO 挂单状态，等待下一轮巡视。")
+             print(f"⚠️ 校验请求被限流，假定止损挂单成功: {e}")
 
-        # 【核心强化】：在后台日志显式打印动态出场价和预期收益率
         print(
-            f"✅ ⚡ [Gate模拟盘] 下单成功！方向：{side.upper()} | 数量：{order_amount} 张 {gate_symbol}。\n"
+            f"✅ ⚡ [Gate实盘] 下单成功！方向：{side.upper()} | 数量：{order_amount} 张 {gate_symbol}。\n"
             f"🎯 进场均价: ${actual_fill_price:.4f} (滑点 {slippage:.3%})\n"
-            f"💰 硬性止盈 (TP): ${tp_price:.4f} (预期 ROE +{abs(tp_pct):.2%})\n"
-            f"🛡️ 硬性止损 (SL): ${sl_price:.4f} (极限亏损 -{abs(sl_pct):.2%})"
+            f"🛡️ 兜底止损 (SL): ${sl_price:.4f} (极限亏损 -{abs(sl_pct):.2%})\n"
+            f"🚀 追踪止盈: 已移交右脑状态机动态接管"
         )
 
         # ---------------------------------------------------------
@@ -408,12 +382,11 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     # 👇 【修复 2：兜底价格计算】因为断网拿不到实际成交价，强制用当前盘口价测算防线
                     actual_tp_move = abs(tp_pct)
                     actual_sl_move = abs(sl_pct)
-                    fallback_tp_price = current_price * (1 + actual_tp_move) if side == 'buy' else current_price * (1 - actual_tp_move)
+                    
                     fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
                     
                     # 立刻挂载 OCO 条件单，堵住超时裸奔漏洞
                     safe_post_condition(sl_rule, fallback_sl_price, "sl")
-                    safe_post_condition(tp_rule, fallback_tp_price, "tp")
                     
                     # 超时抢救成功后兜底落库
                     db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol}.db")

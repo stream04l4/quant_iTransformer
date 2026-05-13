@@ -314,7 +314,7 @@ class DeepSeekMacroAgent:
             "temperature": 0.1 
         }
 
-        max_retries = 5
+        max_retries = 10
         for attempt in range(1, max_retries + 1):
             try:
                 response = requests.post(self.url, headers=headers, json=payload, timeout=15)

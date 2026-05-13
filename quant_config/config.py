@@ -26,11 +26,12 @@ LOG_DIR = LIVE_DATA_DIR / "logs"
 # 2. 交易标的与业务参数 (Trading & Features)
 # ==========================================
 SYMBOL = "BTCUSDT"
-AUX_SYMBOLS = ["ETHUSDT", "ETHBTC"]  # 横截面辅助标的
+AUX_SYMBOLS = ["ETHUSDT", "ETHBTC"]  
 
-WHALE_THRESHOLD = 5.0    # 巨鲸大单阈值 (>=5 BTC)
-RETAIL_THRESHOLD = 0.1   # 散户碎单阈值 (<=0.1 BTC)
-FORECAST_HORIZON = 24    # 模型预测未来 24 小时
+WHALE_THRESHOLD = 5.0    
+RETAIL_THRESHOLD = 0.1   
+# 👇 改为动态获取，供 Mode 1 寻优
+FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 24))
 
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
@@ -61,16 +62,16 @@ METRICS_COLS = [
 # ==========================================
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
-# 这些参数在调优时需要频繁变动，集中管理以防止回测与实盘错配
-LEVERAGE_1 = 1.0           # 杠杆倍数
-LEVERAGE_2 = 3.0           # 杠杆倍数
-LEVERAGE_3 = 5.0           # 杠杆倍数
+# 👇 全部改为动态获取，供 Mode 2 寻优
+LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 1.0))
+LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 3.0))
+LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 5.0))
 
-FEE_RATE = 0.0005        # 交易所单边手续费 (币安市价单 Taker 万五)
+FEE_RATE = 0.0005        
 
-HOLD_PERIOD = 24         
-HARD_TP = 0.05           # 绝对止盈线 6% 
-HARD_SL = 0.02           # 绝对止损线 2% 
+HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 24))         
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.05))           
+HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.02))
 
 # --- 实盘专用风控与仓位参数 ---
 LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
@@ -89,7 +90,7 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 336))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 256))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-5))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-6))
 
 D_MODEL = int(os.environ.get("OPT_D_MODEL", 256))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 1))

@@ -20,16 +20,14 @@ from quant_config.config import (
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL
 )
 # ==========================================
-# 1. 加载实盘配置 (对齐 1296 次寻优跑出的终极神级参数)
+# 1. 加载实盘配置 (固定单模型路径)
 # ==========================================
 GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 🚨 极其重要：把我们在网格搜索中跑出的神级模型的绝对路径填好！
-# 如果你没改文件名，大概率长这样，请替换为你本地真实的路径
-MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_1.pth" 
-# 对应的概率门槛文件
-JSON_PATH = MODEL_DIR / "dynamic_thresholds_1.json"
+# 🚨 对齐用户指定的文件名
+MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_24h.pth" 
+JSON_PATH = MODEL_DIR / "dynamic_thresholds_24h.json"
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
@@ -235,56 +233,43 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 # 3. 实盘主循环
 # ==========================================
 def run_live():
-    print("🚀 极速实盘预测引擎启动...")
+    print(f"🚀 极速实盘预测引擎启动 (单模型模式: {MODEL_PATH.name})...")
     threading.Thread(target=bailout_worker, daemon=True).start()
-    # 1. 加载 5 个神级模型形成议会
-    models = []
-    thresholds_list = []
-    feature_cols = None
     
+    # --- 1. 加载单一神级模型 ---
+    print(f"📥 正在加载模型权重: {MODEL_PATH}")
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+    feature_cols = checkpoint['feature_cols']
+    
+    # 动态构建网络拓扑
     dynamic_n_heads = max(2, LIVE_D_MODEL // 16) 
     dynamic_d_ff = LIVE_D_MODEL * 4
     
-    for i in range(1, 6):
-        m_path = MODEL_DIR / f"itransformer_BTCUSDT_best_{i}.pth"
-        j_path = MODEL_DIR / f"dynamic_thresholds_{i}.json"
-        
-        print(f"📥 加载席位 {i} 权重: {m_path}")
-        checkpoint = torch.load(m_path, map_location=DEVICE, weights_only=False)
-        if feature_cols is None:
-            feature_cols = checkpoint['feature_cols']
-            
-        # 使用实盘专属网络拓扑参数实例化议员模型
-        model = InvertedTransformer(
-            num_variates=len(feature_cols), 
-            seq_len=LIVE_SEQ_LEN, 
-            d_model=LIVE_D_MODEL, 
-            n_heads=dynamic_n_heads, 
-            d_ff=dynamic_d_ff, 
-            e_layers=LIVE_E_LAYERS,
-            dropout=LIVE_DROPOUT
-        ).to(DEVICE)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        models.append(model)
-        
-        with open(j_path, 'r') as f:
-            thresholds_list.append(json.load(f))
-            
-    print(f"✅ 成功组建 5 节点 AI 议会。")
+    model = InvertedTransformer(
+        num_variates=len(feature_cols), 
+        seq_len=LIVE_SEQ_LEN, 
+        d_model=LIVE_D_MODEL, 
+        n_heads=dynamic_n_heads, 
+        d_ff=dynamic_d_ff, 
+        e_layers=LIVE_E_LAYERS,
+        dropout=LIVE_DROPOUT
+    ).to(DEVICE)
     
-    # ==========================================
-    # 🎯 频段隔离器：初始化各种频率的控制阀
-    # ==========================================
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    with open(JSON_PATH, 'r') as f:
+        th = json.load(f)
+            
+    print(f"✅ 模型与阈值加载成功。")
+    
+    # 频段隔离器变量
     last_inferred_hour = 0
     cached_p_down, cached_p_flat, cached_p_up = 0.0, 0.0, 0.0
-    cached_probs_list = [[0.0, 0.0, 0.0] for _ in range(5)]
     
     last_macro_check = 0.0
     cached_macro_score = 0.0
-    
-    last_trade_hour = 0  # 核心修正：使用 K 线的时间戳代替物理时间
+    last_trade_hour = 0  
     last_trade_signal = 0
     latest_closed_ts = 0
 
@@ -347,150 +332,112 @@ def run_live():
                 trigger_reason = "宏观得分刷新"
 
             # ---------------------------------------------------------
-            # ⏳ [1小时级 Tick] 深度学习微观特征矩阵推理
+            # ⏳ [1小时级 Tick] 深度学习推理 (单模型)
             # ---------------------------------------------------------
             if len(snapshot['ohlcv_1h']) >= 2:
-                # 倒数第二根是已闭合的完整 K 线
                 latest_closed_ts = snapshot['ohlcv_1h'][-2][0] 
                 
-                # 只有跨入新的一小时，才执行沉重的 Transformer 张量计算
                 if latest_closed_ts != last_inferred_hour:
-                    print(f"\n🔄 [换线时刻] 侦测到 K 线闭合 (TS: {latest_closed_ts})，开始重构 29 维张量...")
+                    print(f"\n🔄 [换线时刻] 开始执行单模型推理 (TS: {latest_closed_ts})...")
                     
                     eth_usdt_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[0]}").json()
                     eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
                     
                     features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
-                    # 🚨 终极安全锁：强行用模型自带的 feature_cols 抓取数据，切断底层硬编码带来的维度错乱风险
                     input_raw = features_df[feature_cols].iloc[-LIVE_SEQ_LEN:].values.astype('float32')
                     x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                     
                     with torch.no_grad():
-                        cached_probs_list = []
-                        for m in models:
-                            logits = m(x_tensor)
-                            cached_probs_list.append(torch.softmax(logits, dim=1).cpu().numpy()[0])
+                        logits = model(x_tensor)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                         
-                    # 计算议会平均概率用于监控展示
-                    avg_probs = np.mean(cached_probs_list, axis=0)
-                    cached_p_down, cached_p_flat, cached_p_up = avg_probs[0], avg_probs[1], avg_probs[2]
+                    cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
                     last_inferred_hour = latest_closed_ts
-                    current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                    print(f"✅ [{current_time_str} UTC] 微观推理完成！本小时基准概率 -> 📉空:{cached_p_down:.4f} | ⚪平:{cached_p_flat:.4f} | 📈多:{cached_p_up:.4f}")
                     needs_evaluation_log = True
-                    trigger_reason = f"新K线闭合推理 & {trigger_reason}" if trigger_reason else "新K线闭合重新推理"
+                    trigger_reason = "新K线闭合推理"
 
             # ---------------------------------------------------------
             # ⚔️ [10秒级 Tick] 实时高频信号撮合
             # ---------------------------------------------------------
-            # 虽然模型概率 1 小时变一次，宏观 30 分钟变一次，
-            # 只要有任何一边发生了改变，或者价格触发了特定条件，这里每 10 秒都会进行一次拦截判断
             dynamic_macro_impact = float(ui_config.get("max_macro_impact", MAX_MACRO_IMPACT * 100.0)) / 100.0
             macro_buff = cached_macro_score * dynamic_macro_impact
             
             adj_p_up = cached_p_up + macro_buff
             adj_p_down = cached_p_down - macro_buff
 
-            # 👇 【新增：输出状态给监控塔 UI (依然显示平均概率)】
-            try:
-                status_data = {
-                    "latest_kline_ts": latest_closed_ts,
-                    "macro_score": cached_macro_score,
-                    "p_up": float(cached_p_up),
-                    "p_flat": float(cached_p_flat),
-                    "p_down": float(cached_p_down),
-                    "adj_p_up": float(adj_p_up),
-                    "adj_p_down": float(adj_p_down),
-                    "current_price": current_price,
-                    "updated_at": current_time
-                }
-                with open(os.path.join(LIVE_DATA_DIR, "live_status.json.tmp"), "w") as f:
-                    json.dump(status_data, f)
-                os.replace(os.path.join(LIVE_DATA_DIR, "live_status.json.tmp"), os.path.join(LIVE_DATA_DIR, "live_status.json"))
-            except Exception: pass
-
+            # --- 单模型信号决策 ---
             signal = 0
             dynamic_leverage = 0.0
             
-            # 👇 进行议会投票
-            directions = []
-            leverages = []
-            
-            for i in range(5):
-                m_p_down, m_p_flat, m_p_up = cached_probs_list[i]
-                m_adj_p_up = m_p_up + macro_buff
-                m_adj_p_down = m_p_down - macro_buff
-                thresh = thresholds_list[i]
-                
-                sig = 0
-                lev = 0.0
-                if m_adj_p_up > thresh['up_top_1']: sig = 1; lev = LEVERAGE_3
-                elif m_adj_p_up > thresh['up_top_5']: sig = 1; lev = LEVERAGE_2
-                elif m_adj_p_up > thresh['up_top_10']: sig = 1; lev = LEVERAGE_1
-                elif m_adj_p_down > thresh['down_top_1']: sig = -1; lev = LEVERAGE_3
-                elif m_adj_p_down > thresh['down_top_5']: sig = -1; lev = LEVERAGE_2
-                elif m_adj_p_down > thresh['down_top_10']: sig = -1; lev = LEVERAGE_1
-                
-                directions.append(sig)
-                leverages.append(lev)
-                
-            long_votes = directions.count(1)
-            short_votes = directions.count(-1)
-            
-            if long_votes >= 3:
-                signal = 1
-                dynamic_leverage = max([leverages[i] for i in range(5) if directions[i] == 1])
-            elif short_votes >= 3:
-                signal = -1
-                dynamic_leverage = max([leverages[i] for i in range(5) if directions[i] == -1])
+            if adj_p_up > th['up_top_1']:      signal = 1; dynamic_leverage = LEVERAGE_3
+            elif adj_p_up > th['up_top_5']:    signal = 1; dynamic_leverage = LEVERAGE_2
+            elif adj_p_up > th['up_top_10']:   signal = 1; dynamic_leverage = LEVERAGE_1
+            elif adj_p_down > th['down_top_1']:  signal = -1; dynamic_leverage = LEVERAGE_3
+            elif adj_p_down > th['down_top_5']:  signal = -1; dynamic_leverage = LEVERAGE_2
+            elif adj_p_down > th['down_top_10']: signal = -1; dynamic_leverage = LEVERAGE_1
 
-            # 👇 优化：每次重推理（换线或宏观刷新）记录综合决策结论与联席会议明细到前端
+            # 👇 优化日志：移除“联席会议”字样，改为单模型汇报
             if needs_evaluation_log:
-                action_str = f"按兵不动 (最终投票: 涨{long_votes} 跌{short_votes})"
-                if signal == 1:
-                    action_str = f"🚀 触发做多 (通过 {long_votes}/5 票, 最终杠杆: {dynamic_leverage}x)"
-                elif signal == -1:
-                    action_str = f"🩸 触发做空 (通过 {short_votes}/5 票, 最终杠杆: {dynamic_leverage}x)"
+                action_str = "按兵不动"
+                if signal == 1: action_str = f"🚀 触发做多 (杠杆: {dynamic_leverage}x)"
+                elif signal == -1: action_str = f"🩸 触发做空 (杠杆: {dynamic_leverage}x)"
                     
-                is_duplicate = (latest_closed_ts == last_trade_hour and signal == last_trade_signal)
-                if signal != 0 and is_duplicate:
-                    action_str += " [静默跳过: 本K线已同向发车]"
-                
-                # 展开 5 个模型的独立看板与投票意向
-                dir_map = {1: "📈看多", -1: "📉看空", 0: "⚪弃权"}
-                council_details = ""
-                for idx in range(5):
-                    m_p_down, m_p_flat, m_p_up = cached_probs_list[idx]
-                    # 记录每个模型加上宏观修正后的独立状态
-                    council_details += f"   ├─ 席位 {idx+1} | 多:{m_p_up:.4f} 平:{m_p_flat:.4f} 空:{m_p_down:.4f} | 投票意向: {dir_map.get(directions[idx], '未知')}\n"
-
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
-                    f"【微观基准概率 (5席均值)】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
-                    f"【宏观修正概率 (5席均值)】📈多:{adj_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{adj_p_down:.4f} (宏观情绪增幅: {macro_buff:+.4f})\n"
-                    f"【联席会议明细】\n{council_details}"
+                    f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
+                    f"【修正概率】📈多:{adj_p_up:.4f} | 📉空:{adj_p_down:.4f} (宏观修正: {macro_buff:+.4f})\n"
                     f"【引擎决策】{action_str}"
                 )
-                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 综合评估汇报:\n{eval_log}\n")
+                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
                 log_system_alert("🧠 决策评估", SYMBOL, eval_log)
 
 
             if signal != 0:
-                # 完美物理对齐：使用 K 线闭合时间戳做锁定，彻底消灭物理时间的毫秒级误差！
                 if latest_closed_ts == last_trade_hour and signal == last_trade_signal:
                     pass # 同一根 K 线内同方向静默跳过
                 else:
                     print(f"\n[{snapshot['server_time']}] 🔥 突破红线！最新价: {current_price} | 发送 OMS 指令 (杠杆: {dynamic_leverage}x)...")
-                    success, actual_margin = execute_gate_trade(
-                        symbol=SYMBOL, signal=signal, leverage=dynamic_leverage,
-                        current_price=current_price,
-                        tp_pct=dynamic_tp, sl_pct=dynamic_sl, risk_margin_usd=dynamic_margin_usd
-                    )
+                    success, actual_margin = execute_gate_trade(...)
                     if success:
                         print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
                         last_trade_hour = latest_closed_ts
                         last_trade_signal = signal
-                
+            
+            # 👇 新增：引擎遥测状态原子级持久化 (Telemetry State Persistence)
+            live_state_payload = {
+                "timestamp": current_time,
+                "server_time": snapshot.get('server_time', int(current_time * 1000)),
+                "symbol": SYMBOL,
+                "current_price": current_price,
+                "macro_score": cached_macro_score,
+                "model_inference": {
+                    "raw_prob_up": float(cached_p_up),
+                    "raw_prob_down": float(cached_p_down),
+                    "adj_prob_up": float(adj_p_up),
+                    "adj_prob_down": float(adj_p_down),
+                    "macro_buff": float(macro_buff)
+                },
+                "execution_state": {
+                    "current_signal": int(signal),
+                    "dynamic_leverage": float(dynamic_leverage) if signal != 0 else 0.0,
+                    "last_inferred_hour": int(last_inferred_hour),
+                    "last_trade_hour": int(last_trade_hour)
+                }
+            }
+
+            tmp_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json.tmp")
+            target_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
+            
+            try:
+                # 1. 写入临时文件
+                with open(tmp_state_path, "w", encoding="utf-8") as f:
+                    json.dump(live_state_payload, f, ensure_ascii=False, indent=2)
+                # 2. 操作系统级原子替换，杜绝外部进程读到不完整的 JSON
+                os.replace(tmp_state_path, target_state_path)
+            except IOError as e:
+                print(f"⚠️ 状态持久化写入失败: {e}")
+            # 👆 新增结束
+
         except Exception as e:
             print(f"❌ 主循环异常: {e}")
             
