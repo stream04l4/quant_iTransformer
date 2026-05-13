@@ -6,9 +6,9 @@ import numpy as np
 import time
 import shutil
 import polars as pl
-from datetime import datetime
+import argparse
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from datetime import timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
@@ -227,8 +227,8 @@ def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
 # ==========================================
 # 2. 核心特征构建与聚合逻辑
 # ==========================================
-def build_features():
-    print(f"\n🚀 [第一阶段] 正在拉取并拼接主维度数据...")
+def build_features(horizon):
+    print(f"\n🚀 [第一阶段] 正在拉取并拼接主维度数据 (预测窗口: {horizon}h)...")
     
     # 1. 拉取 1h K线，并顺手保存一份未被对数和归一化污染的 raw_1h.parquet 给回测用
     btc_klines = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1h", save_raw_parquet=True)
@@ -395,7 +395,7 @@ def build_features():
         (pl.col("hour_timestamp").dt.hour() * (2 * np.pi / 24)).cos().alias("hour_cos"),
         (pl.col("hour_timestamp").dt.weekday() * (2 * np.pi / 7)).sin().alias("week_sin"),
         (pl.col("hour_timestamp").dt.weekday() * (2 * np.pi / 7)).cos().alias("week_cos"),
-        (pl.col("close").shift(-FORECAST_HORIZON).log() - pl.col("close").log()).alias(f"target_{FORECAST_HORIZON}h_return")
+        (pl.col("close").shift(-horizon).log() - pl.col("close").log()).alias(f"target_{horizon}h_return")
     ])
 
     features = features.with_columns(
@@ -462,7 +462,7 @@ def build_features():
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 
         "rv_term_structure", 
         "funding_rate_momentum", "premium_delta", "eth_btc_return", 
-        "hour_sin", "hour_cos", "week_sin", "week_cos", f"target_{FORECAST_HORIZON}h_return"
+        "hour_sin", "hour_cos", "week_sin", "week_cos", f"target_{horizon}h_return"
     ]
     # 🌟 新增: COID 被放进含有深度订单流的分支中
     if "cvd" in features.columns:
@@ -480,10 +480,15 @@ def build_features():
     features = features.drop_nulls()
     
     current_date = datetime.now().strftime("%Y%m%d")
-    file_name = f"{SYMBOL}_Master_Training_Matrix_{current_date}.parquet"
+    # 👇 文件名加上了 {horizon}h 的标志
+    file_name = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_{current_date}.parquet"
     output_path = PROCESSED_MAIN_DIR / file_name
     features.write_parquet(output_path)
     print(f"\n✅ 终极宽表构建成功！路径: {output_path} | 最终规模: {features.shape}")
 
 if __name__ == "__main__":
-    build_features()
+    parser = argparse.ArgumentParser(description='构建加密货币量化特征宽表')
+    parser.add_argument('--horizon', type=int, default=FORECAST_HORIZON, help='预测未来的时间窗口 (小时)')
+    args = parser.parse_args()
+    
+    build_features(horizon=args.horizon)

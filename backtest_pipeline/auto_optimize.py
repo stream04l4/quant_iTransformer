@@ -90,6 +90,9 @@ def run_experiment(params, mode, base_model, save_models):
     
     env["OMP_NUM_THREADS"] = "1"
     env["POLARS_MAX_THREADS"] = "1"
+    # 👇 核心修复：绝对压制底层 NumPy/SciPy 的多线程分裂，防止 CPU 踩踏！
+    env["MKL_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
     
     stdout_log = ""
     res = {}
@@ -97,7 +100,8 @@ def run_experiment(params, mode, base_model, save_models):
     if mode == 'alpha':
         scripts = ['train_itransformer.py', 'check_prob_distribution.py', 'alpha_ic_evaluator.py']
         for script in scripts:
-            script_path = HISTORICAL_DIR / script if script != 'alpha_ic_evaluator.py' else BACKTEST_DIR / script
+            # 只有训练脚本在 historical，其余都在 backtest 文件夹下
+            script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
             result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 return {"error": f"💥 {script} 报错:\n{result.stderr}", **params}
@@ -179,7 +183,7 @@ def main():
     if args.mode == 'backtest': print(f"   基座 Alpha 模型: {args.base_model}")
     print("=" * 80)
 
-    MAX_WORKERS = 2 if args.mode == 'alpha' else 8 
+    MAX_WORKERS = 16 if args.mode == 'alpha' else 16 
     batches = [combinations[i:i + MAX_WORKERS] for i in range(0, len(combinations), MAX_WORKERS)]
     
     all_results = []
@@ -197,7 +201,7 @@ def main():
                 
                 progress_str = f"[{completed_tasks}/{len(combinations)}]"
                 if "error" in res:
-                    print(f"   {progress_str} ❌ 失败: {res['error'].splitlines()[0]}")
+                    print(f"   {progress_str} ❌ 失败:\n{res['error']}")
                 else:
                     if args.mode == 'alpha':
                         rank_ic = res.get('primary_rank_ic', 0)

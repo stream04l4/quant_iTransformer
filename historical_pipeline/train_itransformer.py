@@ -109,7 +109,7 @@ def train_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     
     # 自动定位最新生成的特征宽表
-    parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
+    parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"*_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
     if not parquet_files:
         print("❌ 未找到特征宽表，请先运行 build_main_features.py")
         return
@@ -158,12 +158,12 @@ def train_model():
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     # 🚨 产业界前沿：换用余弦退火调度器，强迫模型多走几十轮
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
     scaler = torch.amp.GradScaler('cuda')
     
     # 🚨 终极修复：废弃 F1，回归 Val Loss 置信度监控，并引入容忍度极低的早停机制
     best_val_loss = float('inf')
-    patience = 7                  # 容忍度：连续 5 个 Epoch 验证集 Loss 不降则强行停止 (对于高噪金融数据，5已足够)
+    patience = 8                  # 容忍度：连续 5 个 Epoch 验证集 Loss 不降则强行停止 (对于高噪金融数据，5已足够)
     patience_counter = 0          # 早停计数器
     
     print("\n🔥 开始炼丹 (引入置信度监控与防过拟合机制)...")

@@ -11,18 +11,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, EXPERIMENT_ID
 
-# 构造一个极简的数据集用于高速批量推断
-class FastSeqDataset(Dataset):
-    def __init__(self, data, seq_len):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.seq_len = seq_len
-
-    def __len__(self):
-        return len(self.data) - self.seq_len
-
-    def __getitem__(self, idx):
-        return self.data[idx : idx + self.seq_len]
-
 def check_distribution():
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
     model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
@@ -66,29 +54,25 @@ def check_distribution():
     print(f"\n⚙️ 正在 H100 上执行批量高速推断 (历史基准集大小: {len(X_baseline)})...")
     
     # 🚨 核心修复 2：使用 DataLoader 进行大批量并行推断
-    dataset = FastSeqDataset(X_baseline, SEQ_LEN)
-    # 关闭锁页内存，释放操作系统的页表管理压力
-    loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
+    X_tensor = torch.tensor(X_baseline, dtype=torch.float32, device=DEVICE)
+    X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
     
-    # 🚨 产业界优化：改用 Chunk (块) 收集法，消除数百万次 list.extend 带来的极度内存碎片化和降速
-    p_down_chunks, p_flat_chunks, p_up_chunks = [], [], []
+    predictions_probs_chunks = [] # 改用 chunks
+    INFERENCE_BATCH_SIZE = 4096
     
     with torch.no_grad():
-        for batch_x in loader:
-            batch_x = batch_x.to(DEVICE)
+        for i in range(0, len(X_windows), INFERENCE_BATCH_SIZE):
+            batch_x = X_windows[i : i + INFERENCE_BATCH_SIZE]
             with torch.amp.autocast('cuda'):
                 logits = model(batch_x)
-                # 直接按 batch 块保留 numpy 数组
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
-                
-            p_down_chunks.append(probs[:, 0])
-            p_flat_chunks.append(probs[:, 1])
-            p_up_chunks.append(probs[:, 2])
+            predictions_probs_chunks.append(probs) # ✅ 整体追加块
 
-    # 循环结束后，在 C 语言底层一次性完成连续内存的拼接，速度提升数十倍
-    p_down = np.concatenate(p_down_chunks)
-    p_flat = np.concatenate(p_flat_chunks)
-    p_up = np.concatenate(p_up_chunks)
+    predictions_probs_arr = np.vstack(predictions_probs_chunks) # ✅ 零开销瞬间合并
+    
+    p_down = predictions_probs_arr[:, 0]
+    p_flat = predictions_probs_arr[:, 1]
+    p_up = predictions_probs_arr[:, 2]
 
     print("\n📊 模型输出概率分位数统计 (基于历史基准防止未来函数):")
     print("=" * 60)

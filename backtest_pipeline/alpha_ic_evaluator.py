@@ -13,41 +13,31 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
-    SYMBOL, PROCESSED_MAIN_DIR, TRAIN_DATA_DIR, MODEL_DIR, TEMP_DIR,
-    SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, FORECAST_HORIZON
+    SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
+    SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, FORECAST_HORIZON, EXPERIMENT_ID
 )
 from historical_pipeline.train_itransformer import InvertedTransformer
 
-# ==========================================
-# 1. 极速推理数据集
-# ==========================================
-class FastSeqDataset(torch.utils.data.Dataset):
-    def __init__(self, data, seq_len):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.seq_len = seq_len
-    def __len__(self):
-        return len(self.data) - self.seq_len
-    def __getitem__(self, idx):
-        return self.data[idx : idx + self.seq_len]
 
 # ==========================================
-# 2. 模型纯净评估主引擎
+# 1. 模型纯净评估主引擎
 # ==========================================
 def evaluate_pure_alpha():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 1. 定位最新数据矩阵
-    data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
+    data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"*_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
     if not data_files:
         print("❌ 找不到特征矩阵文件！")
         return
     data_path = data_files[-1]
     
-    # 2. 定位所有模型权重文件
-    model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_*.pth")))
-    if not model_files:
-        print("❌ 找不到任何模型权重文件！")
+    # 2. 定位模型权重文件
+    target_model_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth"
+    if not target_model_path.exists():
+        print(f"❌ 找不到当前批次的模型权重文件: {target_model_path.name}！")
         return
+    model_files = [target_model_path]
 
     # 3. 加载特征空间与时间轴
     print(f"📦 正在加载特征宽表: {data_path.name}")
@@ -95,21 +85,23 @@ def evaluate_pure_alpha():
         X_raw = df_matrix.select(feature_cols).to_numpy().astype('float32')
         X_test_raw = X_raw[split_idx:]
         
-        # 批量推理产生置信度
-        dataset = FastSeqDataset(X_test_raw, SEQ_LEN)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=False)
+        # 批量推理产生置信度 (Zero-Copy 模式)
+        X_tensor = torch.tensor(X_test_raw, dtype=torch.float32, device=DEVICE)
+        X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
         
         predictions_probs = []
+        INFERENCE_BATCH_SIZE = 4096
+        
         with torch.no_grad():
-            for batch_x in loader:
-                batch_x = batch_x.to(DEVICE)
+            for i in range(0, len(X_windows), INFERENCE_BATCH_SIZE):
+                batch_x = X_windows[i : i + INFERENCE_BATCH_SIZE]
                 with torch.amp.autocast('cuda'):
                     logits = model(batch_x)
                     probs = torch.softmax(logits, dim=1).cpu().numpy()
                 predictions_probs.extend(probs)
                 
         # 生成时间戳对齐 (扣除 seq_len 造成的窗口位移)
-        valid_timestamps = test_timestamps[SEQ_LEN - 1 : len(X_test_raw) - 1]
+        valid_timestamps = test_timestamps[SEQ_LEN - 1 :].tolist()
         valid_timestamps_pd = pd.to_datetime(valid_timestamps)
 
         # 构建评测数据框

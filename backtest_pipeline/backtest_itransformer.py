@@ -22,7 +22,7 @@ from historical_pipeline.train_itransformer import InvertedTransformer
 
 
 def run_backtest():
-    data_files = sorted(list(PROCESSED_MAIN_DIR.glob("*_Master_Training_Matrix_*.parquet")))
+    data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"*_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
     model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
     
     if not data_files or not model_files:
@@ -63,32 +63,27 @@ def run_backtest():
     X_test_raw = X_raw[split_idx:]
     test_timestamps = timestamps[split_idx:]
     
-    print("\n⚙️ 正在 H100 上生成概率矩阵 (Softmax 置信度)...")
-    predictions_probs = []
-    valid_timestamps = []
+    print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
     
-    class FastSeqDataset(torch.utils.data.Dataset):
-        def __init__(self, data, seq_len):
-            self.data = torch.tensor(data, dtype=torch.float32)
-            self.seq_len = seq_len
-        def __len__(self):
-            return len(self.data) - self.seq_len
-        def __getitem__(self, idx):
-            return self.data[idx : idx + self.seq_len]
-
-    dataset = FastSeqDataset(X_test_raw, SEQ_LEN)
-    # 🚨 关闭锁页内存
-    loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
+    # 1. 一次性将全量数据推送至 GPU 显存
+    X_tensor = torch.tensor(X_test_raw, dtype=torch.float32, device=DEVICE)
+    
+    # 2. 利用底层 C++ unfold 瞬间生成滑动窗口的内存视图
+    X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
+    
+    predictions_probs = []
+    valid_timestamps = test_timestamps[SEQ_LEN - 1 :].tolist()
+    
+    # 3. 显存内极速批处理 (摆脱 CPU 束缚，Batch Size 可拉爆到 4096)
+    INFERENCE_BATCH_SIZE = 4096 
     
     with torch.no_grad():
-        for batch_x in loader:
-            batch_x = batch_x.to(DEVICE)
+        for i in range(0, len(X_windows), INFERENCE_BATCH_SIZE):
+            batch_x = X_windows[i : i + INFERENCE_BATCH_SIZE]
             with torch.amp.autocast('cuda'):
                 logits = model(batch_x)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
             predictions_probs.extend(probs)
-            
-    valid_timestamps = test_timestamps[SEQ_LEN - 1 : len(X_test_raw) - 1].tolist()
 
     # 极速加载 1h 和 1m 的真实物理价格 (执行空间)
     raw_kline_dir = TEMP_DIR / "klines" / SYMBOL
