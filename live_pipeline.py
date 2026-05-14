@@ -18,7 +18,7 @@ from quant_config.config import (
     LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD,
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL,
-    INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI
+    INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON
 )
 # ==========================================
 # 1. 加载实盘配置 (固定单模型路径)
@@ -27,8 +27,8 @@ GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🚨 对齐用户指定的文件名
-MODEL_PATH = MODEL_DIR / "itransformer_BTCUSDT_best_24h.pth" 
-JSON_PATH = MODEL_DIR / "dynamic_thresholds_24h.json"
+MODEL_PATH = MODEL_DIR / f"itransformer_BTCUSDT_best_{FORECAST_HORIZON}h.pth" 
+JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{FORECAST_HORIZON}h.json"
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)

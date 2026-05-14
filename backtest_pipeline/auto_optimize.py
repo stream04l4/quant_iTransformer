@@ -23,9 +23,9 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
     'SEQ_LEN': [336],
-    'CLASS_THRESHOLD': [0.025],
+    'CLASS_THRESHOLD': [0.015],
     'E_LAYERS': [2],
-    'D_MODEL': [128],
+    'D_MODEL': [256],
     'DROPOUT': [0.3],
     'BATCH_SIZE': [128],
     'LEARNING_RATE': [5e-6],
@@ -37,9 +37,9 @@ BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_1': [1.0, 2.0],
     'LEVERAGE_2': [3.0, 4.0],
     'LEVERAGE_3': [5.0, 7.0],
-    'HOLD_PERIOD': [12, 24, 48],
-    'HARD_TP': [0.04, 0.06, 0.08],
-    'HARD_SL': [0.03, 0.04, 0.06]
+    'HOLD_PERIOD': [6, 12, 24],
+    'HARD_TP': [0.03, 0.04, 0.05],
+    'HARD_SL': [0.015, 0.02, 0.03, 0.04]
 }
 
 def extract_alpha_metrics(output):

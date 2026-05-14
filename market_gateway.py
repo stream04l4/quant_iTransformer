@@ -5,10 +5,12 @@ from fastapi import FastAPI, HTTPException
 import uvicorn
 import threading
 import random
+import math
 from datetime import datetime
 import time
 import sqlite3
-from quant_config.config import SYMBOL, AUX_SYMBOLS, WHALE_THRESHOLD, RETAIL_THRESHOLD, LIVE_DATA_DIR
+import polars as pl
+from quant_config.config import SYMBOL, AUX_SYMBOLS, WHALE_THRESHOLD, RETAIL_THRESHOLD, LIVE_DATA_DIR, PROCESSED_AGGTRADES_DIR
 
 app = FastAPI(title="Binance链币种: {} 极速行情网关".format(SYMBOL))
 
@@ -30,7 +32,7 @@ all_symbols = [SYMBOL] + AUX_SYMBOLS
 for sym in all_symbols:
     market_data_store[sym] = {
         "1m": deque(maxlen=35000), # 增加长度以支撑 1m RV 计算
-        "1h": deque(maxlen=1000), # 从 500 提升到 1000，确保满足 504 需求
+        "1h": deque(maxlen=1250), # 从 500 提升到 1000，确保满足 504 需求
         "orderbook": {"bids": [], "asks": []},
         "ticker": {"last": None},
         "liquidations": deque(maxlen=1000), 
@@ -416,13 +418,13 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
     with sqlite3.connect(DB_PATH) as conn:
         # 获取最近 1000 根 K 线的时间戳
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1000", (symbol,))
+        cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
         ts_list = [r[0] for r in cursor.fetchall()]
 
     if len(ts_list) < 2:
         # 初次启动，拉取全量
         print(f"   🆕 {symbol} 本地无数据，执行全量预热...")
-        await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, limit=1000)
+        await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, limit=1250)
     else:
         # 检查时间轴空隙
         ts_list.reverse()
@@ -439,10 +441,14 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
         else:
             print(f"   ✅ {symbol} 时间轴完美连续。")
 
-# ================= 终极步骤：将完美的 1000 根数据灌入内存 =================
+    # 🚨 触发一次性回填
+    if not is_spot:
+        await sync_local_aggtrades_to_db(symbol)
+
+# ================= 终极步骤：将完美的 1250 根数据灌入内存 =================
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1000", (symbol,))
+        cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
         rows = cursor.fetchall()
 
     rows.reverse()
@@ -503,31 +509,57 @@ async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTim
     try:
         async with rest_semaphore:
             if not is_spot:
-                # 合约使用 fapi 获取全维度数据
                 klines = await exchange.fapiPublicGetKlines({'symbol': exchange.market_id(swap_symbol), 'interval': '1h', 'limit': limit, **params})
             else:
                 klines = await exchange.fetch_ohlcv(swap_symbol, '1h', params=params)
         
         new_records = []
         for k in klines:
-            # 这里的 index 严格对应你的 memory_1h 表结构
-            # 绝不手动填充 0，直接使用交易所返回的物理值
             vol = float(k[5])
             new_records.append((
                 symbol, int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), vol,
-                float(k[7]) if len(k)>7 else 0.0, # quote_volume
-                int(k[8]) if len(k)>8 else 0,     # count
-                float(k[9]) if len(k)>9 else 0.0, # taker_buy
+                float(k[7]) if len(k)>7 else 0.0, 
+                int(k[8]) if len(k)>8 else 0,     
+                float(k[9]) if len(k)>9 else 0.0, 
                 vol - float(k[9]) if len(k)>9 else 0.0,
-                0.0, 0.0, vol * 0.1 # 权重过渡
+                # 🚨 修正：对于缺失的高频拆单数据，使用 NaN (或 None 存入 DB 时转 Null)，杜绝注入虚假分布
+                None, None, None 
             ))
         
         if new_records:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new_records)
-                conn.commit()
+            # 🚨 修正：将同步 I/O 踢入后台线程池，释放事件循环
+            def _write_db():
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new_records)
+                    conn.commit()
+            await asyncio.to_thread(_write_db)
+            
     except Exception as e:
         print(f"   ❌ {symbol} 物理回填失败: {e}")
+
+async def sync_local_aggtrades_to_db(symbol):
+    """一次性动作：从本地 Parquet 抽取大户/散户拆单特征覆盖到 SQLite"""
+    print(f"📂 [订单流预热] 尝试从本地 Parquet 回填 {symbol} 的微观特征...")
+    try:
+        parquet_files = list(PROCESSED_AGGTRADES_DIR.glob(f"{symbol}_aggTrades_*.parquet"))
+        if not parquet_files:
+            return
+
+        df = pl.scan_parquet(PROCESSED_AGGTRADES_DIR / f"{symbol}_aggTrades_*.parquet").collect()
+        records = df.select(["whale_buy", "whale_sell", "retail_vol", "hour_timestamp"]).to_numpy().tolist()
+        
+        def _update_db():
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executemany(
+                    f"UPDATE memory_1h SET whale_buy=?, whale_sell=?, retail_vol=? WHERE symbol='{symbol}' AND timestamp=?",
+                    records
+                )
+                conn.commit()
+                
+        await asyncio.to_thread(_update_db)
+        print("   ✅ 历史订单流特征已成功挂载入网关底座。")
+    except Exception as e:
+        print(f"   ❌ 回填订单流特征异常: {e}")
 
 async def db_persist_loop():
     """ 自动存档守护进程：将 WebSocket 即时揉出的微观流，每分钟刷入硬盘 """
@@ -538,7 +570,6 @@ async def db_persist_loop():
             records = []
             for sym, data in market_data_store.items():
                 if len(data["1h"]) == 0: continue
-                # 只抓取内存中最新的那一根（或正在聚合的那一根）
                 k = data["1h"][-1]
                 ts = k[0]
                 stats = data.get("taker_stats_1h", {}).get(ts, {})
@@ -548,14 +579,17 @@ async def db_persist_loop():
                     k[1], k[2], k[3], k[4], k[5],
                     stats.get("quote_volume", 0.0), stats.get("count", 0),
                     stats.get("taker_buy_volume", 0.0), stats.get("taker_sell_volume", 0.0),
-                    stats.get("whale_buy", 0.0), stats.get("whale_sell", 0.0), stats.get("retail_vol", 0.0)
+                    stats.get("whale_buy", None), stats.get("whale_sell", None), stats.get("retail_vol", None)
                 ))
             if records:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
-                    conn.commit()
+                # 🚨 修正：后台线程落盘防假死
+                def _persist():
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
+                        conn.commit()
+                await asyncio.to_thread(_persist)
         except Exception:
-            pass # 硬盘写入失败默默忽略，下个周期重试，不阻塞主线程
+            pass
 # ==========================================
 # 🚑 5分钟健康看门狗巡检
 # ==========================================
@@ -702,9 +736,15 @@ async def get_market_snapshot(symbol: str):
     
     # 只有主币种附加深度微观特征
     if clean_sym == SYMBOL or clean_sym.replace("/", "") == SYMBOL:
+        # 🚨 修正：彻底剔除未闭合的 1m K 线，防止 RV 污染
+        safe_1m = list(data.get("1m", []))
+        current_minute_ts = int(time.time() / 60) * 60000
+        if safe_1m and safe_1m[-1][0] >= current_minute_ts:
+            safe_1m = safe_1m[:-1]
+
         response.update({
             "taker_stats_1h": data.get("taker_stats_1h", {}),
-            "ohlcv_1m": list(data.get("1m", [])),
+            "ohlcv_1m": safe_1m,
             "premium_history": data.get("premium_history", []),
             "funding_history": data.get("funding_history", []),
             "oi_history": data.get("oi_history", []),

@@ -24,41 +24,41 @@ class InvertedTransformer(nn.Module):
     def __init__(self, num_variates, seq_len, d_model, n_heads, d_ff, e_layers, dropout):
         super(InvertedTransformer, self).__init__()
         
-        # Variate Embedding: 将每个特征的一整段历史 (seq_len) 映射为一个 Token
         self.enc_embedding = nn.Linear(seq_len, d_model)
         
-        # Transformer Encoder: 在特征维度之间进行注意力计算 (Attention across variates)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, batch_first=True, activation='gelu'
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
         
-        # Projector: 线性层将编码后的表示映射为未来的预测值
-        self.projector = nn.Linear(d_model, 3)
+        # 🚨 修改 1：引入 Flatten 层，保留所有特征的独立表征
+        self.flatten = nn.Flatten(start_dim=1)
+        
+        # 🚨 修改 2：废弃单层 Linear，替换为产业界标准的 MLP Projector，实现特征的高阶非线性交叉
+        self.projector = nn.Sequential(
+            nn.Linear(num_variates * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 3)
+        )
 
     def forward(self, x):
-        # x 初始形状: [Batch, Seq_Len, Num_Variates] -> 例: [256, 96, 25]
-        
-        # 🚨 核心修改 1：Sequence Instance Normalization (类 RevIN 的输入处理)
-        # 对每一个时间序列窗口内的每一个特征，减去自身均值除以标准差
         seq_means = x.mean(dim=1, keepdim=True)
         seq_stdev = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-8)
         x = (x - seq_means) / seq_stdev
         
-        # 🚨 维度倒置 (Inversion)
-        x = x.transpose(1, 2)  # 变为 [Batch, Num_Variates, Seq_Len]
+        x = x.transpose(1, 2)  
         
-        # Embedding: 变为 [Batch, Num_Variates, d_model] -> [256, 25, 512]
         enc_out = self.enc_embedding(x)
-        
-        # Self-Attention: 让特征和特征之间互相“交流”
         enc_out = self.encoder(enc_out)
         
-        # 🚨 架构优化：先将所有特征融合成一个全局表征，形状变为 [Batch, d_model]
-        global_rep = enc_out.mean(dim=1) 
+        # 🚨 修改 3：移除 mean(dim=1)，直接展平
+        # enc_out 原始形状: [Batch, Num_Variates, d_model]
+        # 展平后形状: [Batch, Num_Variates * d_model]
+        global_rep = self.flatten(enc_out) 
         
-        # 再由全局表征统一给出 3 分类预测，形状变为 [Batch, 3]
+        # 通过多层感知机进行非线性降维与分类预测
         dec_out = self.projector(global_rep) 
         
         return dec_out

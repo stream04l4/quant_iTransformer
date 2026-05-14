@@ -4,6 +4,7 @@ import requests
 import zipfile
 import polars as pl
 from pathlib import Path
+from datetime import datetime, timedelta, date
 
 # ==========================================
 # 0. 环境初始化与配置导入
@@ -16,7 +17,7 @@ sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     TEMP_DIR, PROCESSED_AGGTRADES_DIR, SYMBOL, WHALE_THRESHOLD, 
     RETAIL_THRESHOLD, DATA_START_MONTH, DATA_END_MONTH, 
-    BINANCE_BASE_URL_FUTURES, AGGTRADE_COLS
+    BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_FUTURES_DAILY, AGGTRADE_COLS
 )
 
 # 脚本启动时，创建所需的文件夹 (副作用操作放在执行脚本中)
@@ -71,7 +72,8 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
     ]).sort("hour_timestamp")
 
     final_df = hourly_features.select([
-        "hour_timestamp", "cvd", "whale_net_flow", "retail_ratio"
+        "hour_timestamp", "cvd", "whale_buy", "whale_sell", 
+        "whale_net_flow", "retail_vol", "retail_ratio"
     ])
 
     final_df.write_parquet(output_parquet_path)
@@ -132,16 +134,52 @@ def pipeline_for_month(year: int, month: int):
     else:
         print(f"❌ 未找到解压后的 CSV 文件: {csv_path.name}")
 
+def pipeline_for_day(d: date):
+    date_str = d.strftime("%Y-%m-%d")
+    file_name = f"{SYMBOL}-aggTrades-{date_str}.zip"
+    download_url = f"{BINANCE_BASE_URL_FUTURES_DAILY}/aggTrades/{SYMBOL}/{file_name}"
+    
+    zip_path = TEMP_DIR / file_name
+    csv_name = f"{SYMBOL}-aggTrades-{date_str}.csv"
+    csv_path = TEMP_DIR / csv_name
+    output_parquet = PROCESSED_AGGTRADES_DIR / f"{SYMBOL}_aggTrades_daily_{date_str}.parquet"
 
+    if output_parquet.exists():
+        return
+    if not download_file(download_url, zip_path):
+        return
+    
+    print(f"📦 正在解压日线数据: {zip_path.name}")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(TEMP_DIR)
+        os.remove(zip_path)
+        if csv_path.exists():
+            process_csv_to_features(csv_path, output_parquet)
+            os.remove(csv_path)
+    except Exception as e:
+        print(f"❌ 处理日线压缩包异常: {e}")
+        if zip_path.exists(): os.remove(zip_path)
 # ==========================================
 # 3. 主函数执行口
 # ==========================================
 if __name__ == "__main__":
     print(f"🚀 开始为 {SYMBOL} 执行历史 aggTrades 订单流特征构建管道...")
-    print(f"📅 数据区间: {DATA_START_MONTH} 至 {DATA_END_MONTH}")
     
-    # 替换掉原来的双重 for 循环，使用我们写好的生成器
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    
+    # 1. 拉取历史月度底座数据 (遇到当前月自动跳过)
     for year, month in generate_month_range(DATA_START_MONTH, DATA_END_MONTH):
+        if year > today.year or (year == today.year and month >= today.month):
+            break 
         pipeline_for_month(year, month)
+
+    # 2. 拉取当前月份的每日增量数据 (从 1 号拉取到昨天)
+    if tuple(DATA_END_MONTH) >= (today.year, today.month):
+        current_date = date(today.year, today.month, 1)
+        while current_date <= yesterday:
+            pipeline_for_day(current_date)
+            current_date += timedelta(days=1)
 
     print(f"🎉 所有处理完毕！检查目录: {PROCESSED_AGGTRADES_DIR}")

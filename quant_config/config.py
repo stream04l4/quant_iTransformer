@@ -37,12 +37,13 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
 DATA_START_MONTH = (2023, 1)   
-DATA_END_MONTH = (2026, 4)     
+DATA_END_MONTH = (2026, 5)     
 
 # ==========================================
 # 4. 币安接口与表结构路由 (Endpoints & Schema)
 # ==========================================
 BINANCE_BASE_URL_FUTURES = "https://data.binance.vision/data/futures/um/monthly"
+BINANCE_BASE_URL_FUTURES_DAILY = "https://data.binance.vision/data/futures/um/daily"
 BINANCE_BASE_URL_SPOT = "https://data.binance.vision/data/spot/monthly"
 BINANCE_BASE_URL_METRICS_DAILY = "https://data.binance.vision/data/futures/um/daily/metrics"
 # 强制规范无表头 CSV 的字段名防错
@@ -65,29 +66,29 @@ METRICS_COLS = [
 # 👇 全部改为动态获取，供 Mode 2 寻优
 LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 1.0))
 LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 3.0))
-LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 5.0))
+LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 7.0))
 
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.05))           
-HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.02))
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.03))           
+HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.03))
 
 # --- 实盘专用风控与仓位参数 ---
-LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
-TRADE_COOLDOWN_SEC = 3600            # 开仓后防连续发车冷却时间(秒)
-MAX_MACRO_IMPACT = 0.03              # 宏观情绪对模型输出概率的最大干预幅度(如0.03=3%)
+LIVE_RISK_MARGIN_USD = 1000.0        # 每次发车动用的固定保证金金额(U)
+TRADE_COOLDOWN_SEC = 3500            # 开仓后防连续发车冷却时间(秒)
+MAX_MACRO_IMPACT = 0.05              # 宏观情绪对模型输出概率的最大干预幅度(如0.03=3%)
 MACRO_CHECK_INTERVAL = 1800          # 宏观情报拉取间隔(秒)
 HEARTBEAT_INTERVAL = 10              # 实盘高频心跳间隔(秒)
 MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC/ETH最大notional(USDT)
 MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
 
 # --- 账户资金管理参数 ---
-INITIAL_CAPITAL = 10000.0            # 账户起始资本(USDT)，用于统计累计收益率
-BASE_RISK_BUDGET = 0.02              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
-MAX_OPEN_POSITIONS = 3               # 最大允许同时持仓数量
-MAX_MARGIN_UTILIZATION = 0.7         # 最大资金使用率红线(70%)
-MIN_ORDER_NOTIONAL = 6.0             # 最小下单名义价值(USDT)
+INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累计收益率
+BASE_RISK_BUDGET = 0.5              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
+MAX_OPEN_POSITIONS = 1               # 最大允许同时持仓数量
+MAX_MARGIN_UTILIZATION = 1         # 最大资金使用率红线(70%)
+MIN_ORDER_NOTIONAL = 1.0             # 最小下单名义价值(USDT)
 
 # --- 右脑高频熔断参数 ---
 BAILOUT_ATR_MULTI = 2.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
@@ -105,11 +106,11 @@ BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 100))
 LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-6))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 128))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 256))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.3))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.025))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))
 
 # ==========================================
 # 6.1 实盘模型拓扑与架构超参数 (严格隔离命名空间)
@@ -120,6 +121,6 @@ LIVE_SEQ_LEN = int(os.environ.get("LIVE_SEQ_LEN", 336))
 # BATCH_SIZE, EPOCHS, LEARNING_RATE 是训练期算子参数，不参与实盘推理，故不予设立
 
 LIVE_D_MODEL = int(os.environ.get("LIVE_D_MODEL", 256))
-LIVE_E_LAYERS = int(os.environ.get("LIVE_E_LAYERS", 1))
-LIVE_DROPOUT = float(os.environ.get("LIVE_DROPOUT", 0.4)) 
-LIVE_CLASS_THRESHOLD = float(os.environ.get("LIVE_CLASS_THRESHOLD", 0.026))
+LIVE_E_LAYERS = int(os.environ.get("LIVE_E_LAYERS", 2))
+LIVE_DROPOUT = float(os.environ.get("LIVE_DROPOUT", 0.3)) 
+LIVE_CLASS_THRESHOLD = float(os.environ.get("LIVE_CLASS_THRESHOLD", 0.015))
