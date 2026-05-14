@@ -8,7 +8,12 @@ from datetime import datetime
 import ccxt
 from state_manager import state
 from execution_oms import log_system_alert
-from quant_config.config import *
+from quant_config.config import (
+    DATA_DIR, LIVE_DATA_DIR, MODEL_DIR,
+    HARD_TP, HARD_SL,
+    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
+    BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH
+)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -142,8 +147,8 @@ def bailout_worker():
             adj_p_up = inference_data.get("adj_prob_up", 0.0)
             adj_p_down = inference_data.get("adj_prob_down", 0.0)
 
-            hard_tp = float(state.dynamic_settings.get("target_profit", 6.0)) / 100.0
-            hard_sl = float(state.dynamic_settings.get("target_risk", 3.0)) / 100.0
+            hard_tp = HARD_TP   # K线物理止盈幅度（直接来自 config）
+            hard_sl = HARD_SL   # K线物理底部止损幅度（直接来自 config）
             
             export_ui_mem = {}
             
@@ -269,14 +274,14 @@ def bailout_worker():
                     atr_1m = sum(tr_list) / len(tr_list) if tr_list else 0
                     
                     if atr_1m > 0:
-                        dyn_atr_multi = float(state.dynamic_settings.get("bailout_atr_multi", 2.5))
-                        dyn_vol_multi = float(state.dynamic_settings.get("bailout_vol_multi", 3.0))
+                        dyn_atr_multi = BAILOUT_ATR_MULTI   # 直接来自 config
+                        dyn_vol_multi = BAILOUT_VOL_MULTI   # 直接来自 config
                         
                         is_flash_crash = False
                         is_flash_surge = False
                         
-                        # 设置一个物理底限，防止波动极小时的误触 (默认 0.5% 物理跌幅)
-                        min_physical_space = current_close * globals().get('BAILOUT_MIN_PHYSICAL_DROP', 0.005)
+                        # 设置一个物理底限，防止波动极小时的误触（直接使用 config 中定义的 BAILOUT_MIN_PHYSICAL_DROP）
+                        min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
                         
                         if pos_side == 'LONG':
                             drop_amt = current_high - current_close
@@ -294,7 +299,7 @@ def bailout_worker():
                                 bid_vol = sum([float(o[0]) * float(o[1]) for o in ob['bids'][:20]])
                                 ask_vol = sum([float(o[0]) * float(o[1]) for o in ob['asks'][:20]])
                                 
-                                obi_thresh = globals().get('BAILOUT_OBI_THRESH', 0.2)
+                                obi_thresh = BAILOUT_OBI_THRESH  # 直接使用 config 中定义的订单簿失衡阈值
                                 
                                 if pos_side == 'LONG' and is_flash_crash:
                                     obi = bid_vol / (ask_vol + 1e-8)

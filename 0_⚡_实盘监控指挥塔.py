@@ -16,7 +16,11 @@ import requests  # 新增：用于发送 Webhook 请求
 # 👇 新增这两行，激活 .env 读取
 from dotenv import load_dotenv
 load_dotenv()
-from quant_config.config import SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS, HARD_TP, HARD_SL
+from quant_config.config import (
+    SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
+    HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
+    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, MAX_MACRO_IMPACT
+)
 
 # --- 核心配置路径 ---
 CONFIG_JSON_FILE = os.path.join(LIVE_DATA_DIR, "ui_config.json")
@@ -162,15 +166,13 @@ def check_auth():
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
         with st.form("login_form"):
-            email = st.text_input("📧 管理员邮箱")
+            email = st.text_input("📧 管理员邮筱")
             pwd = st.text_input("🔑 访问密码", type="password")
             submitted = st.form_submit_button("验证并解锁 🚀", width='stretch')
             
             if submitted:
                 if email == ADMIN_EMAIL and pwd == ADMIN_PASSWORD:
-                    # 登录成功，写入共享内存
                     st.session_state["auth_success"] = True
-                    # 仅在点登录的这一瞬间，写入一次 URL，方便你把这个带 Auth 的网址存入浏览器收藏夹
                     st.query_params["auth"] = SECRET_TOKEN
                     st.rerun()
                 else:
@@ -182,31 +184,10 @@ if not check_auth():
     st.stop()
 
 defaults = {
-    # 战略宏观过滤
-    "prob_thresh": 0.52, "score_thresh": 0.6, "base_z": 0.8,
-    # 趋势博弈规则
-    "trend_penalty": 1.2, "trend_reward": 0.6,
-    "reversion_bias": 2.0,
-    "min_conf": 0.15, "consistency": 0.45, "choppy_thresh": 0.001,
-    "funding_limit": 0.0003,"cooldown_mins": 45,
-    # 资金与风控出场
-    "initial_capital": 10000.0, "max_open_positions": 3,
-    "target_risk": HARD_SL * 100.0,     
-    "target_profit": HARD_TP * 100.0,   
-    "chandelier_multi": 2.8, # (如果你其他地方也没用到 chandelier_multi，这行也可以删掉)
-    # 架构与运维
-    "use_xgboost": False, 
-    "collection_version": "v1.0", "inference_version": "v1.0", # 👈 替换掉原来的 data_version
-    "xgb_min_win_rate": 0.50,  # 👈 【新增】：XGBoost 默认拦截红线
-    "xgb_reverse_win_rate": 0.80, # 👈 【修复】：补齐缺失的反杀红线默认值，防止写入 null
-    "beta_thresh": 0.001,    # 最小相对强弱要求 (0.1%)
-    "max_dd_limit": 5.0,     # 最大允许插针风险 (%)
-    # 资金管理流水线 (新增)
-    "max_margin_utilization": 0.7, "base_risk_budget": 0.02,
-    "max_allowed_sl_distance": 0.15, "min_order_notional": 6.0,
-    "default_win_rate": 0.52, "default_profit_loss_ratio": 1.5,
-    # 👇 新增：右脑高频熔断阈值默认值
-    "bailout_atr_multi": 2.5, "bailout_vol_multi": 3.0,  # 👈 修复：在这里补上英文逗号
+    # 以下参数已全部进入 config.py ， defaults 仅保留 UI 运行状态项
+    "collection_version": "v1.0",
+    "inference_version": "v1.0",
+    "active_symbols": SYMBOL if isinstance(SYMBOL, list) else [SYMBOL],
 }
 
 if 'settings' not in st.session_state:
@@ -222,45 +203,13 @@ if 'settings' not in st.session_state:
     else:
         st.session_state.settings = defaults.copy()
 
-# 回调函数：滑动时触发硬盘写入
+# 回调函数：仅保存尚未进入 config 的 UI 状态项（如版本号、活跃币种等）
 def save_settings():
     s = st.session_state.settings
     st.session_state.settings = {
-        "prob_thresh": st.session_state.get("ui_prob", s.get("prob_thresh")),
-        "score_thresh": st.session_state.get("ui_score_thresh", s.get("score_thresh")),
-        "base_z": st.session_state.get("ui_base_z", s.get("base_z")),
-        "trend_penalty": st.session_state.get("ui_trend_penalty", s.get("trend_penalty")),
-        "trend_reward": st.session_state.get("ui_trend_reward", s.get("trend_reward")),
-        "reversion_bias": st.session_state.get("ui_reversion_bias", s.get("reversion_bias")),
-        "min_conf": st.session_state.get("ui_min_conf", s.get("min_conf")),
-        "consistency": st.session_state.get("ui_consistency", s.get("consistency")),
-        "choppy_thresh": st.session_state.get("ui_choppy_thresh", s.get("choppy_thresh")),
-        "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget")),
-        "target_risk": st.session_state.get("ui_risk", s.get("target_risk", HARD_SL * 100.0)),
-        "target_profit": st.session_state.get("ui_profit", s.get("target_profit", HARD_TP * 100.0)),
-        "excursion": st.session_state.get("ui_excursion", s.get("excursion")),
-        "chandelier_multi": st.session_state.get("ui_chandelier_multi", s.get("chandelier_multi")),
-        "initial_capital": st.session_state.get("ui_initial_capital", s.get("initial_capital", 10000.0)),
-        "base_risk_budget": st.session_state.get("ui_base_risk", s.get("base_risk_budget", 0.02)),
-        "target_risk": st.session_state.get("ui_risk", s.get("target_risk", 30.0)),
-        "target_profit": st.session_state.get("ui_profit", s.get("target_profit", 60.0)),
-        "max_macro_impact": st.session_state.get("ui_macro_impact", s.get("max_macro_impact", 1.5)),
-        "use_xgboost": st.session_state.get("ui_use_xgboost", s.get("use_xgboost")),
-        "beta_thresh": st.session_state.get("ui_beta_thresh", s.get("beta_thresh", 0.001) * 100) / 100.0,
-        "max_dd_limit": st.session_state.get("ui_max_dd_limit", s.get("max_dd_limit")),
-        "xgb_min_win_rate": st.session_state.get("ui_xgb_min_win", s.get("xgb_min_win_rate")), 
-        "xgb_reverse_win_rate": st.session_state.get("ui_xgb_reverse_win", s.get("xgb_reverse_win_rate")), 
-        "collection_version": st.session_state.get("ui_collection_version", s.get("collection_version", "v1.0")), 
-        "inference_version": st.session_state.get("ui_inference_version", s.get("inference_version", "v1.0")),    
-        "inspect_version": st.session_state.get("ui_inspect_version", s.get("inspect_version", "v1.0")),
-        "target_train_version": st.session_state.get("ui_target_train_version", s.get("target_train_version", "v1.0")), 
-        "audit_model_version": st.session_state.get("ui_audit_model_version", s.get("audit_model_version")), 
-        "funding_limit": st.session_state.get("ui_funding_limit", s.get("funding_limit")),
-        "active_symbols": st.session_state.get("ui_active_symbols_state", s.get("active_symbols", SYMBOL)),
-        "bailout_atr_multi": st.session_state.get("ui_bailout_atr_multi", s.get("bailout_atr_multi", 2.5)),
-        "bailout_vol_multi": st.session_state.get("ui_bailout_vol_multi", s.get("bailout_vol_multi", 3.0)),
-        "max_margin_utilization": st.session_state.get("max_margin_utilization", 0.7),
-        "min_order_notional": st.session_state.get("min_order_notional", 6.0),
+        "collection_version": st.session_state.get("ui_collection_version", s.get("collection_version", "v1.0")),
+        "inference_version": st.session_state.get("ui_inference_version", s.get("inference_version", "v1.0")),
+        "active_symbols": st.session_state.get("ui_active_symbols_state", s.get("active_symbols", SYMBOL if isinstance(SYMBOL, list) else [SYMBOL])),
     }
     # 原子写入保持不变
     temp_file = f"{CONFIG_JSON_FILE}.tmp"
@@ -525,12 +474,12 @@ def render_realtime_portfolio():
             st.warning(f"⚠️ 解析 Gate 资产列表出现异常: {e}")
 
         # 计算已实现盈亏与历史累计收益率
-        initial_cap = float(st.session_state.settings.get("initial_capital", 100000.0))
+        initial_cap = float(INITIAL_CAPITAL)  # 直接来自 config
         historical_roi = (total_equity - initial_cap) / initial_cap
         realized_pnl = wallet_balance - initial_cap
 
         margin_utilization = (total_margin_used / total_equity) if total_equity > 0 else 0.0
-        max_utilization = st.session_state.settings.get("max_margin_utilization", 0.7)
+        max_utilization = float(MAX_MARGIN_UTILIZATION)  # 直接来自 config
 
         # UI 重构：增加进度条刻度
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -662,7 +611,7 @@ render_realtime_portfolio()
 # ====================================================================
 # 📊 静态切片：策略分析驾驶舱与历史本纪 (无动作绝对不刷新，解放 CPU)
 # ====================================================================
-initial_cap = float(st.session_state.settings.get("initial_capital", 10000.0))
+initial_cap = float(INITIAL_CAPITAL)  # 直接来自 config
 actual_track_list = SYMBOL
 hist_data = []
 total_ml_samples = 0
@@ -1274,35 +1223,21 @@ with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
             disabled=lock_params
         )
 # ---------------------------------------------------------
-with st.sidebar.expander("🛡️ 仓位与出场防线", expanded=False):
-    st.caption("基于波动率平价的机构级算仓防线与实时风控联动。")
-    user_initial_capital = st.number_input("🏦 账户初始起始资金 (USDT)", min_value=100.0, max_value=1000000.0, value=float(st.session_state.settings.get("initial_capital", 10000.0)), step=100.0, key="ui_initial_capital", on_change=save_settings, disabled=lock_params)
-    user_base_risk = st.slider("单笔风险预算 (拨备率)", min_value=0.01, max_value=0.5, value=float(st.session_state.settings.get("base_risk_budget", 0.02)), step=0.01, key="ui_base_risk", on_change=save_settings, disabled=lock_params, help="单笔订单使用的保证金 = 初始资金 × 风险预算")
-    st.markdown("#### 🧱 初始底层 OCO 硬防线")
-    st.caption("无视杠杆，完全锚定标的资产的 K 线真实物理涨跌幅。")
-    user_target_profit = st.slider(
-        "K 线物理硬止盈 (%)", 
-        min_value=0.5, max_value=20.0, 
-        value=float(st.session_state.settings.get("target_profit", HARD_TP * 100.0)), 
-        step=0.5, key="ui_profit", on_change=save_settings, disabled=lock_params, 
-        help="触碰该物理涨幅后，右脑将接管并将止损线上移至此。如 6.0 代表 K线涨 6%。"
-    )
-    user_target_risk = st.slider(
-        "K 线兜底硬止损 (%)", 
-        min_value=0.5, max_value=15.0, 
-        value=float(st.session_state.settings.get("target_risk", HARD_SL * 100.0)), 
-        step=0.1, key="ui_risk", on_change=save_settings, disabled=lock_params, 
-        help="最坏情况下的物理防线。如 3.0 代表 K线跌 3% 无条件斩仓。"
-    )
-
-    st.markdown("#### 🧠 右脑高频熔断阈值")
-    st.caption("防插针过滤：结合量价的三重并发锁，识别真伪瀑布。")
-    user_bailout_atr_multi = st.slider("价格瀑布乘数 (ATR)", min_value=1.5, max_value=8.0, value=float(st.session_state.settings.get("bailout_atr_multi", 2.5)), step=0.1, key="ui_bailout_atr_multi", on_change=save_settings, disabled=lock_params, help="1分钟内跌幅超过该倍数的 ATR 才会触发警报")
-    user_bailout_vol_multi = st.slider("异常爆量乘数 (Volume)", min_value=1.5, max_value=10.0, value=float(st.session_state.settings.get("bailout_vol_multi", 3.0)), step=0.5, key="ui_bailout_vol_multi", on_change=save_settings, disabled=lock_params, help="下跌时的成交量必须大于过去15分钟均量的该倍数，以过滤无量假摔插针")
-
-    # 👇 新增：宏观干预专区
-    st.markdown("#### 🌐 宏观情报干预")
-    user_macro_impact = st.slider("宏观情绪干预幅度 (%)", min_value=0.0, max_value=5.0, value=float(st.session_state.settings.get("max_macro_impact", 1.5)), step=0.1, key="ui_macro_impact", on_change=save_settings, disabled=lock_params, help="宏观得分对AI原始概率的最大增减幅度 (如1.5%代表情绪极度狂热时，看涨概率强行增加1.5%)")
+# 📋 核心风控参数来自 config.py（只读展示，如需修改请编辑 quant_config/config.py 并重启）
+with st.sidebar.expander("📋 当前生效风控参数 (只读)", expanded=False):
+    st.caption("以下参数均来自 `quant_config/config.py`，如需修改请直接编辑该文件并重启服务。")
+    st.markdown(f"""
+| 参数 | 当前值 |
+|------|--------|
+| 🏦 初始资本 | `{INITIAL_CAPITAL:,.0f} USDT` |
+| �� 单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
+| 🟢 K线物理止盈 | `{HARD_TP*100:.1f}%` |
+| 🔴 K线物理止损 | `{HARD_SL*100:.1f}%` |
+| ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |
+| 📊 爆量乘数 | `{BAILOUT_VOL_MULTI}x` |
+| 🌐 宏观干预幅度 | `{MAX_MACRO_IMPACT*100:.1f}%` |
+| 🛡️ 资金使用率红线 | `{MAX_MARGIN_UTILIZATION:.0%}` |
+""")
 
 st.sidebar.divider()
 
@@ -1406,7 +1341,7 @@ def render_market_radar():
         ema_macro_slope = 0.001 if is_uptrend_proxy else -0.001
         
         up_prob = adj_p_up if adj_p_up > adj_p_down else (1.0 - adj_p_down)
-        auto_leverage = float(st.session_state.settings.get("max_margin_utilization", 10.0)) * 10
+        auto_leverage = float(MAX_MARGIN_UTILIZATION) * 10  # 直接来自 config
         tp_pct = 0.08
         sl_pct = 0.04
         

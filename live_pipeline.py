@@ -16,8 +16,9 @@ from datetime import datetime
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
-    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD, 
-    TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL
+    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD,
+    TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL,
+    INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI
 )
 # ==========================================
 # 1. 加载实盘配置 (固定单模型路径)
@@ -286,29 +287,15 @@ def run_live():
             current_time = time.time()
             current_price = snapshot['current_price']
             
-            # --- 读入前端 UI 设置并应用 ---
-            ui_config = {}
-            ui_path = os.path.join(LIVE_DATA_DIR, "ui_config.json")
-            if os.path.exists(ui_path):
-                try:
-                    with open(ui_path, "r") as f:
-                        ui_config = json.load(f)
-                except:
-                    pass
+            # --- 直接使用 config 常量，无需读取 UI JSON ---
+            # 右脑风控熔断器参数（直接来自 config）
+            state.dynamic_settings["bailout_atr_multi"] = BAILOUT_ATR_MULTI
+            state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
             
-            # 动态更新给右脑风控熔断器的参数
-            state.dynamic_settings["bailout_atr_multi"] = float(ui_config.get("bailout_atr_multi", 2.5))
-            state.dynamic_settings["bailout_vol_multi"] = float(ui_config.get("bailout_vol_multi", 3.0))
-            state.dynamic_settings["excursion"] = float(ui_config.get("excursion", 1.5))
-            
-            # 动态计算仓位保证金与止盈止损参数
-            initial_cap = float(ui_config.get("initial_capital", 10000.0))
-            base_risk = float(ui_config.get("base_risk_budget", 0.02))
-            dynamic_margin_usd = initial_cap * base_risk if initial_cap * base_risk > 0 else LIVE_RISK_MARGIN_USD
-            
-            # 从 UI 读取 6.0 并转为 0.06。现在的语义是：标的资产物理涨跌 6.0%
-            dynamic_sl = float(ui_config.get("target_risk", HARD_SL * 100.0)) / 100.0
-            dynamic_tp = float(ui_config.get("target_profit", HARD_TP * 100.0)) / 100.0
+            # 仓位保证金与止盈止损参数（直接来自 config）
+            dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET if INITIAL_CAPITAL * BASE_RISK_BUDGET > 0 else LIVE_RISK_MARGIN_USD
+            dynamic_sl = HARD_SL   # K线物理兜底止损幅度
+            dynamic_tp = HARD_TP   # K线物理止盈幅度
 
             # 👇 【关键补充】将最新价格更新到全局状态机，供后端的 bailout_worker (阶梯止损) 随时读取
             try:
@@ -359,7 +346,7 @@ def run_live():
             # ---------------------------------------------------------
             # ⚔️ [10秒级 Tick] 实时高频信号撮合
             # ---------------------------------------------------------
-            dynamic_macro_impact = float(ui_config.get("max_macro_impact", MAX_MACRO_IMPACT * 100.0)) / 100.0
+            dynamic_macro_impact = MAX_MACRO_IMPACT  # 直接使用 config 中定义的宏观干预幅度
             macro_buff = cached_macro_score * dynamic_macro_impact
             
             adj_p_up = cached_p_up + macro_buff
@@ -397,11 +384,26 @@ def run_live():
                     pass # 同一根 K 线内同方向静默跳过
                 else:
                     print(f"\n[{snapshot['server_time']}] 🔥 突破红线！最新价: {current_price} | 发送 OMS 指令 (杠杆: {dynamic_leverage}x)...")
-                    success, actual_margin = execute_gate_trade(...)
+                    log_system_alert("🔥 下单触发", SYMBOL,
+                        f"信号: {'做多' if signal==1 else '做空'} | 杠杆: {dynamic_leverage}x | 价格: {current_price:.4f}")
+                    success, actual_margin = execute_gate_trade(
+                        symbol=SYMBOL,
+                        signal=signal,
+                        leverage=dynamic_leverage,
+                        current_price=current_price,
+                        tp_pct=dynamic_tp,
+                        sl_pct=dynamic_sl,
+                        risk_margin_usd=dynamic_margin_usd,
+                    )
                     if success:
                         print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
+                        log_system_alert("✅ 下单成交", SYMBOL,
+                            f"{'做多' if signal==1 else '做空'} {dynamic_leverage}x | 成交价: {current_price:.4f} | 保证金: ${actual_margin:.2f}")
                         last_trade_hour = latest_closed_ts
                         last_trade_signal = signal
+                    else:
+                        log_system_alert("❌ 下单失败", SYMBOL,
+                            f"OMS 返回 False | 信号: {'做多' if signal==1 else '做空'} | 价格: {current_price:.4f}")
             
             # 👇 新增：引擎遥测状态原子级持久化 (Telemetry State Persistence)
             live_state_payload = {

@@ -76,11 +76,24 @@ HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.02))
 # --- 实盘专用风控与仓位参数 ---
 LIVE_RISK_MARGIN_USD = 100.0         # 每次发车动用的固定保证金金额(U)
 TRADE_COOLDOWN_SEC = 3600            # 开仓后防连续发车冷却时间(秒)
-MAX_MACRO_IMPACT = 0.03            # 宏观情绪对模型输出概率的最大干预幅度
-MACRO_CHECK_INTERVAL = 1800         # 宏观情报拉取间隔(秒)
-HEARTBEAT_INTERVAL = 10             # 实盘高频心跳间隔(秒)
-MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC最大notional
-MAX_NOTIONAL_BTC = 100000            # 实盘BTC最大notional
+MAX_MACRO_IMPACT = 0.03              # 宏观情绪对模型输出概率的最大干预幅度(如0.03=3%)
+MACRO_CHECK_INTERVAL = 1800          # 宏观情报拉取间隔(秒)
+HEARTBEAT_INTERVAL = 10              # 实盘高频心跳间隔(秒)
+MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC/ETH最大notional(USDT)
+MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
+
+# --- 账户资金管理参数 ---
+INITIAL_CAPITAL = 10000.0            # 账户起始资本(USDT)，用于统计累计收益率
+BASE_RISK_BUDGET = 0.02              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
+MAX_OPEN_POSITIONS = 3               # 最大允许同时持仓数量
+MAX_MARGIN_UTILIZATION = 0.7         # 最大资金使用率红线(70%)
+MIN_ORDER_NOTIONAL = 6.0             # 最小下单名义价值(USDT)
+
+# --- 右脑高频熔断参数 ---
+BAILOUT_ATR_MULTI = 2.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
+BAILOUT_VOL_MULTI = 3.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
+BAILOUT_MIN_PHYSICAL_DROP = 0.005    # 熔断最小物理跌幅过滤(0.5%)，防止微小波动误触
+BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确认为真瀑布)
 
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)

@@ -71,23 +71,25 @@ def evaluate_pure_alpha():
         checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
         feature_cols = checkpoint['feature_cols']
         
-        # 构建并加载模型
+        # 构建并加载模型（从 checkpoint 读取 seq_len，防止修改 config 后 shape mismatch）
+        ckpt_seq_len = checkpoint.get('seq_len', SEQ_LEN)  # 兼容旧权重文件
         dynamic_n_heads = max(2, D_MODEL // 16) 
         dynamic_d_ff = D_MODEL * 4
         model = InvertedTransformer(
-            num_variates=len(feature_cols), seq_len=SEQ_LEN, d_model=D_MODEL,
+            num_variates=len(feature_cols), seq_len=ckpt_seq_len, d_model=D_MODEL,
             n_heads=dynamic_n_heads, d_ff=dynamic_d_ff, e_layers=E_LAYERS, dropout=DROPOUT
         ).to(DEVICE)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
+        print(f"  ✅ 模型加载成功 | 感受野 seq_len={ckpt_seq_len} | 特征数={len(feature_cols)}")
 
         # 提取当前模型对应的特征数据并进入测试集
         X_raw = df_matrix.select(feature_cols).to_numpy().astype('float32')
         X_test_raw = X_raw[split_idx:]
         
-        # 批量推理产生置信度 (Zero-Copy 模式)
+        # 批量推理（Zero-Copy 模式，使用 checkpoint 中的 seq_len）
         X_tensor = torch.tensor(X_test_raw, dtype=torch.float32, device=DEVICE)
-        X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
+        X_windows = X_tensor.unfold(0, ckpt_seq_len, 1).transpose(1, 2)
         
         predictions_probs = []
         INFERENCE_BATCH_SIZE = 4096
@@ -100,8 +102,8 @@ def evaluate_pure_alpha():
                     probs = torch.softmax(logits, dim=1).cpu().numpy()
                 predictions_probs.extend(probs)
                 
-        # 生成时间戳对齐 (扣除 seq_len 造成的窗口位移)
-        valid_timestamps = test_timestamps[SEQ_LEN - 1 :].tolist()
+        # 生成时间戳对齐（扣除 ckpt_seq_len 造成的窗口位移）
+        valid_timestamps = test_timestamps[ckpt_seq_len - 1 :].tolist()
         valid_timestamps_pd = pd.to_datetime(valid_timestamps)
 
         # 构建评测数据框

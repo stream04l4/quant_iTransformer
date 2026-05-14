@@ -10,7 +10,10 @@ import ccxt
 import threading
 from ccxt.base.errors import NetworkError, ExchangeError, RequestTimeout
 from state_manager import state
-from quant_config.config import *
+from quant_config.config import (
+    DATA_DIR, LIVE_DATA_DIR,
+    MAX_NOTIONAL_BTC, MAX_NOTIONAL_ALTS
+)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -210,12 +213,9 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         target_notional = risk_margin_usd * leverage
         
         # 👇 【智能修复 1：动态风险限额压降 (Risk Limit Capping)】
-        # 山寨币默认风控限额为 5000。如果触碰红线，自动压降至安全水位 (4800)
-        base_coin = symbol.split('/')[0]
-        _max_btc_eth = globals().get('MAX_NOTIONAL_BTC_ETH', 100000.0)  # 主流币默认最高 10 万 U
-        _max_alts = globals().get('MAX_NOTIONAL_ALTS', 5000.0)          # 山寨币默认最高 5 千 U
-        
-        safe_notional_limit = _max_btc_eth if base_coin in ['BTC', 'ETH'] else _max_alts
+        # 直接使用 config 中定义的 MAX_NOTIONAL_BTC / MAX_NOTIONAL_ALTS，自动压降至安全水位
+        base_coin = symbol.replace('USDT', '').split('/')[0]
+        safe_notional_limit = MAX_NOTIONAL_BTC if base_coin in ['BTC', 'ETH'] else MAX_NOTIONAL_ALTS
         
         if target_notional > safe_notional_limit:
             target_notional = safe_notional_limit

@@ -232,6 +232,8 @@ def train_model():
             save_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth"
             
             torch.save({
+                'seq_len': SEQ_LEN,              # 固化感受野，确保推理/评估时不依赖全局 config
+                'class_threshold': CLASS_THRESHOLD,  # 固化分类阈值，便于复现
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'feature_cols': train_set.feature_cols,

@@ -21,13 +21,13 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 # ==========================================
 # 模式一：纯粹的 Alpha 预测力寻优 (不带任何止盈止损)
 ALPHA_SEARCH_SPACE = {
-    'FORECAST_HORIZON': [6, 12, 24],
-    'SEQ_LEN': [168, 336],
-    'CLASS_THRESHOLD': [0.024, 0.025, 0.026],
-    'E_LAYERS': [1, 2],
-    'D_MODEL': [64, 128, 256],
-    'DROPOUT': [0.3, 0.4, 0.5],
-    'BATCH_SIZE': [128, 256],
+    'FORECAST_HORIZON': [12, 36],
+    'SEQ_LEN': [336, 1344, 2016],
+    'CLASS_THRESHOLD': [0.025],
+    'E_LAYERS': [1],
+    'D_MODEL': [256],
+    'DROPOUT': [0.4],
+    'BATCH_SIZE': [256],
     'LEARNING_RATE': [1e-6],
     'EPOCHS': [50]
 }

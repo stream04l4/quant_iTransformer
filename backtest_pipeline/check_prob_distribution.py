@@ -26,15 +26,16 @@ def check_distribution():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     
-    # 动态构建模型架构以对齐训练时的情况
+    # 动态构建模型架构（从 checkpoint 读取 seq_len，防止修改 config 后 shape mismatch）
     from historical_pipeline.train_itransformer import InvertedTransformer
     feature_cols = checkpoint['feature_cols']
+    ckpt_seq_len = checkpoint.get('seq_len', SEQ_LEN)  # 兼容旧权重文件
     dynamic_n_heads = max(2, D_MODEL // 16) 
     dynamic_d_ff = D_MODEL * 4
 
     model = InvertedTransformer(
         num_variates=len(feature_cols), 
-        seq_len=SEQ_LEN,
+        seq_len=ckpt_seq_len,      # 使用 checkpoint 中此模型训练时的感受野
         d_model=D_MODEL,     
         n_heads=dynamic_n_heads,
         d_ff=dynamic_d_ff,       
@@ -43,6 +44,7 @@ def check_distribution():
     ).to(DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
+    print(f"✅ 模型加载成功 | 感受野 seq_len={ckpt_seq_len} | 特征数={len(feature_cols)}")
 
     df = pl.read_parquet(data_path)
     X_raw = df.select(feature_cols).to_numpy().astype('float32')
@@ -55,7 +57,7 @@ def check_distribution():
     
     # 🚨 核心修复 2：使用 DataLoader 进行大批量并行推断
     X_tensor = torch.tensor(X_baseline, dtype=torch.float32, device=DEVICE)
-    X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
+    X_windows = X_tensor.unfold(0, ckpt_seq_len, 1).transpose(1, 2)
     
     predictions_probs_chunks = [] # 改用 chunks
     INFERENCE_BATCH_SIZE = 4096
