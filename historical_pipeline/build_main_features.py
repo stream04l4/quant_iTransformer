@@ -349,7 +349,7 @@ def build_features(horizon):
     var = (m2 - m1.pow(2)).abs() 
     
     # 偏度标准公式: E[(X-mu)^3] / sigma^3 = (m3 - 3*m1*m2 + 2*m1^3) / sigma^3
-    skew_expr = ((m3 - 3 * m1 * m2 + 2 * m1.pow(3)) / (var.pow(1.5) + 1e-9)).fill_null(0).alias("vol_skew_24h")
+    skew_expr = ((m3 - 3 * m1 * m2 + 2 * m1.pow(3)) / (var.pow(1.5) + 1e-15)).fill_null(0).alias("vol_skew_24h")
 
     # 🚨 [核心修正] 在计算任何位移特征之前，先计算核心对数收益率
     master_df = master_df.with_columns([
@@ -381,8 +381,10 @@ def build_features(horizon):
         ((pl.col("sum_open_interest") - pl.col("sum_open_interest").shift(1)) / (pl.col("sum_open_interest").shift(1) + 1e-9)).alias("oi_delta_pct"),
         pl.col("sum_toptrader_long_short_ratio").alias("ls_ratio"),
         
-        # 🚨 Alpha 3: Amihud 流动性消耗率
-        (pl.col("log_return").abs() / (pl.col("quote_volume") + 1e-9)).alias("amihud_illiquidity"),
+        # 🚨 Alpha 3: Amihud 流动性消耗率 (对数尺度)
+        (
+            (pl.col("log_return").abs() / (pl.col("quote_volume") + 1e-9)) + 1e-12
+        ).log().alias("amihud_illiquidity"),
         
         # 🚨 [新增] RVTS: 波动率期限结构 (1h极短期波动 vs 24h基准波动)
         (pl.col("realized_vol_1h") / (pl.col("realized_vol_1h").rolling_mean(window_size=24) + 1e-9)).alias("rv_term_structure"),

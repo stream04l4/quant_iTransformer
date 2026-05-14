@@ -43,7 +43,7 @@ class InvertedTransformer(nn.Module):
         # 🚨 核心修改 1：Sequence Instance Normalization (类 RevIN 的输入处理)
         # 对每一个时间序列窗口内的每一个特征，减去自身均值除以标准差
         seq_means = x.mean(dim=1, keepdim=True)
-        seq_stdev = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-5)
+        seq_stdev = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-8)
         x = (x - seq_means) / seq_stdev
         
         # 🚨 维度倒置 (Inversion)
@@ -55,11 +55,13 @@ class InvertedTransformer(nn.Module):
         # Self-Attention: 让特征和特征之间互相“交流”
         enc_out = self.encoder(enc_out)
         
-        # 预测: 变为 [Batch, Num_Variates, 1]
-        dec_out = self.projector(enc_out)
+        # 🚨 架构优化：先将所有特征融合成一个全局表征，形状变为 [Batch, d_model]
+        global_rep = enc_out.mean(dim=1) 
         
-        # 将所有维度的信息做加权平均，输出最终对 Y 的单一预测
-        return dec_out.mean(dim=1)  # 最终形状: [Batch, 1]
+        # 再由全局表征统一给出 3 分类预测，形状变为 [Batch, 3]
+        dec_out = self.projector(global_rep) 
+        
+        return dec_out
 
 # ==========================================
 # 2. PyTorch 数据加载器 (Dataset) - 3分类版本
@@ -158,12 +160,14 @@ def train_model():
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     # 🚨 产业界前沿：换用余弦退火调度器，强迫模型多走几十轮
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-7
+    )
     scaler = torch.amp.GradScaler('cuda')
     
     # 🚨 终极修复：废弃 F1，回归 Val Loss 置信度监控，并引入容忍度极低的早停机制
     best_val_loss = float('inf')
-    patience = 8                  # 容忍度：连续 5 个 Epoch 验证集 Loss 不降则强行停止 (对于高噪金融数据，5已足够)
+    patience = 16                  # 容忍度：连续 15 个 Epoch 验证集 Loss 不降则强行停止 (对于高噪金融数据，5已足够)
     patience_counter = 0          # 早停计数器
     
     print("\n🔥 开始炼丹 (引入置信度监控与防过拟合机制)...")
@@ -216,7 +220,7 @@ def train_model():
         avg_val_loss = val_loss / len(val_loader)
         val_acc = (val_correct / val_total) * 100
         
-        scheduler.step()
+        scheduler.step(avg_val_loss)
         
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch [{epoch+1:02d}/{EPOCHS}] | LR: {current_lr:.2e} | "
