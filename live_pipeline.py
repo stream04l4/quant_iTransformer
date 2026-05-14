@@ -18,7 +18,8 @@ from quant_config.config import (
     LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD,
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL,
-    INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON
+    INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
+    EXPERIMENT_ID, TRAIN_DATA_DIR  # 🚨 新增：引入 TRAIN_DATA_DIR
 )
 # ==========================================
 # 1. 加载实盘配置 (固定单模型路径)
@@ -139,7 +140,7 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df['cvd'] = (df['taker_buy_volume'] - df['taker_sell_volume']).fillna(0)
         df['whale_net_flow'] = (df['whale_buy'] - df['whale_sell']).fillna(0)
         df['retail_ratio'] = (df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)).ffill().fillna(0.1)
-        df['amihud_illiquidity'] = df['log_return'].abs() / (df['quote_volume'] + 1e-9)
+        df['amihud_illiquidity'] = np.log((df['log_return'].abs() / (df['quote_volume'] + 1e-9)) + 1e-12)
     else:
         for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'retail_ratio', 'amihud_illiquidity']:
             df[col] = np.nan
@@ -331,8 +332,22 @@ def run_live():
                     eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
                     
                     features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
-                    input_raw = features_df[feature_cols].iloc[-LIVE_SEQ_LEN:].values.astype('float32')
+                    
+                    # 提取喂给模型的那个精确窗口
+                    inference_window = features_df[feature_cols].iloc[-LIVE_SEQ_LEN:]
+                    input_raw = inference_window.values.astype('float32')
                     x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                    
+                    # 🚨 新增：审计外挂，将当前送入模型的 DataFrame 写入 CSV
+                    try:
+                        os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
+                        audit_csv_path = os.path.join(TRAIN_DATA_DIR, f"live_inference_audit_{SYMBOL}.csv")
+                        
+                        # 覆写保存最新的 336 根特征矩阵，保留表头以便核对
+                        inference_window.to_csv(audit_csv_path, index=False)
+                        print(f"   💾 [特征审计] 本次推理输入矩阵 (Shape: {inference_window.shape}) 已输出至: {audit_csv_path}")
+                    except Exception as e:
+                        print(f"   ⚠️ [特征审计] CSV 输出失败: {e}")
                     
                     with torch.no_grad():
                         logits = model(x_tensor)
