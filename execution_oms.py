@@ -163,25 +163,24 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         exchange_private = global_gate
 
         # ---------------------------------------------------------
-        # 1. 仓位互斥锁与反转引擎：防止重复同向开仓，支持反向平仓反转
+        # 1. 仓位互斥锁与反转引擎：支持同向阶梯加仓，拦截反向信号交由右脑
         # ---------------------------------------------------------
         order_sent = False 
+        has_existing_same_side = False
         positions = exchange_private.fetch_positions([gate_symbol])
         for pos in positions:
             if float(pos.get('contracts', 0)) > 1e-8:
                 current_pos_side = str(pos.get('side', '')).lower()
                 
-                # 👇 【修改点1：反转拦截移交右脑】
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
-                    msg = f"🔄 侦测到 AI 预测反转信号！主引擎已挂起，交由右脑风控 (risk_manager) 评估执行 0.5% 锁润或强制平仓。"
+                    msg = f"🔄 侦测到 AI 预测反转信号！主引擎已挂起，交由右脑风控 (risk_manager) 评估。"
                     print("⚠️", msg)
                     log_system_alert("🔄 信号反转拦截", symbol, msg)
-                    return False, 0.0 # 阻断主引擎开新仓，等待右脑完成状态机结算
-                else:
-                    msg = f"🔒 仓位锁拦截：{gate_symbol} 当前已有同向存续仓位，拒绝重复加仓。"
-                    print("⚠️", msg)
-                    log_system_alert("⚠️ 拦截", symbol, msg)
                     return False, 0.0
+                else:
+                    has_existing_same_side = True
+                    msg = f"📈 侦测到 {gate_symbol} 同向存续仓位，允许金字塔阶梯加仓。"
+                    print("ℹ️", msg)
 
         # ---------------------------------------------------------
         # 2. 面值与张数计算 (工业级精度适配与风控智能压降)
@@ -245,11 +244,12 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             log_system_alert("❌ 资金不足", symbol, msg)
             return False, 0.0
 
-        # 设置杠杆 (包一层 try-except 防止因为已有其他同向/反向持仓而导致报错)
-        try:
-            exchange_private.set_leverage(leverage, gate_symbol)
-        except Exception as e:
-            print(f"⚠️ 设置杠杆提醒 (可能已有存续仓位): {e}")
+        # 智能杠杆防护：如果有同向仓位，禁止调用修改杠杆接口，防止保证金剧烈跳动
+        if not has_existing_same_side:
+            try:
+                exchange_private.set_leverage(leverage, gate_symbol)
+            except Exception as e:
+                print(f"⚠️ 设置初始杠杆失败: {e}")
 
         # ---------------------------------------------------------
         # 3. 核心市价开仓 (增强参数传递)
@@ -261,13 +261,14 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
 
         native_symbol = exchange_private.market_id(gate_symbol)
 
-        # 内部挂单重试闭包函数
-        def safe_post_condition(rule, price, text_label):
+        # 内部挂单重试闭包函数 (已改造为精确张数平仓)
+        def safe_post_condition(rule, price, text_label, stop_size):
+            exact_size = int(stop_size)
             for attempt in range(3):
                 try:
                     exchange_private.private_futures_post_settle_price_orders({
                         "settle": "usdt",
-                        "initial": {"contract": native_symbol, "size": 0, "close": True, "price": "0", "tif": "ioc", "text": text_label},
+                        "initial": {"contract": native_symbol, "size": exact_size, "close": False, "price": "0", "tif": "ioc", "text": text_label},
                         "trigger": {"strategy_type": 0, "price_type": 1, "price": str(exchange_private.price_to_precision(gate_symbol, price)), "rule": rule}
                     })
                     return True
@@ -305,8 +306,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # ---------------------------------------------------------
         # 【修改点2：移除硬止盈，只挂兜底硬止损 (给追踪止盈让路)】
         # ---------------------------------------------------------
-        # 挂载物理硬止损
-        sl_success = safe_post_condition(sl_rule, sl_price, "sl")
+        # 挂载精确定量硬止损
+        sl_success = safe_post_condition(sl_rule, sl_price, "sl_tier", order_amount)
         
         # 终极物理校验
         time.sleep(1.5) 
@@ -385,8 +386,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     
                     fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
                     
-                    # 立刻挂载 OCO 条件单，堵住超时裸奔漏洞
-                    safe_post_condition(sl_rule, fallback_sl_price, "sl")
+                    # 立刻挂载条件单，堵住超时裸奔漏洞
+                    safe_post_condition(sl_rule, fallback_sl_price, "sl_tier", order_amount)
                     
                     # 超时抢救成功后兜底落库
                     db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")

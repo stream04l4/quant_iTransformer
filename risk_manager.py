@@ -10,8 +10,8 @@ from state_manager import state
 from execution_oms import log_system_alert
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, MODEL_DIR,
-    HARD_TP, HARD_SL,
-    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
+    HARD_TP, HARD_SL, HOLD_PERIOD, 
+    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH
 )
 from dotenv import load_dotenv
@@ -19,7 +19,7 @@ load_dotenv()
 
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
-
+JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{FORECAST_HORIZON}h.json"
 def execute_bailout(ex, base_sym, p, reason, current_price):
     """右脑专用：执行紧急市价逃生"""
     gate_sym = p['symbol']
@@ -83,14 +83,14 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
 
 def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price):
-    """向交易所发送 API：撤销旧止损，挂载新追踪止损"""
+    """向交易所发送 API：撤销旧追踪，挂载统管全局的新追踪止损"""
     try:
-        # 1. 撤销旧单
+        # 1. 撤销旧单：一旦右脑接管，清理掉所有碎片化止损
         for o in ex.fetch_open_orders(gate_symbol, params={'stop': True}):
             try: ex.cancel_order(o['id'], gate_symbol, params={'stop': True})
             except: pass
         
-        # 2. 挂载新单
+        # 2. 挂载新追踪单：采用 size:0 与 close:True 一键接管净头寸
         rule = 2 if pos_side == 'LONG' else 1
         native_symbol = ex.market_id(gate_symbol)
         ex.private_futures_post_settle_price_orders({
@@ -116,7 +116,7 @@ def bailout_worker():
     # 加载回测同款概率阈值
     th = {}
     try:
-        with open(MODEL_DIR / "dynamic_thresholds_24h.json", 'r') as f:
+        with open(JSON_PATH, 'r') as f:
             th = json.load(f)
     except Exception as e:
         print(f"❌ 右脑加载阈值文件失败，请检查模型编号: {e}")
@@ -215,7 +215,7 @@ def bailout_worker():
                 close_reason = ""
                 
                 # 触发器 1 & 3：反转 或 超过 24 小时
-                if is_reversal or hold_hours >= 24.0:
+                if is_reversal or hold_hours >= HOLD_PERIOD:
                     if current_phys_pnl < 0.005 and not mem['trailing_active']:
                         need_market_close = True
                         close_reason = "AI反转" if is_reversal else "24小时持仓超时"

@@ -84,7 +84,7 @@ MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
 
 # --- 账户资金管理参数 ---
 INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累计收益率
-BASE_RISK_BUDGET = 0.5              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
+BASE_RISK_BUDGET = 0.2              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
 MAX_OPEN_POSITIONS = 1               # 最大允许同时持仓数量
 MAX_MARGIN_UTILIZATION = 1         # 最大资金使用率红线(70%)
 MIN_ORDER_NOTIONAL = 1.0             # 最小下单名义价值(USDT)

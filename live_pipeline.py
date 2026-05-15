@@ -274,6 +274,9 @@ def run_live():
     last_trade_hour = 0  
     last_trade_signal = 0
     latest_closed_ts = 0
+    
+    # 🎯 仓位阶梯状态机：0=空仓，1=top10(lv1)，2=top5(lv2)，3=top1(lv3)
+    position_tier_state = { "side": 0, "highest_tier": 0 }
 
     while True:
         try:
@@ -367,58 +370,76 @@ def run_live():
             adj_p_up = cached_p_up + macro_buff
             adj_p_down = cached_p_down - macro_buff
 
-            # --- 单模型信号决策 ---
-            signal = 0
+            # --- 🎯 阶梯加仓信号决策 ---
+            target_signal = 0
+            target_tier = 0
             dynamic_leverage = 0.0
             
-            if adj_p_up > th['up_top_1']:      signal = 1; dynamic_leverage = LEVERAGE_3
-            elif adj_p_up > th['up_top_5']:    signal = 1; dynamic_leverage = LEVERAGE_2
-            elif adj_p_up > th['up_top_10']:   signal = 1; dynamic_leverage = LEVERAGE_1
-            elif adj_p_down > th['down_top_1']:  signal = -1; dynamic_leverage = LEVERAGE_3
-            elif adj_p_down > th['down_top_5']:  signal = -1; dynamic_leverage = LEVERAGE_2
-            elif adj_p_down > th['down_top_10']: signal = -1; dynamic_leverage = LEVERAGE_1
+            # 判断真实物理仓位是否已空，归零状态机
+            with state.pos_lock:
+                if SYMBOL.replace("/", "") not in state.active_pos_map:
+                    position_tier_state = {"side": 0, "highest_tier": 0}
 
-            # 👇 优化日志：移除“联席会议”字样，改为单模型汇报
+            if adj_p_up > th['up_top_1']:        target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+            elif adj_p_up > th['up_top_5']:      target_signal = 1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+            elif adj_p_up > th['up_top_10']:     target_signal = 1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+            elif adj_p_down > th['down_top_1']:  target_signal = -1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+            elif adj_p_down > th['down_top_5']:  target_signal = -1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+            elif adj_p_down > th['down_top_10']: target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+
+            # 阶梯过滤器核心逻辑
+            actual_signal = 0
+            if target_signal != 0:
+                if position_tier_state["side"] == 0:
+                    actual_signal = target_signal
+                elif position_tier_state["side"] == target_signal:
+                    if target_tier > position_tier_state["highest_tier"]:
+                        actual_signal = target_signal
+                else:
+                    actual_signal = target_signal # 反向平仓交由 OMS 处理
+
             if needs_evaluation_log:
                 action_str = "按兵不动"
-                if signal == 1: action_str = f"🚀 触发做多 (杠杆: {dynamic_leverage}x)"
-                elif signal == -1: action_str = f"🩸 触发做空 (杠杆: {dynamic_leverage}x)"
+                if actual_signal == 1: 
+                    action_str = f"🚀 触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
+                elif actual_signal == -1: 
+                    action_str = f"🩸 触发做空 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
                     
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
                     f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
                     f"【修正概率】📈多:{adj_p_up:.4f} | 📉空:{adj_p_down:.4f} (宏观修正: {macro_buff:+.4f})\n"
-                    f"【引擎决策】{action_str}"
+                    f"【引擎决策】{action_str} | 状态机: {position_tier_state}"
                 )
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
                 log_system_alert("🧠 决策评估", SYMBOL, eval_log)
 
 
-            if signal != 0:
-                if latest_closed_ts == last_trade_hour and signal == last_trade_signal:
-                    pass # 同一根 K 线内同方向静默跳过
+            if actual_signal != 0:
+                print(f"\n[{snapshot['server_time']}] 🔥 突破阶梯红线！最新价: {current_price} | 发送 OMS 指令 (Tier-{target_tier})...")
+                log_system_alert("🔥 下单触发", SYMBOL,
+                    f"信号: {'做多' if actual_signal==1 else '做空'} | Tier: {target_tier} | 杠杆变量: {dynamic_leverage}x | 价格: {current_price:.4f}")
+                success, actual_margin = execute_gate_trade(
+                    symbol=SYMBOL,
+                    signal=actual_signal,
+                    leverage=dynamic_leverage,
+                    current_price=current_price,
+                    tp_pct=dynamic_tp,
+                    sl_pct=dynamic_sl,
+                    risk_margin_usd=dynamic_margin_usd,
+                )
+                if success:
+                    print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
+                    log_system_alert("✅ 下单成交", SYMBOL,
+                        f"Tier-{target_tier} 建立 | 成交价: {current_price:.4f} | 保证金: ${actual_margin:.2f}")
+                    last_trade_hour = latest_closed_ts
+                    last_trade_signal = actual_signal
+                    # 升级状态机最高记录
+                    position_tier_state["side"] = actual_signal
+                    position_tier_state["highest_tier"] = target_tier
                 else:
-                    print(f"\n[{snapshot['server_time']}] 🔥 突破红线！最新价: {current_price} | 发送 OMS 指令 (杠杆: {dynamic_leverage}x)...")
-                    log_system_alert("🔥 下单触发", SYMBOL,
-                        f"信号: {'做多' if signal==1 else '做空'} | 杠杆: {dynamic_leverage}x | 价格: {current_price:.4f}")
-                    success, actual_margin = execute_gate_trade(
-                        symbol=SYMBOL,
-                        signal=signal,
-                        leverage=dynamic_leverage,
-                        current_price=current_price,
-                        tp_pct=dynamic_tp,
-                        sl_pct=dynamic_sl,
-                        risk_margin_usd=dynamic_margin_usd,
-                    )
-                    if success:
-                        print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
-                        log_system_alert("✅ 下单成交", SYMBOL,
-                            f"{'做多' if signal==1 else '做空'} {dynamic_leverage}x | 成交价: {current_price:.4f} | 保证金: ${actual_margin:.2f}")
-                        last_trade_hour = latest_closed_ts
-                        last_trade_signal = signal
-                    else:
-                        log_system_alert("❌ 下单失败", SYMBOL,
-                            f"OMS 返回 False | 信号: {'做多' if signal==1 else '做空'} | 价格: {current_price:.4f}")
+                    log_system_alert("❌ 下单失败", SYMBOL,
+                        f"OMS 返回 False | 信号: {'做多' if actual_signal==1 else '做空'} | 价格: {current_price:.4f}")
             
             # 👇 新增：引擎遥测状态原子级持久化 (Telemetry State Persistence)
             live_state_payload = {
@@ -435,8 +456,8 @@ def run_live():
                     "macro_buff": float(macro_buff)
                 },
                 "execution_state": {
-                    "current_signal": int(signal),
-                    "dynamic_leverage": float(dynamic_leverage) if signal != 0 else 0.0,
+                    "current_signal": int(actual_signal),
+                    "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
                     "last_inferred_hour": int(last_inferred_hour),
                     "last_trade_hour": int(last_trade_hour)
                 }

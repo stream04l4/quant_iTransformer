@@ -23,7 +23,6 @@ from quant_config.config import (
 )
 
 # --- 核心配置路径 ---
-CONFIG_JSON_FILE = os.path.join(LIVE_DATA_DIR, "ui_config.json")
 ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
 
 # --- UI 页面配置与高频轮询开关 ---
@@ -142,39 +141,6 @@ def render_status_dashboard():
 with st.sidebar:
     render_status_dashboard()
 
-defaults = {
-    # 以下参数已全部进入 config.py ， defaults 仅保留 UI 运行状态项
-    "collection_version": "v1.0",
-    "inference_version": "v1.0",
-    "active_symbols": SYMBOL if isinstance(SYMBOL, list) else [SYMBOL],
-}
-
-if 'settings' not in st.session_state:
-    if os.path.exists(CONFIG_JSON_FILE):
-        try:
-            with open(CONFIG_JSON_FILE, 'r') as f:
-                st.session_state.settings = json.load(f)
-            for k, v in defaults.items():
-                if k not in st.session_state.settings:
-                    st.session_state.settings[k] = v
-        except Exception:
-            st.session_state.settings = defaults.copy()
-    else:
-        st.session_state.settings = defaults.copy()
-
-# 回调函数：仅保存尚未进入 config 的 UI 状态项（如版本号、活跃币种等）
-def save_settings():
-    s = st.session_state.settings
-    st.session_state.settings = {
-        "collection_version": st.session_state.get("ui_collection_version", s.get("collection_version", "v1.0")),
-        "inference_version": st.session_state.get("ui_inference_version", s.get("inference_version", "v1.0")),
-        "active_symbols": st.session_state.get("ui_active_symbols_state", s.get("active_symbols", SYMBOL if isinstance(SYMBOL, list) else [SYMBOL])),
-    }
-    # 原子写入保持不变
-    temp_file = f"{CONFIG_JSON_FILE}.tmp"
-    with open(temp_file, 'w') as f:
-        json.dump(st.session_state.settings, f)
-    os.replace(temp_file, CONFIG_JSON_FILE)
 
 # --- 资产组合监控模块 (Portfolio Monitor) ---
 def get_gate_portfolio():
@@ -529,8 +495,7 @@ def render_realtime_portfolio():
                     "方向": "🟢 做多" if pos_side == 'LONG' else "🔴 做空",
                     "杠杆": f"{leverage_used:.0f}x",
                     "占用保证金": f"${actual_margin:,.2f}",
-                    "开仓均价": f"${entry_px:,.4f}",
-                    "目标止盈 (TP)": real_tp,
+                    "开仓均价": f"${entry_px:,.4f}",                    
                     "防守止损 (SL)": real_sl,
                     "当前标记价": f"${float(info.get('markPx', info.get('mark_price', 0))):,.4f}",
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
@@ -905,7 +870,7 @@ with dash_tab4:
     st.markdown("##### 🤖 当前服役主模型 (Live) 实盘绩效监控")
     st.caption("此处仅对当前实盘正在加载的 AI 模型进行单独剥离分析，排除历史其他老旧型号的混合数据污染，用于直观评估【大模型当下的实战准确度与诚实度】。")
 
-    current_inf_version = st.session_state.settings.get("inference_version", "v1.0")
+    current_inf_version = "v1.0"
     if not df_closed_trades.empty:
         
         # 1. 查找当前模型的身世
@@ -924,7 +889,7 @@ with dash_tab4:
                         curr_m_created_at = pd.to_datetime(reg_data[current_inf_version].get('created_at', '2000-01-01'), errors='coerce')
             except Exception: pass
 
-        default_win = float(st.session_state.settings.get("default_win_rate", 0.52))
+        default_win = 0.52
 
         if pd.isna(curr_m_created_at):
             curr_m_created_at = pd.to_datetime('2000-01-01')
@@ -1105,7 +1070,7 @@ st.markdown("### 📡 实时全市场扫描雷达")
 @st.fragment(run_every=_run_every)
 def render_market_radar():
     # 👇 从 session_state 动态读取当前存活的币种池
-    active_radar_symbols = st.session_state.settings.get("active_symbols", ALL_SYMBOLS)
+    active_radar_symbols = ALL_SYMBOLS
     if isinstance(active_radar_symbols, str):
         active_radar_symbols = [active_radar_symbols]
     
