@@ -16,7 +16,7 @@ from datetime import datetime
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
-    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL, LIVE_RISK_MARGIN_USD,
+    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR  # 🚨 新增：引入 TRAIN_DATA_DIR
@@ -294,7 +294,7 @@ def run_live():
             state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
             
             # 仓位保证金与止盈止损参数（直接来自 config）
-            dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET if INITIAL_CAPITAL * BASE_RISK_BUDGET > 0 else LIVE_RISK_MARGIN_USD
+            dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET  # 单笔保证金 = 总资本 × 风险拨备率
             dynamic_sl = HARD_SL   # K线物理兜底止损幅度
             dynamic_tp = HARD_TP   # K线物理止盈幅度
 

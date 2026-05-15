@@ -334,7 +334,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # ---------------------------------------------------------
         # 4. 真实订单特征落库（live_trades 表）
         # ---------------------------------------------------------
-        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol}.db")
+        db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")
         with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS live_trades
@@ -389,7 +389,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     safe_post_condition(sl_rule, fallback_sl_price, "sl")
                     
                     # 超时抢救成功后兜底落库
-                    db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol}.db")
+                    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")
                     try:
                         with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
                             cursor = conn.cursor()

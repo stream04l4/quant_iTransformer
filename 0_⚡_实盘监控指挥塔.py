@@ -27,7 +27,7 @@ CONFIG_JSON_FILE = os.path.join(LIVE_DATA_DIR, "ui_config.json")
 ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
 
 # --- UI 页面配置与高频轮询开关 ---
-st.set_page_config(page_title="TimesFM 预测引擎", layout="wide")
+st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -141,47 +141,6 @@ def render_status_dashboard():
 # 👇 【核心修复】：在调用时，从外部将其推入侧边栏
 with st.sidebar:
     render_status_dashboard()
-# ==========================================
-# 🔐 全局安全认证拦截器 (邮箱+密码 双轨认证)
-# ==========================================
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@yourquant.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "UNCONFIGURED_PASSWORD_123") 
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "UNCONFIGURED_TOKEN_888")
-
-def check_auth():
-    """全站安全认证：完全信任 Session，避免引发路由重置"""
-    
-    # 1. 最高优先级：检查跨页面共享内存
-    # 只要内存里有状态，直接放行！【绝对不要】在这里强行修改 URL，否则会引发掉线
-    if st.session_state.get("auth_success", False):
-        return True
-        
-    # 2. 次优先级：检查 URL 是否带有免密金牌 (主要用于刚打开收藏夹网址时)
-    if st.query_params.get("auth") == SECRET_TOKEN:
-        st.session_state["auth_success"] = True
-        return True
-
-    # 3. 拦截：渲染登录表单
-    st.markdown("<h2 style='text-align: center; margin-top: 100px;'>🛡️ TimesFM 预测引擎访问受限</h2>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
-        with st.form("login_form"):
-            email = st.text_input("📧 管理员邮筱")
-            pwd = st.text_input("🔑 访问密码", type="password")
-            submitted = st.form_submit_button("验证并解锁 🚀", width='stretch')
-            
-            if submitted:
-                if email == ADMIN_EMAIL and pwd == ADMIN_PASSWORD:
-                    st.session_state["auth_success"] = True
-                    st.query_params["auth"] = SECRET_TOKEN
-                    st.rerun()
-                else:
-                    st.error("❌ 身份核验失败，系统已拦截此次尝试。")
-    return False
-
-# 拦截器触发点
-if not check_auth():
-    st.stop()
 
 defaults = {
     # 以下参数已全部进入 config.py ， defaults 仅保留 UI 运行状态项
@@ -216,33 +175,7 @@ def save_settings():
     with open(temp_file, 'w') as f:
         json.dump(st.session_state.settings, f)
     os.replace(temp_file, CONFIG_JSON_FILE)
-# ==========================================
-# 🔑 全局 API 密鑰配置 (异构架构：OKX 仅用于获取数据，这里填 Gate 的执行密钥)
-# ==========================================
-# ==========================================
-# 🛠️ 运维专用：轻量级测试 API (仅用于侧边栏手动按钮，不参与主渲染)
-# ==========================================
-# 重新获取密钥，确保下方的测试面板依然能动
-TEST_API_KEY = os.environ.get("GATE_DEMO_API_KEY")
-TEST_SECRET  = os.environ.get("GATE_DEMO_SECRET")
 
-@st.cache_resource
-def get_test_exchange():
-    """ 专门为 UI 测试按钮创建一个独立实例，避免干扰后端 engine.py """
-    try:
-        ex = ccxt.gate({
-            'apiKey': TEST_API_KEY, 
-            'secret': TEST_SECRET,
-            'enableRateLimit': True, 
-            'options': {'defaultType': 'swap'}
-        })
-        ex.set_sandbox_mode(True) # 👈 物理锁定为模拟盘，防止误操作实盘
-        return ex
-    except Exception:
-        return None
-
-# 初始化测试实例，供下方按钮调用
-test_ex_instance = get_test_exchange()
 # --- 资产组合监控模块 (Portfolio Monitor) ---
 def get_gate_portfolio():
     """ 架构解耦：直接读取 engine.py 在后台写好的本地 JSON 快照，0 网络请求！"""
@@ -265,7 +198,7 @@ def get_gate_portfolio():
 
 def load_trade_history_for_symbol(symbol):
     """稳健加载单币种交易流水，并用最近预测快照补齐杠杆、胜率和版本血统。"""
-    db_name = os.path.join(DATA_DIR, f"trading_intelligence_{symbol.replace('/', '_')}.db")
+    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol.replace('/', '_')}.db")
     if not os.path.exists(db_name):
         return pd.DataFrame()
 
@@ -302,6 +235,7 @@ def load_trade_history_for_symbol(symbol):
                 df_pred = pd.DataFrame()
 
         if not df_pred.empty:
+            df_live['exec_ts'] = pd.to_datetime(df_live['exec_ts'], format='mixed', errors='coerce')
             df_pred['predict_ts'] = pd.to_datetime(df_pred['predict_ts'], format='mixed', errors='coerce')
             df_pred = df_pred.dropna(subset=['predict_ts']).sort_values('predict_ts')
             df_pred = df_pred.rename(columns={
@@ -331,7 +265,7 @@ def load_trade_history_for_symbol(symbol):
     except Exception:
         return pd.DataFrame()
 
-st.title("TimesFM 预测引擎")
+st.title("iTransformer 预测引擎")
 
 # ==========================================
 # 🧠 V3 宏观情报横幅 (DeepSeek Marquee)
@@ -378,7 +312,7 @@ except Exception:
 def render_realtime_portfolio():
     balance, positions, all_open_stops = get_gate_portfolio()
     if balance is None:
-        st.warning("⏳ 正在等待后台量化引擎 (engine.py) 启动并同步资产快照...")
+        st.warning("⏳ 正在等待后台量化引擎启动并同步资产快照...")
         return
         
     with st.expander("🏦 Gate.io 仓位监控中心", expanded=True):
@@ -612,7 +546,7 @@ render_realtime_portfolio()
 # 📊 静态切片：策略分析驾驶舱与历史本纪 (无动作绝对不刷新，解放 CPU)
 # ====================================================================
 initial_cap = float(INITIAL_CAPITAL)  # 直接来自 config
-actual_track_list = SYMBOL
+actual_track_list = ALL_SYMBOLS
 hist_data = []
 total_ml_samples = 0
 
@@ -1144,93 +1078,14 @@ def render_bottom_alerts():
                 st.info(f"🟢 警报数据库读取中: {e}")
         else:
             st.info("🟢 等待底层引擎生成警报库...")
-# ---------------------------------------------------------
-# 【新增：全局参数安全锁】
-# ---------------------------------------------------------
-st.sidebar.markdown("### 🔒 核心参数控制")
-lock_params = st.sidebar.toggle("锁定交易参数 (防误触)", value=True, help="为了防止实盘中误触修改参数，默认锁定。请关闭此开关后再进行调参。")
-if lock_params:
-    st.sidebar.success("✅ 参数已锁定，当前处于安全防误触模式。")
-else:
-    st.sidebar.warning("⚠️ 参数已解锁，任何滑动都将立即实时生效于底层引擎！")
-# ---------------------------------------------------------
-# 1. 状态初始化：从硬盘配置中读取当前存活的币种
-if "ui_active_symbols_state" not in st.session_state:
-    _active = st.session_state.settings.get("active_symbols", ALL_SYMBOLS)
-    if isinstance(_active, str):
-        _active = [_active]
-    st.session_state["ui_active_symbols_state"] = _active.copy()
 
-# 判断当前是否处于“全选”状态
-is_all_selected = len(st.session_state["ui_active_symbols_state"]) == len(ALL_SYMBOLS)
-
-# 2. 核心回调函数：负责内存与硬盘的同步
-def sync_symbols_to_disk():
-    """将内存中的选中状态原子化持久写入硬盘"""
-    st.session_state.settings["active_symbols"] = st.session_state["ui_active_symbols_state"]
-    temp_file = f"{CONFIG_JSON_FILE}.tmp"
-    with open(temp_file, 'w') as f:
-        json.dump(st.session_state.settings, f)
-    os.replace(temp_file, CONFIG_JSON_FILE)
-
-def toggle_all():
-    """触发了【全选】按钮的回调"""
-    if st.session_state["select_all_toggle"]:
-        st.session_state["ui_active_symbols_state"] = ALL_SYMBOLS.copy()
-    else:
-        st.session_state["ui_active_symbols_state"] = [SYMBOL]
-        st.toast("⚠️ 已取消全选，但系统风控要求至少保留一个监控标的。", icon="⚠️")
-    sync_symbols_to_disk()
-
-def toggle_item(symbol):
-    """触发了【单个币种】的回调"""
-    if st.session_state[f"chk_sym_{symbol}"]:
-        if symbol not in st.session_state["ui_active_symbols_state"]:
-            st.session_state["ui_active_symbols_state"].append(symbol)
-    else:
-        if symbol in st.session_state["ui_active_symbols_state"]:
-            st.session_state["ui_active_symbols_state"].remove(symbol)
-
-    # 物理防呆兜底
-    if not st.session_state["ui_active_symbols_state"]:
-        st.session_state["ui_active_symbols_state"] = [symbol]
-        st.session_state[f"chk_sym_{symbol}"] = True 
-        st.toast("❌ 必须至少保留一个交易标的！", icon="❌")
-        
-    sync_symbols_to_disk()
-
-# 3. 渲染 UI (👇 核心修改：使用 expanded=False 默认收缩)
-with st.sidebar.expander("🌍 交易标的控制池", expanded=False):
-    st.caption("展开勾选以激活 AI 监控与自动交易。")
-
-    # 渲染【全选按钮】 (注意这里去掉了 .sidebar，因为已经包裹在 expander 里了)
-    st.checkbox(
-        "**☑️ 全选所有标的**",
-        value=is_all_selected,
-        key="select_all_toggle",
-        on_change=toggle_all,
-        disabled=lock_params
-    )
-
-    # 渲染【子节点列表】
-    for sym in ALL_SYMBOLS:
-        st.checkbox(
-            f"　🔸 {sym}", 
-            value=(sym in st.session_state["ui_active_symbols_state"]),
-            key=f"chk_sym_{sym}",
-            on_change=toggle_item, 
-            args=(sym,),           
-            disabled=lock_params
-        )
 # ---------------------------------------------------------
 # 📋 核心风控参数来自 config.py（只读展示，如需修改请编辑 quant_config/config.py 并重启）
-with st.sidebar.expander("📋 当前生效风控参数 (只读)", expanded=False):
-    st.caption("以下参数均来自 `quant_config/config.py`，如需修改请直接编辑该文件并重启服务。")
-    st.markdown(f"""
+st.sidebar.markdown(f"""
 | 参数 | 当前值 |
 |------|--------|
 | 🏦 初始资本 | `{INITIAL_CAPITAL:,.0f} USDT` |
-| �� 单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
+|  单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
 | 🟢 K线物理止盈 | `{HARD_TP*100:.1f}%` |
 | 🔴 K线物理止损 | `{HARD_SL*100:.1f}%` |
 | ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |

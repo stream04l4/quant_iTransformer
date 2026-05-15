@@ -75,7 +75,6 @@ HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.03))
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.03))
 
 # --- 实盘专用风控与仓位参数 ---
-LIVE_RISK_MARGIN_USD = 1000.0        # 每次发车动用的固定保证金金额(U)
 TRADE_COOLDOWN_SEC = 3500            # 开仓后防连续发车冷却时间(秒)
 MAX_MACRO_IMPACT = 0.05              # 宏观情绪对模型输出概率的最大干预幅度(如0.03=3%)
 MACRO_CHECK_INTERVAL = 1800          # 宏观情报拉取间隔(秒)

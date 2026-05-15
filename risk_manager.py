@@ -41,7 +41,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
         except: pass
         
         # 3. 落库：历史本纪
-        db_name = os.path.join(DATA_DIR, f"trading_intelligence_{base_sym}.db")
+        db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
         with sqlite3.connect(db_name, timeout=10.0, check_same_thread=False) as conn_log:
             cursor = conn_log.cursor()
             try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
@@ -180,7 +180,7 @@ def bailout_worker():
 
                 # 初始化该币种的内存追踪器
                 if base_sym not in tracking_mem:
-                    db_name = os.path.join(DATA_DIR, f"trading_intelligence_{base_sym}.db")
+                    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
                     entry_time = time.time()
                     try:
                         with sqlite3.connect(db_name, timeout=1.0) as conn:
