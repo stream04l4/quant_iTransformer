@@ -17,9 +17,9 @@ from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
-    TRADE_COOLDOWN_SEC, MAX_MACRO_IMPACT, MACRO_CHECK_INTERVAL, HEARTBEAT_INTERVAL,
+    TRADE_COOLDOWN_SEC, MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
-    EXPERIMENT_ID, TRAIN_DATA_DIR  # 🚨 新增：引入 TRAIN_DATA_DIR
+    EXPERIMENT_ID, TRAIN_DATA_DIR  
 )
 # ==========================================
 # 1. 加载实盘配置 (固定单模型路径)
@@ -34,25 +34,23 @@ JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{FORECAST_HORIZON}h.json"
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
 # ==========================================
-def get_macro_sentiment_score():
-    """实时读取最新的宏观情绪得分"""
+def get_macro_sentiment_info():
+    """实时读取最新的宏观情绪得分及时间戳"""
     db_path = os.path.join(LIVE_DATA_DIR, "macro_intelligence.db")
     if not os.path.exists(db_path):
-        return 0.0 # 找不到数据库，默认宏观中性
+        return 0.0, "0"
 
     try:
-        # 使用超时机制，防止高频引擎被数据库文件锁卡死
-        with sqlite3.connect(db_path, timeout=1.0) as conn:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
             cursor = conn.cursor()
-            # 永远只取最新的一条宏观决策
-            cursor.execute("SELECT score FROM llm_decisions ORDER BY decision_ts DESC LIMIT 1")
+            cursor.execute("SELECT score, decision_ts FROM llm_decisions ORDER BY decision_ts DESC LIMIT 1")
             row = cursor.fetchone()
             if row:
-                return float(row[0])
+                return float(row[0]), str(row[1])
     except Exception as e:
-        print(f"⚠️ [宏观雷达] 读取情绪得分失败: {e}")
+        print(f"⚠️ [宏观雷达] 读取情绪详情失败: {e}")
         
-    return 0.0
+    return 0.0, "0"
 # ==========================================
 # 2. 特征工程构建器 (严禁补零，严格对齐)
 # ==========================================
@@ -232,8 +230,65 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     return inference_window
 
 # ==========================================
+# ⚡ 贝叶斯 Logit 融合算子
+# ==========================================
+def apply_logit_fusion(base_prob, macro_score, alpha):
+    """将大模型概率转换为 Log-Odds，加上宏观偏置后再还原为概率 (防止概率越界且边缘平滑)"""
+    epsilon = 1e-7
+    # 防御性剪裁，防止极端情况除零报错
+    p_safe = np.clip(base_prob, epsilon, 1.0 - epsilon)
+    # 转换为无限边界的 Logit 空间
+    logit = np.log(p_safe / (1.0 - p_safe))
+    # 注入宏观偏置
+    adjusted_logit = logit + (alpha * macro_score)
+    # Sigmoid 还原回 [0, 1] 空间
+    return float(1.0 / (1.0 + np.exp(-adjusted_logit)))
+
+# ==========================================
 # 3. 实盘主循环
 # ==========================================
+def _reconstruct_tier_state():
+    """
+    重启恢复：从真实交易所仓位 + live_status.json 双轨重建阶梯状态机。
+    优先级：exchange pos_map（真实） > live_status.json（快速兜底）。
+    """
+    # --- 轨道 1：真实交易所仓位（portfolio_sync_worker 已刷入 state.active_pos_map）---
+    with state.pos_lock:
+        pos_map = dict(state.active_pos_map)
+
+    sym_key = SYMBOL.replace("/", "")
+    print(f"🔍 [状态恢复] 正在校验符号: {sym_key}，当前已同步仓位列表: {list(pos_map.keys())}")
+    if sym_key in pos_map:
+        p = pos_map[sym_key]
+        pos_side_str = str(p.get('side', '')).upper()
+        side_int = 1 if pos_side_str == 'LONG' else (-1 if pos_side_str == 'SHORT' else 0)
+        if side_int != 0:
+            lev = float(p.get('leverage', p['info'].get('lever', p['info'].get('leverage', 0))))
+            # 根据杠杆反推当时开仓所属 Tier
+            if   lev >= LEVERAGE_3: tier = 3
+            elif lev >= LEVERAGE_2: tier = 2
+            else:                   tier = 1
+            print(f"♻️  [重启恢复] 从交易所仓位重建状态机: side={side_int}, Tier={tier}, lev={lev}x")
+            return {"side": side_int, "highest_tier": tier}
+
+    # --- 轨道 2：live_status.json 快速兜底（交易所尚未响应时）---
+    status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
+    if os.path.exists(status_path):
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            ts_state = saved.get("position_tier_state", {})
+            side = int(ts_state.get("side", 0))
+            tier = int(ts_state.get("highest_tier", 0))
+            if side != 0:
+                print(f"♻️  [重启恢复] 从 live_status.json 恢复状态机: side={side}, Tier={tier}")
+                return {"side": side, "highest_tier": tier}
+        except Exception as e:
+            print(f"⚠️  [重启恢复] 读取 live_status.json 失败: {e}")
+
+    print("🆕 [重启恢复] 未发现持仓记录，状态机初始化为空仓。")
+    return {"side": 0, "highest_tier": 0}
+
 def run_live():
     print(f"🚀 极速实盘预测引擎启动 (单模型模式: {MODEL_PATH.name})...")
     threading.Thread(target=bailout_worker, daemon=True).start()
@@ -269,14 +324,23 @@ def run_live():
     last_inferred_hour = 0
     cached_p_down, cached_p_flat, cached_p_up = 0.0, 0.0, 0.0
     
-    last_macro_check = 0.0
     cached_macro_score = 0.0
+    last_macro_ts = "0" # 👈 新增：用于侦测宏观情报异动
     last_trade_hour = 0  
     last_trade_signal = 0
     latest_closed_ts = 0
     
-    # 🎯 仓位阶梯状态机：0=空仓，1=top10(lv1)，2=top5(lv2)，3=top1(lv3)
-    position_tier_state = { "side": 0, "highest_tier": 0 }
+    # 🎯 仓位阶梯状态机：重启时从交易所/磁盘双轨恢复，防止重复开仓
+    # portfolio_sync_worker 在后台独立线程中运行，动态等待其完成首次同步
+    print("⏳ 正在同步交易所账户状态 (资金/仓位/委托)...")
+    wait_start = time.time()
+    while state.portfolio_memory.get('last_sync_ts', 0) == 0:
+        if time.time() - wait_start > 15: # 增加超时保护
+            print("⚠️ [启动预警] 供货线程同步超时 (15s)，将尝试从本地缓存恢复状态。")
+            break
+        time.sleep(1)
+        
+    position_tier_state = _reconstruct_tier_state()
 
     while True:
         try:
@@ -308,28 +372,23 @@ def run_live():
                 pass # 兼容你可能的 state_manager 写法
 
             # ---------------------------------------------------------
-            # ⏱️ [30分钟级 Tick] 宏观情报低频轮询
+            # ⏳ [1小时级 Tick] 深度学习推理 (单模型)
             # ---------------------------------------------------------
             needs_evaluation_log = False
             trigger_reason = ""
-            
-            # 超过 MACRO_CHECK_INTERVAL 才去读一次数据库更新宏观得分
-            if current_time - last_macro_check > MACRO_CHECK_INTERVAL:
-                cached_macro_score = get_macro_sentiment_score()
-                last_macro_check = current_time
-                current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                print(f"📡 [{current_time_str} UTC] [宏观雷达] 已刷新宏观情绪得分: {cached_macro_score:+.2f}")
-                needs_evaluation_log = True
-                trigger_reason = "宏观得分刷新"
-
-            # ---------------------------------------------------------
-            # ⏳ [1小时级 Tick] 深度学习推理 (单模型)
-            # ---------------------------------------------------------
             if len(snapshot['ohlcv_1h']) >= 2:
                 latest_closed_ts = snapshot['ohlcv_1h'][-2][0] 
                 
                 if latest_closed_ts != last_inferred_hour:
-                    print(f"\n🔄 [换线时刻] 开始执行单模型推理 (TS: {latest_closed_ts})...")
+                    # 💡 策略：整点第1分钟留给 DeepSeek 脚本执行，第2分钟准时开始大模型推理
+                    current_minute = datetime.utcnow().minute
+                    if current_minute < 2:
+                        if int(current_time) % 30 == 0: # 每30秒提醒一次
+                            print(f"⏳ [等待窗口] 检测到新K线，等待进入整点第2分钟以同步宏观分 (当前: {current_minute}分)...")
+                        time.sleep(1) # 稍微睡眠，防止极短时间内的 while 循环空转过快
+                        continue
+
+                    print(f"\n🔄 [时钟对齐] 进入整点第{current_minute}分钟，开始执行单模型推理 (TS: {latest_closed_ts})...")
                     
                     eth_usdt_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[0]}").json()
                     eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
@@ -357,18 +416,39 @@ def run_live():
                         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                         
                     cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
+                    
+                    # 🎯 [联动触发] 大模型推理完成后，立即调取宏观分进行 Logit 融合调整
+                    cached_macro_score, last_macro_ts = get_macro_sentiment_info()
+                    current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"📡 [{current_time_str} UTC] [宏观雷达] 联动刷新宏观情绪得分: {cached_macro_score:+.2f} (TS: {last_macro_ts})")
+                    
                     last_inferred_hour = latest_closed_ts
                     needs_evaluation_log = True
-                    trigger_reason = "新K线闭合推理"
+                    trigger_reason = "新K线闭合推理并联动宏观评分"
 
             # ---------------------------------------------------------
-            # ⚔️ [10秒级 Tick] 实时高频信号撮合
+            # 💡 [新增：非整点宏观突袭侦测]
             # ---------------------------------------------------------
-            dynamic_macro_impact = MAX_MACRO_IMPACT  # 直接使用 config 中定义的宏观干预幅度
-            macro_buff = cached_macro_score * dynamic_macro_impact
-            
-            adj_p_up = cached_p_up + macro_buff
-            adj_p_down = cached_p_down - macro_buff
+            if not needs_evaluation_log and cached_p_up + cached_p_down > 0:
+                new_macro_score, new_macro_ts = get_macro_sentiment_info()
+                if new_macro_ts != last_macro_ts:
+                    cached_macro_score = new_macro_score
+                    last_macro_ts = new_macro_ts
+                    needs_evaluation_log = True
+                    trigger_reason = f"🚀 宏观哨兵突击！监测到情报异动 (TS: {new_macro_ts})"
+                    print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🦅 宏观哨兵触发实时重估！新得分: {cached_macro_score:+.2f}")
+
+            # ---------------------------------------------------------
+            # ⚔️ [10秒级 Tick] 实时高频信号撮合 (Logit 贝叶斯非线性融合)
+            # ---------------------------------------------------------
+            # 多头宏观得分为正收益，空头宏观得分为负收益 (反向叠加，即做空时宏观得分为负反而加成)
+            adj_up_top1 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_1)
+            adj_up_top5 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_5)
+            adj_up_top10 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_10)
+
+            adj_down_top1 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_1)
+            adj_down_top5 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_5)
+            adj_down_top10 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_10)
 
             # --- 🎯 阶梯加仓信号决策 ---
             target_signal = 0
@@ -380,12 +460,13 @@ def run_live():
                 if SYMBOL.replace("/", "") not in state.active_pos_map:
                     position_tier_state = {"side": 0, "highest_tier": 0}
 
-            if adj_p_up > th['up_top_1']:        target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
-            elif adj_p_up > th['up_top_5']:      target_signal = 1; target_tier = 2; dynamic_leverage = LEVERAGE_2
-            elif adj_p_up > th['up_top_10']:     target_signal = 1; target_tier = 1; dynamic_leverage = LEVERAGE_1
-            elif adj_p_down > th['down_top_1']:  target_signal = -1; target_tier = 3; dynamic_leverage = LEVERAGE_3
-            elif adj_p_down > th['down_top_5']:  target_signal = -1; target_tier = 2; dynamic_leverage = LEVERAGE_2
-            elif adj_p_down > th['down_top_10']: target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+            # 评估是否击穿各层级动态阈值 (用各自阶梯专属的修正概率)
+            if adj_up_top1 > th['up_top_1']:        target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+            elif adj_up_top5 > th['up_top_5']:      target_signal = 1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+            elif adj_up_top10 > th['up_top_10']:     target_signal = 1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+            elif adj_down_top1 > th['down_top_1']:  target_signal = -1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+            elif adj_down_top5 > th['down_top_5']:  target_signal = -1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+            elif adj_down_top10 > th['down_top_10']: target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
 
             # 阶梯过滤器核心逻辑
             actual_signal = 0
@@ -408,7 +489,7 @@ def run_live():
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
                     f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
-                    f"【修正概率】📈多:{adj_p_up:.4f} | 📉空:{adj_p_down:.4f} (宏观修正: {macro_buff:+.4f})\n"
+                    f"【融合概率(入场级Tier1)】📈多:{adj_up_top10:.4f} | 📉空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
                     f"【引擎决策】{action_str} | 状态机: {position_tier_state}"
                 )
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
@@ -451,15 +532,19 @@ def run_live():
                 "model_inference": {
                     "raw_prob_up": float(cached_p_up),
                     "raw_prob_down": float(cached_p_down),
-                    "adj_prob_up": float(adj_p_up),
-                    "adj_prob_down": float(adj_p_down),
-                    "macro_buff": float(macro_buff)
+                    "adj_prob_up_tier1": float(adj_up_top10),
+                    "adj_prob_down_tier1": float(adj_down_top10),
+                    "macro_score": float(cached_macro_score)
                 },
                 "execution_state": {
                     "current_signal": int(actual_signal),
                     "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
                     "last_inferred_hour": int(last_inferred_hour),
                     "last_trade_hour": int(last_trade_hour)
+                },
+                "position_tier_state": {
+                    "side": int(position_tier_state["side"]),
+                    "highest_tier": int(position_tier_state["highest_tier"])
                 }
             }
 

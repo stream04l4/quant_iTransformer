@@ -173,10 +173,16 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                 current_pos_side = str(pos.get('side', '')).lower()
                 
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
-                    msg = f"🔄 侦测到 AI 预测反转信号！主引擎已挂起，交由右脑风控 (risk_manager) 评估。"
-                    print("⚠️", msg)
-                    log_system_alert("🔄 信号反转拦截", symbol, msg)
-                    return False, 0.0
+                    msg = f"🔄 [紧急反转] 检测到反向信号，主引擎强制唤醒右脑执行清仓！"
+                    print("🚨", msg)
+                    log_system_alert("🚨 强制平仓", symbol, msg)
+                    
+                    # 💡 直接从这里导入并调用右脑的执行函数，不再等待下一秒的轮询
+                    from risk_manager import execute_bailout
+                    p = pos # 获取当前仓位信息对象
+                    execute_bailout(exchange_private, symbol, p, "AI信号强制反转", current_price)
+                    
+                    return False, 0.0 # 平仓后依然返回 False，防止在本轮循环立即反向开仓（符合回测冷却逻辑）
                 else:
                     has_existing_same_side = True
                     msg = f"📈 侦测到 {gate_symbol} 同向存续仓位，允许金字塔阶梯加仓。"
@@ -336,25 +342,29 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # 4. 真实订单特征落库（live_trades 表）
         # ---------------------------------------------------------
         db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")
-        with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''CREATE TABLE IF NOT EXISTS live_trades
-                              (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
-                               amount REAL, fill_price REAL, slippage REAL,
-                               tp_price REAL, sl_price REAL, margin_used REAL)''')
-            # 动态升级旧表
-            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
-            except sqlite3.OperationalError: pass
-            # 👇 新增：动态升级杠杆列
-            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
-            except sqlite3.OperationalError: pass
-            
-            # 👇 新增：将 leverage 写入
-            cursor.execute('''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                           (datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), str(order['id']), side,
-                            float(order_amount), actual_fill_price, float(slippage),
-                            float(tp_price), float(sl_price), float(risk_margin_usd), float(leverage)))
-            conn.commit()
+        try:
+            with sqlite3.connect(db_name, timeout=30.0, check_same_thread=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''CREATE TABLE IF NOT EXISTS live_trades
+                                (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
+                                 amount REAL, fill_price REAL, slippage REAL,
+                                 tp_price REAL, sl_price REAL, margin_used REAL)''')
+                # 动态升级旧表
+                try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
+                except sqlite3.OperationalError: pass
+                # 👇 新增：动态升级杠杆列
+                try: cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
+                except sqlite3.OperationalError: pass
+                
+                # 👇 新增：将 leverage 写入
+                cursor.execute('''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                               (datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), str(order['id']), side,
+                                float(order_amount), actual_fill_price, float(slippage),
+                                float(tp_price), float(sl_price), float(risk_margin_usd), float(leverage)))
+                conn.commit()
+                print(f"   💾 交易记录已同步至本地数据库: {db_name}")
+        except Exception as e:
+            print(f"   ⚠️ 交易记录入库失败: {e}")
 
         return True, float(risk_margin_usd)
 

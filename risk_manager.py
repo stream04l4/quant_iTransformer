@@ -27,11 +27,16 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
     contracts = float(p.get('contracts', 0))
     entry_px = float(p.get('entryPrice', p['info'].get('entry_price', p['info'].get('avgPx', 0))))
     
-    print(f"\n🚨 [右脑介入] 侦测到 {base_sym} {reason}！执行市价核弹清仓！")
+    print(f"\n🚨 [右脑介入] 侦测到 {base_sym} {reason}！执行市价核弹清仓 (数量: {contracts})...")
     try:
         # 1. 越权下发市价单
         cl_side = 'sell' if pos_side == 'LONG' else 'buy'
-        ex.create_order(symbol=gate_sym, type='market', side=cl_side, amount=contracts, params={'reduceOnly': True})
+        try:
+            ex.create_order(symbol=gate_sym, type='market', side=cl_side, amount=contracts, params={'reduceOnly': True})
+            print(f"   ✅ 交易所市价平仓指令已下发 ({gate_sym})")
+        except Exception as e:
+            print(f"   ⚠️ 交易所下单接口报错: {e}")
+            # 即便下单报错也尝试继续执行落库，可能仓位已经由于 OCO 先一步平掉了
         
         # 2. 扫清残余 OCO
         try:
@@ -40,19 +45,21 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
                 except: pass
         except: pass
         
-        # 3. 落库：历史本纪
+        # 3. 落库：历史本纪 (增加写入保障)
         db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
-        with sqlite3.connect(db_name, timeout=10.0, check_same_thread=False) as conn_log:
+        with sqlite3.connect(db_name, timeout=30.0, check_same_thread=False) as conn_log:
             cursor = conn_log.cursor()
-            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
-            except: pass
-            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
-            except: pass
+            cursor.execute('''CREATE TABLE IF NOT EXISTS live_trades
+                              (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
+                               amount REAL, fill_price REAL, slippage REAL,
+                               tp_price REAL, sl_price REAL, margin_used REAL, leverage REAL)''')
             
+            # 记录一笔平仓流水
             cursor.execute('''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                            (datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), 'bailout_panic_sell', 'bailout_close',
                             float(contracts), current_price, 0.0, 0.0, 0.0, 0.0, 0.0))
             conn_log.commit()
+            print(f"   💾 平仓记录已同步至本地数据库: {db_name}")
                     
         # 5. 警报与推送
         log_system_alert("🆘 熔断跳伞", base_sym, f"微观崩塌 ({reason})，已市价斩仓逃生。")

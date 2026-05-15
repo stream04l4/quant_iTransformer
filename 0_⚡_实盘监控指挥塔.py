@@ -19,7 +19,7 @@ load_dotenv()
 from quant_config.config import (
     SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
-    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, MAX_MACRO_IMPACT
+    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI
 )
 
 # --- 核心配置路径 ---
@@ -228,7 +228,8 @@ def load_trade_history_for_symbol(symbol):
         df_live['trade_version'] = df_live.get('data_version', pd.Series(np.nan, index=df_live.index)).fillna("v1.0")
         df_live.insert(0, '交易对', symbol)
         return df_live
-    except Exception:
+    except Exception as e:
+        st.error(f"❌ 加载 {symbol} 交易历史失败: {e}")
         return pd.DataFrame()
 
 st.title("iTransformer 预测引擎")
@@ -522,7 +523,7 @@ for sym in actual_track_list:
         hist_data.append(df_hist)
 
 # ==========================================
-# 👇 核心修复：提前初始化兜底的空 DataFrame，防止新系统无数据时崩溃
+# 👇 核心修复：初始化兜底的 DataFrame
 # ==========================================
 combined_hist = pd.DataFrame()
 df_closed_trades = pd.DataFrame()
@@ -535,7 +536,8 @@ if hist_data:
     closed_records = []
     target_info_list = []
     entry_memory = {} 
-    rev_flags = [] # 👈 新增：全局跟踪反杀状态
+    rev_flags = [] 
+    is_closing_list = [] # 👈 新增：标记是否为平仓动作
     
     for idx, row in combined_hist.iterrows():
         sym = row['交易对']
@@ -543,58 +545,78 @@ if hist_data:
         px = float(row['fill_price'])
         ts = pd.to_datetime(row['exec_ts'])
         
-        # 提取开仓信息
-        if side in ['buy', 'sell']:
-            # 记录入场点
-            entry_memory[sym] = {
-                'px': px, 
-                'side': side, 
-                'lev': float(row.get('leverage', 3.0)), 
-                'ts': ts, 
-                'margin': float(row.get('margin_used', 100.0)),
-                'is_rev': row.get('is_ai_rev', False)
-            }
-            # 计算回测同款物理预期 (6% TP / 3% SL)
-            tp_move = abs(HARD_TP)
-            sl_move = abs(HARD_SL)
-            target_info_list.append(f"⏳ 预期: +{tp_move*100:.1f}% / -{sl_move*100:.1f}% (K线)")
-            
-        # 识别平仓动作 (兼容新旧标签)
-        elif side in ['close_long', 'close_short', 'exchange_close', 'bailout_close', 'bailout_panic_sell']:
-            mem = entry_memory.get(sym)
-            if mem and mem['px'] > 0:
+        # 智能识别逻辑：如果当前有持仓且动作相反，则判定为平仓
+        mem = entry_memory.get(sym)
+        is_opening = side in ['buy', 'sell']
+        is_closing_action = side in ['close_long', 'close_short', 'exchange_close', 'bailout_close', 'bailout_panic_sell']
+        
+        real_is_closing = False
+        if is_closing_action:
+            real_is_closing = True
+        elif is_opening and mem and mem.get('px', 0) > 0:
+            # 如果动作是 buy 且之前是 sell，或者动作是 sell 且之前是 buy -> 判定为平仓
+            if (side == 'buy' and mem['side'] == 'sell') or (side == 'sell' and mem['side'] == 'buy'):
+                real_is_closing = True
+
+        if real_is_closing:
+            # 执行平仓逻辑
+            is_closing_list.append(True)
+            if mem and mem.get('px', 0) > 0:
                 entry_px = mem['px']
                 entry_side = mem['side']
-                
-                # 核心逻辑：根据开仓方向判断盈亏量纲
                 if entry_side == 'buy':
                     raw_pnl = (px - entry_px) / entry_px
                 else:
                     raw_pnl = (entry_px - px) / entry_px
                 
                 real_roe = raw_pnl * mem['lev']
-                
                 closed_records.append({
                     'exec_ts': ts,
                     'symbol': sym,
                     'real_roe': real_roe,
                     'account_impact': (real_roe * mem['margin']) / initial_cap,
-                    'hold_hours': (ts - mem['ts']).total_seconds() / 3600
+                    'hold_hours': (ts - mem['ts']).total_seconds() / 3600,
+                    'version': mem.get('version', 'v1.0'), # 👈 继承入场时的血统
+                    'xgb_prob': mem.get('xgb_prob', 0.5)    # 👈 继承入场时的概率
                 })
-                
                 color = "🟢" if real_roe > 0 else "🔴"
                 target_info_list.append(f"{color} 实际: {real_roe:+.2%}")
-                # 清除内存锁，等待下一次开仓
+                rev_flags.append(False)
                 entry_memory[sym] = {'px': 0}
             else:
                 target_info_list.append("💰 历史遗留单 (匹配失败)")
+                rev_flags.append(False)
+        elif is_opening:
+            # 执行开仓逻辑
+            is_closing_list.append(False)
+            entry_memory[sym] = {
+                'px': px, 
+                'side': side, 
+                'lev': float(row.get('leverage', 1.0)), 
+                'ts': ts, 
+                'margin': float(row.get('margin_used', 100.0)),
+                'version': row.get('trade_version', 'v1.0'),
+                'xgb_prob': row.get('xgb_prob', 0.5)
+            }
+            tp_move = abs(HARD_TP)
+            sl_move = abs(HARD_SL)
+            target_info_list.append(f"⏳ 预期: +{tp_move*100:.1f}% / -{sl_move*100:.1f}%")
+            rev_flags.append(row.get('is_ai_rev', False))
         else:
+            is_closing_list.append(False)
             target_info_list.append("-")
             rev_flags.append(False)
             
-    combined_hist['预期/实际收益'] = target_info_list
-    combined_hist['is_ai_rev'] = rev_flags # 👈 将完整的一列反杀标记追加给 DataFrame
-    df_closed_trades = pd.DataFrame(closed_records)
+    if not combined_hist.empty:
+        # 补齐长度
+        while len(target_info_list) < len(combined_hist): target_info_list.append("-")
+        while len(rev_flags) < len(combined_hist): rev_flags.append(False)
+        while len(is_closing_list) < len(combined_hist): is_closing_list.append(False)
+        
+        combined_hist['预期/实际收益'] = target_info_list[:len(combined_hist)]
+        combined_hist['is_ai_rev'] = rev_flags[:len(combined_hist)]
+        combined_hist['is_closing_trade'] = is_closing_list[:len(combined_hist)] # 👈 写入标记
+        df_closed_trades = pd.DataFrame(closed_records)
 # ==========================================
 # 📍 历史本纪
 # ==========================================
@@ -620,11 +642,14 @@ with st.expander("查看由机器人自动执行的历史订单记录", expanded
             
         def map_side(row):
             x = row['方向']
+            is_closing = row.get('is_closing_trade', False)
             is_rev = row.get('is_ai_rev', False)
             flag = " 🔄(AI反杀)" if is_rev else ""
 
-            if x == 'buy': return "🟢 智能开多" + flag
-            if x == 'sell': return "🔴 智能开空" + flag
+            if x == 'buy':
+                return ("✔️ 智能平仓" if is_closing else "🟢 智能开多") + flag
+            if x == 'sell':
+                return ("✔️ 智能平仓" if is_closing else "🔴 智能开空") + flag
             if x == 'bailout_close': return "🎯 状态机止盈/损"
             if x == 'bailout_panic_sell': return "🆘 右脑紧急熔断"
             if x == 'exchange_close': return "🏁 交易所 OCO 触发"
@@ -633,14 +658,9 @@ with st.expander("查看由机器人自动执行的历史订单记录", expanded
         # 👇 【终极修复：先翻译中文方向，再根据中文方向决定是否显示胜率】
         display_hist['方向'] = display_hist.apply(map_side, axis=1)
         
-        display_hist['AI 预判胜率'] = combined_hist['xgb_prob']
-        display_hist['AI 预判胜率'] = display_hist.apply(
-            lambda row: f"{row['AI 预判胜率']:.1%}" if pd.notnull(row['AI 预判胜率']) and row['AI 预判胜率'] > 0 and ("进多" in str(row['方向']) or "进空" in str(row['方向'])) else "-", 
-            axis=1
-        )
         display_hist['滑点损耗'] = display_hist['滑点损耗'].apply(lambda x: f"{x:.3%}")
         display_hist['执行时成交价'] = display_hist['执行时成交价'].apply(lambda x: f"${float(x):,.4f}" if pd.notnull(x) else "N/A")
-        st.dataframe(display_hist[['执行时间', '交易对', '方向', 'AI 预判胜率', '开仓保证金', '执行时成交价', '预期/实际收益', '滑点损耗']], hide_index=True, width='stretch')
+        st.dataframe(display_hist[['执行时间', '交易对', '方向', '开仓保证金', '执行时成交价', '预期/实际收益', '滑点损耗']], hide_index=True, width='stretch')
     else:
         st.info("📭 本地数据库暂无机器人的自动开仓记录，请耐心等待首单信号。")  
 # ==========================================
@@ -1055,7 +1075,6 @@ st.sidebar.markdown(f"""
 | 🔴 K线物理止损 | `{HARD_SL*100:.1f}%` |
 | ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |
 | 📊 爆量乘数 | `{BAILOUT_VOL_MULTI}x` |
-| 🌐 宏观干预幅度 | `{MAX_MACRO_IMPACT*100:.1f}%` |
 | 🛡️ 资金使用率红线 | `{MAX_MARGIN_UTILIZATION:.0%}` |
 """)
 

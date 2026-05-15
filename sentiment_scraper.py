@@ -169,7 +169,7 @@ class TradFiScraper:
                     except Exception as e:
                         logging.warning(f"  ⚠️ {symbol} 极速 Tick 缝合失败，回退至基础 K 线: {e}")
 
-                    # 截取最后 8 根 K 线 (由于是 15m，这刚好代表了最近 2 小时的密集微观轨迹)
+                    # === 截取最后 8 根 K 线保留微观轨迹 (保留原逻辑) ===
                     recent_bars = hist.tail(8)
                     trend_data = []
                     
@@ -179,16 +179,27 @@ class TradFiScraper:
                             "close": round(float(row['Close']), 3)
                         })
                     
-                    # 计算这 2 小时跨度内的总体动能变化率
-                    first_close = float(recent_bars['Close'].iloc[0])
+                    # === 以下为新增与修改的核心逻辑 ===
                     last_close = float(recent_bars['Close'].iloc[-1])
-                    overall_delta_pct = (last_close - first_close) / first_close
+                    
+                    # 1. 精确提取 Rolling 24H 变化率 (解决“管中窥豹”未感知昨日大跌的问题)
+                    # 15分钟线一天理论上有 24 * 4 = 96 根，向后回溯找到最接近 24H 前的基准价
+                    lookback_idx = -96 if len(hist) >= 96 else 0
+                    price_24h_ago = float(hist['Close'].iloc[lookback_idx])
+                    daily_delta_pct = (last_close - price_24h_ago) / price_24h_ago
+                    
+                    # 2. 跨资产波动率标准化 (Price Z-Score)
+                    # 将现价放置在 5 日的统计分布中计算偏离度，抹平美债(波动极小)和纳指(波动极大)的底层差异
+                    period_mean = hist['Close'].mean()
+                    period_std = hist['Close'].std()
+                    # 防御性除法，防止除以 0
+                    z_score = (last_close - period_mean) / period_std if period_std > 0 else 0.0
                     
                     macro_data[name] = {
-                        # 👇 这里的 update_time 将精确到最近的 1 分钟！
                         "latest_update_time": (recent_bars.index[-1].tz_convert('UTC') if getattr(recent_bars.index[-1], 'tzinfo', None) else recent_bars.index[-1]).strftime('%Y-%m-%d %H:%M:%S UTC'),
                         "current_price": round(last_close, 3),
-                        "recent_trend_delta_pct": round(overall_delta_pct * 100, 3), 
+                        "daily_24h_delta_pct": round(daily_delta_pct * 100, 3),  # 👈 替换掉原先的 2h_delta
+                        "price_z_score": round(z_score, 2),                      # 👈 核心基准：统计学上的标准差偏离度
                         "recent_k_lines": trend_data 
                     }
             return macro_data
@@ -239,11 +250,12 @@ class DeepSeekMacroAgent:
 
         【跨市场流动性与权重打分基准 (Strict Rubric)】
         1. 权重 40%：美国宏观推力与跨市场溢出 (US Macro & Equities)
-           - 数据源：`us_macro_equities` 中的 K 线序列与最后更新时间。包含纳指 (Nasdaq_Futures)、美元指数 (US_Dollar_Index)、10年期美债 (US_10Y_Treasury)。
-           - ⚠️ 宏观逻辑铁律：
-             * 10年期美债收益率 (^TNX) 飙升代表无风险利率抬升与流动性收紧，对加密市场是重大【利空】。
-             * 美元指数 (DXY) 走强代表全球流动性回流美元及避险情绪升温 (Risk-off)，对加密市场是【利空】；美元走弱则是【利好】。
-             * 纳指上涨代表宏观风险偏好上升，是【利好】。
+           - 数据源：`us_macro_equities`。包含纳指、美元指数、10年期美债。
+           - ⚠️ 宏观逻辑铁律与 Z-Score 判定标准 (极为关键)：
+             你必须优先查看 `price_z_score` (价格的标准差偏离度) 与 `daily_24h_delta_pct`，不要受各资产绝对波动百分比的干扰。
+             * Z-Score 的统计学意义：0 附近为均值回归/横盘。|Z-Score| > 1.0 视为趋势形成，|Z-Score| > 2.0 视为极端单边暴涨/暴跌 (即 2 个标准差事件)。
+             * 10年期美债收益率 (^TNX) 与 美元指数 (DXY)：若 Z-Score > +1.5 且 24H 涨幅为正，代表全球流动性剧烈收紧，对 Crypto 构成【毁灭性打击】，直接给极低分；反之为【利好】。
+             * 纳斯达克 (NQ=F)：若 Z-Score < -1.5 且 24H 涨幅显著为负（例如跌幅超过 1%），代表风险资产崩盘溢出，对 Crypto 是【重大利空】；反之为【利好】。
            - ⚠️ 数据时效与休市逻辑（严格执行）：【唯一】判断休市的标准是美股数据的 `latest_update_time` 距离【当前系统绝对时间】明确超过 2 小时（此时降权至 10%）。如果时间差在 2 小时以内（如仅相差几分钟到1小时），代表美股**正在正常交易中**，你**绝对不可**以任何理由判定为“休市”，必须维持 40% 的满额权重！
 
         2. 权重 30%：Crypto 核心基本面与机构资金 (Institutional Crypto Fundamentals)
@@ -269,7 +281,7 @@ class DeepSeekMacroAgent:
 
         【物理限速锁与历史多重锚点防漂移机制 (State Drift Prevention)】：
         如果用户提供了【历史打分基线】（包含 T-1、T-10、T-50），你必须按以下严格逻辑使用它们：
-        1. T-1 (上一次)：作为短期平滑锚点。除非你在极鲜数据中读到末日/史诗级事件，否则本次打分与 T-1 的绝对差值（Delta）不允许超过 ±0.3。如果数据无显著变化，允许打同分。
+        1. T-1 (上一次)：作为短期平滑锚点。在常规震荡市中，本次打分与 T-1 的绝对差值（Delta）尽量控制在 ±0.3 以内。但【例外铁律】：如果 `recent_5d_delta_pct` 显示宏观资产（如美债或美元）出现强劲单边趋势，或者 `hot_news` 包含行业巨震事件，你必须打破 ±0.3 的限制，直接给出符合当前极端情况的跳空打分，不可被 T-1 拖累。
         2. T-10 (往前第10次)：作为中期趋势校准锚点。评估当前情绪相比中期周期是处于升温还是降温阶段。
         3. T-50 (往前第50次)：作为长期均值回归 (Mean Reversion) 锚点。防止在连续的微小 Delta 累加下产生长期的“分数漂移”。如果当前宏观基本面与 T-50 时期相似，你的分数趋势应当向 T-50 靠拢收敛。
         
@@ -348,13 +360,16 @@ def compress_historical_context(raw_json_str):
         data = json.loads(raw_json_str)
         compressed = {}
         
-        # 1. 提取宏观资产现价
         macro = data.get("us_macro_equities", {})
         if macro:
-            compressed["US_10Y_Treasury"] = macro.get("US_10Y_Treasury", {}).get("current_price")
-            compressed["US_Dollar_Index"] = macro.get("US_Dollar_Index", {}).get("current_price")
-            compressed["Nasdaq_Futures"] = macro.get("Nasdaq_Futures", {}).get("current_price")
-            
+            for asset in ["US_10Y_Treasury", "US_Dollar_Index", "Nasdaq_Futures"]:
+                asset_data = macro.get(asset, {})
+                if asset_data:
+                    compressed[asset] = {
+                        "price": asset_data.get("current_price"),
+                        "z_score": asset_data.get("price_z_score"),
+                        "daily_delta": asset_data.get("daily_24h_delta_pct")
+                    }   
         # 2. 提取多空比和贪婪指数
         pos = data.get("market_position", {})
         if pos:

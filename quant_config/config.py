@@ -76,8 +76,11 @@ HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.03))
 
 # --- 实盘专用风控与仓位参数 ---
 TRADE_COOLDOWN_SEC = 3500            # 开仓后防连续发车冷却时间(秒)
-MAX_MACRO_IMPACT = 0.05              # 宏观情绪对模型输出概率的最大干预幅度(如0.03=3%)
-MACRO_CHECK_INTERVAL = 1800          # 宏观情报拉取间隔(秒)
+# 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
+MACRO_ALPHA_TOP_10 = 1.20            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
+MACRO_ALPHA_TOP_5 = 0.50             # Tier 2 (波段加仓): 宏观权重中等
+MACRO_ALPHA_TOP_1 = 0.15             # Tier 3 (激进杠杆): 宏观权重极低，尊重微观量价动能
+
 HEARTBEAT_INTERVAL = 10              # 实盘高频心跳间隔(秒)
 MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC/ETH最大notional(USDT)
 MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
