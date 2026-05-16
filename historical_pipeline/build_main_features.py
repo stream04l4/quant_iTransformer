@@ -382,21 +382,34 @@ def build_features(horizon):
 
         ((build_rsi_expr("close", 14) - 50) / 50.0).alias("rsi_14"),
         ((build_rsi_expr("close", 48) - 50) / 50.0).alias("rsi_48"),
+        
         # 🚨 [修改] TBRD: 主动买入占比的差分(加速度)，捕捉资金突袭
         (pl.col("taker_buy_volume") / (pl.col("volume") + 1e-9)).diff().alias("taker_ratio_delta"),
-        (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("avg_trade_size"), # 修正命名逻辑，真实含义为平均交易粒度
+        (pl.col("quote_volume") / (pl.col("count") + 1e-9)).alias("avg_trade_size"), 
         
-        # 🚨 Alpha 1: Open Interest 持仓动能与价格背离交叉乘积
-        ((pl.col("sum_open_interest") - pl.col("sum_open_interest").shift(1)) / (pl.col("sum_open_interest").shift(1) + 1e-9)).alias("oi_delta_pct"),
+        # ==========================================================
+        # 🚨 终极护城河修改区 (开始)
+        # ==========================================================
+        
+        # 🚨 Alpha 1: Open Interest (修复 91万亿溢出，使用 Null 丢弃宕机恢复行)
+        pl.when(pl.col("sum_open_interest").shift(1).abs() > 1e-6)
+          .then(((pl.col("sum_open_interest") - pl.col("sum_open_interest").shift(1)) / pl.col("sum_open_interest").shift(1)).clip(-1.0, 1.0))
+          .otherwise(None)
+          .alias("oi_delta_pct"),
+          
         pl.col("sum_toptrader_long_short_ratio").alias("ls_ratio"),
         
-        # 🚨 Alpha 3: Amihud 流动性消耗率 (对数尺度)
+        # 🚨 Alpha 3: Amihud 流动性消耗率 (增加 clip 保护，防止极端缩量暴涨)
         (
             (pl.col("log_return").abs() / (pl.col("quote_volume") + 1e-9)) + 1e-12
-        ).log().alias("amihud_illiquidity"),
+        ).log().clip(-50.0, 50.0).alias("amihud_illiquidity"),
         
-        # 🚨 [新增] RVTS: 波动率期限结构 (1h极短期波动 vs 24h基准波动)
-        (pl.col("realized_vol_1h") / (pl.col("realized_vol_1h").rolling_mean(window_size=24) + 1e-9)).alias("rv_term_structure"),
+        # 🚨 [新增] RVTS: 波动率期限结构 (增加 clip 保护，防止死水行情方差趋近于0引发爆发)
+        (pl.col("realized_vol_1h") / (pl.col("realized_vol_1h").rolling_mean(window_size=24) + 1e-9)).clip(0.0, 50.0).alias("rv_term_structure"),
+        
+        # ==========================================================
+        # 🚨 终极护城河修改区 (结束)
+        # ==========================================================
 
         # 🚨 [修改] FRM: 资金费率动量 (24h均线 - 72h均线)，过滤长期极化噪音
         (pl.col("last_funding_rate").rolling_mean(window_size=24) - pl.col("last_funding_rate").rolling_mean(window_size=72)).alias("funding_rate_momentum"),
@@ -432,10 +445,9 @@ def build_features(horizon):
             .unique(subset=["hour_timestamp"], keep="last")
         )
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
-            pl.col("cvd").fill_null(0),
-            pl.col("whale_net_flow").fill_null(0),
-            # 剔除 backward 填充，防止开局缺失时使用未来行倒填，直接使用 0.1(10%) 兜底
-            pl.col("retail_ratio").fill_null(strategy="forward").fill_null(0.1)
+            pl.col("cvd").fill_nan(0).fill_null(0),
+            pl.col("whale_net_flow").fill_nan(0).fill_null(0),
+            pl.col("retail_ratio").fill_nan(None).fill_null(strategy="forward").fill_null(0.1)
         ])
     else:
         print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")
@@ -487,14 +499,31 @@ def build_features(horizon):
 
     features = features.select(final_cols)
 
-    # 🔍 核心诊断：在 drop_nulls 前查验空值
-    print("\n🩺 [空值诊断] 正在扫描异常的空列...")
+    print("\n🩺 [极值诊断] 启动全局 NaN / Inf 强制清洗网...")
+    
+    # 获取所有浮点数列
+    float_cols = [c for c, dtype in features.schema.items() if dtype in (pl.Float32, pl.Float64)]
+    
+    # 1. 绞杀所有 NaN 转化为 Null
+    features = features.with_columns([
+        pl.col(c).fill_nan(None).alias(c) for c in float_cols
+    ])
+    
+    # 2. 绞杀所有 Infinity 转化为 Null
+    features = features.with_columns([
+        pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c) for c in float_cols
+    ])
+
+    print("\n🩺 [空值诊断] 正在扫描异常空列 (脏数据已被全部转化为 Null)...")
     null_report = features.null_count()
     with pl.Config(tbl_cols=-1):
         print(null_report)
 
-    # 最后只剥离正常的尾部空值 (如 target_24h_return 产生的末端空位)
+    # 无漏网之鱼，安全执行空值剥离
+    before_rows = features.height
     features = features.drop_nulls()
+    after_rows = features.height
+    print(f"🧹 drop_nulls 清洗完成: 删除 {before_rows - after_rows} 行，剩余 {after_rows} 行")
     
     current_date = datetime.now().strftime("%Y%m%d")
     # 👇 文件名加上了 {horizon}h 的标志

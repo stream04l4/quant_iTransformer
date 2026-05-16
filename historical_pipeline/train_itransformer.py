@@ -173,6 +173,11 @@ def train_model():
                 loss = criterion(output, batch_y)
             
             scaler.scale(loss).backward()
+            
+            # 🚨 护城河：执行梯度裁剪，防止偶尔的数值尖峰炸毁 Transformer 权重
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             

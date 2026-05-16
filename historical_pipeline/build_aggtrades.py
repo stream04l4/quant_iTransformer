@@ -68,7 +68,10 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
         pl.col("quantity").filter(pl.col("quantity") <= RETAIL_THRESHOLD).sum().alias("retail_vol"),
     ]).with_columns([
         (pl.col("whale_buy") - pl.col("whale_sell")).alias("whale_net_flow"),
-        (pl.col("retail_vol") / pl.col("total_volume")).alias("retail_ratio")
+        pl.when(pl.col("total_volume") > 0)
+            .then(pl.col("retail_vol") / pl.col("total_volume"))
+            .otherwise(None)
+            .alias("retail_ratio")
     ]).sort("hour_timestamp")
 
     final_df = hourly_features.select([

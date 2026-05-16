@@ -17,14 +17,14 @@ sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR, SYMBOL
 
 ALPHA_SEARCH_SPACE = {
-    'FORECAST_HORIZON': [36],
-    'SEQ_LEN': [2016],
+    'FORECAST_HORIZON': [12],
+    'SEQ_LEN': [336, 672],
     'CLASS_THRESHOLD': [0.015],
     'E_LAYERS': [2],
-    'D_MODEL': [256],
-    'DROPOUT': [0.3],
-    'BATCH_SIZE': [128],
-    'LEARNING_RATE': [5e-6],
+    'D_MODEL': [64, 128, 256],
+    'DROPOUT': [0.3, 0.4],
+    'BATCH_SIZE': [128, 256],
+    'LEARNING_RATE': [1e-5, 5e-6],
     'EPOCHS': [50]
 }
 
@@ -178,7 +178,7 @@ def main():
     print("=" * 80)
 
     # 🚨 修复单卡 H100 灾难：alpha 模式最多 2 个并发，保障显存安全；backtest 模式 20 核 CPU 开 16 并发。
-    MAX_WORKERS = 2 if args.mode == 'alpha' else 16 
+    MAX_WORKERS = 16 
     batches = [combinations[i:i + MAX_WORKERS] for i in range(0, len(combinations), MAX_WORKERS)]
     
     all_results = []

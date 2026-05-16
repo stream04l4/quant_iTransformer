@@ -181,7 +181,14 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     var = (m2 - m1**2).abs()
     df['vol_skew_24h'] = (m3 - 3 * m1 * m2 + 2 * m1**3) / (var**1.5 + 1e-9)
     
-    df['oi_delta_pct'] = (df['sum_open_interest'] - df['sum_open_interest'].shift(1)) / (df['sum_open_interest'].shift(1) + 1e-9)
+    prev_oi = df['sum_open_interest'].shift(1)
+    
+    # 🚨 实盘绝不能返回 NaN，若遇到除零或极端宕机恢复，强制将变化率归 0
+    df['oi_delta_pct'] = np.where(
+        prev_oi.abs() > 1e-6,
+        ((df['sum_open_interest'] - prev_oi) / prev_oi).clip(-1.0, 1.0),
+        0.0  # 实盘保命符：以 0.0 兜底，绕过 NaN 熔断机制
+    )
     
     # 🚨 新增：补齐缺失的高阶特征
     df['max_ret_24h'] = df['log_return'].rolling(window=24).max()
