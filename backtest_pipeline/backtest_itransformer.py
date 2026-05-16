@@ -139,8 +139,9 @@ def run_backtest():
     benchmark_prices = []
     
     current_pos = 0          
-    hold_timer_mins = 0           
-    entry_price = 0.0        
+    current_tier = 0         # 👈 新增：记录当前阶梯水位
+    hold_timer_mins = 0      
+    entry_price = 0.0     
     trade_start_equity = 1.0 
     current_leverage = 0.0   
     entry_time = None
@@ -196,29 +197,32 @@ def run_backtest():
             break
 
         # ------------------------------------------
-        # 1. 寻找开仓机会 (1h 级别)
+        # 1. 寻找开仓与【阶梯加仓】机会 (1h 级别)
         # ------------------------------------------
-        if current_pos == 0:
-            target_pos = 0
-            dynamic_leverage = 0.0
+        target_pos = 0
+        target_tier = 0
+        target_leverage = 0.0
 
-            if p_up > th["up_top_1"]:      target_pos = 1; dynamic_leverage = LEVERAGE_3
-            elif p_up > th["up_top_5"]:    target_pos = 1; dynamic_leverage = LEVERAGE_2
-            elif p_up > th["up_top_10"]:   target_pos = 1; dynamic_leverage = LEVERAGE_1
+        if p_up > th["up_top_1"]:      target_pos = 1; target_tier = 3; target_leverage = LEVERAGE_3
+        elif p_up > th["up_top_5"]:    target_pos = 1; target_tier = 2; target_leverage = LEVERAGE_2
+        elif p_up > th["up_top_10"]:   target_pos = 1; target_tier = 1; target_leverage = LEVERAGE_1
+        elif p_down > th["down_top_1"]:  target_pos = -1; target_tier = 3; target_leverage = LEVERAGE_3
+        elif p_down > th["down_top_5"]:  target_pos = -1; target_tier = 2; target_leverage = LEVERAGE_2
+        elif p_down > th["down_top_10"]: target_pos = -1; target_tier = 1; target_leverage = LEVERAGE_1
 
-            elif p_down > th["down_top_1"]:  target_pos = -1; dynamic_leverage = LEVERAGE_3
-            elif p_down > th["down_top_5"]:  target_pos = -1; dynamic_leverage = LEVERAGE_2
-            elif p_down > th["down_top_10"]: target_pos = -1; dynamic_leverage = LEVERAGE_1
-
-            if target_pos != 0 and exec_idx_1h < len(opens_1h):
+        if target_pos != 0 and exec_idx_1h < len(opens_1h):
+            current_hour_open = opens_1h[exec_idx_1h]
+            
+            # 💡 情景 A: 绝对空仓，首次建仓
+            if current_pos == 0:
                 current_pos = target_pos
-                current_leverage = dynamic_leverage
+                current_tier = target_tier
+                current_leverage = target_leverage
                 hold_timer_mins = HOLD_PERIOD * 60 
                 
-                entry_price = opens_1h[exec_idx_1h] 
+                entry_price = current_hour_open 
                 entry_time = ts_1h[exec_idx_1h]
                 
-                # 🚨 财务修复 1：严格记录入场成本并锁定账本基数
                 trade_start_equity = equity 
                 open_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
                 equity = trade_start_equity - open_cost 
@@ -230,6 +234,47 @@ def run_backtest():
                 max_unrealized_phys_pnl = 0.0   
                 trailing_active = False         
                 dynamic_sl_phys = -abs(HARD_SL) 
+
+            # 💡 情景 B: 同向持仓，且触发了更高的 Tier (执行金字塔加仓)
+            elif current_pos == target_pos and target_tier > current_tier:
+                # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
+                if current_pos == 1:
+                    absolute_sl_price = entry_price * (1 + dynamic_sl_phys)
+                else:
+                    absolute_sl_price = entry_price * (1 - dynamic_sl_phys)
+                    
+                # 【对齐 OMS 物理逻辑】：直接累加新杠杆
+                added_leverage = target_leverage
+                old_notional = trade_start_equity * current_leverage
+                new_notional = trade_start_equity * added_leverage
+                
+                old_size = old_notional / entry_price
+                new_size = new_notional / current_hour_open
+                total_size = old_size + new_size
+                
+                # 重新计算加仓后的加权持仓均价
+                avg_entry_price = (old_notional + new_notional) / total_size
+                
+                # 扣除新增仓位的摩擦成本
+                added_open_cost = trade_start_equity * added_leverage * (FEE_RATE + SLIPPAGE)
+                open_cost += added_open_cost
+                equity -= added_open_cost 
+                
+                # 更新全局状态机
+                entry_price = avg_entry_price
+                current_leverage += added_leverage
+                current_tier = target_tier
+                
+                # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
+                if current_pos == 1:
+                    new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
+                    max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
+                else:
+                    new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
+                    max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
+                    
+                # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
+                dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
 
         # ------------------------------------------
         # 2. 1分钟级别显微镜追踪持仓
@@ -324,6 +369,7 @@ def run_backtest():
             if liquidated:
                 equity = 0
                 current_pos = 0
+                current_tier = 0
                 equity_curve.append(0)
                 print(f"💀 盘中分钟级扎针爆仓！发生于 {signal_time}")
                 trade_count += 1
@@ -346,6 +392,7 @@ def run_backtest():
                 
                 trade_count += 1
                 current_pos = 0 
+                current_tier = 0
                 current_leverage = 0.0
                 
                 pnl_list.append(trade_pnl / trade_start_equity)

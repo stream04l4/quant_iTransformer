@@ -13,14 +13,16 @@ from state_manager import state
 import sqlite3
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
-    LIVE_SEQ_LEN, LIVE_D_MODEL, LIVE_E_LAYERS, LIVE_CLASS_THRESHOLD, LIVE_DROPOUT,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     TRADE_COOLDOWN_SEC, MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR  
 )
+
 # ==========================================
 # 1. 加载实盘配置 (基于 EXPERIMENT_ID 精准定位)
 # ==========================================

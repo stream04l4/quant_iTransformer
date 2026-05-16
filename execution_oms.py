@@ -360,6 +360,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # ---------------------------------------------------------
         # 3. 核心市价开仓 (增强参数传递)
         # ---------------------------------------------------------
+        # ✅ Gate.io 官方 API：rule=1 是 >=，rule=2 是 <=
+        # 多单 (buy) 止损在下方，需跌破触发，故 rule=2。你的原版逻辑是正确的！
         if side == 'buy':  
             tp_rule, sl_rule = 1, 2  
         else:              
@@ -367,15 +369,33 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
 
         native_symbol = exchange_private.market_id(gate_symbol)
 
-        # 内部挂单重试闭包函数 (已改造为精确张数平仓)
+        # 🚨 修复 1：安全的四舍五入防截断 + close=True 防止仓位翻倍
         def safe_post_condition(rule, price, text_label, stop_size):
-            exact_size = int(stop_size)
+            exact_size = int(round(float(stop_size)))
+            if exact_size <= 0:
+                msg_err = f"⚠️ 计算所得止损张数 ({exact_size}) <= 0，放弃挂载止损单。"
+                print(msg_err)
+                log_system_alert("⚠️ 止损挂单异常", symbol, msg_err)
+                return False
+                
             for attempt in range(3):
                 try:
                     exchange_private.private_futures_post_settle_price_orders({
                         "settle": "usdt",
-                        "initial": {"contract": native_symbol, "size": exact_size, "close": False, "price": "0", "tif": "ioc", "text": text_label},
-                        "trigger": {"strategy_type": 0, "price_type": 1, "price": str(exchange_private.price_to_precision(gate_symbol, price)), "rule": rule}
+                        "initial": {
+                            "contract": native_symbol, 
+                            "size": exact_size, 
+                            "close": True,       # 极其关键：标记为平仓专属，防止反向开仓
+                            "price": "0", 
+                            "tif": "ioc", 
+                            "text": text_label
+                        },
+                        "trigger": {
+                            "strategy_type": 0, 
+                            "price_type": 1, 
+                            "price": str(exchange_private.price_to_precision(gate_symbol, price)), 
+                            "rule": rule
+                        }
                     })
                     return True
                 except Exception as e:
@@ -419,10 +439,10 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         time.sleep(1.5) 
         try:
             verify_stops = exchange_private.fetch_open_orders(gate_symbol, params={'stop': True})
-            active_texts = [o.get('clientOrderId', '') or o['info'].get('initial', {}).get('text', '') for o in verify_stops]
+            active_texts = [str(o.get('clientOrderId', '') or o['info'].get('initial', {}).get('text', '')).lower() for o in verify_stops]
             
-            # 校验只查 SL 是否存在即可
-            if len(verify_stops) >= 1 or 'sl' in active_texts:
+            # 🚨 修复 2：只要含有 sl 字样即算挂单成功，防止因 'sl_tier' != 'sl' 造成的 Python 语法误判
+            if len(verify_stops) >= 1 and any('sl' in t for t in active_texts):
                 print("🔔 交易所底层 OCO 兜底止损单【挂单且物理校验成功】！")
             else:
                 msg_oco_fail = f"物理兜底止损单校验未完全通过 (现存: {len(verify_stops)}个)，可能存在遗漏，交由右脑兜底。"

@@ -91,24 +91,52 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
 
 def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
-    """向交易所发送 API：撤销旧追踪，挂载统管全局的新追踪止损"""
-    try:
-        # 1. 撤销旧单：一旦右脑接管，清理掉所有碎片化止损
-        for o in ex.fetch_open_orders(gate_symbol, params={'stop': True}):
-            try: ex.cancel_order(o['id'], gate_symbol, params={'stop': True})
-            except: pass
+    """向交易所发送 API：先挂载新追踪止损，成功后再撤销旧追踪，杜绝裸奔窗口"""
+    exact_size = int(round(float(pos_size)))
+    if exact_size <= 0:
+        return False
         
-        # 2. 挂载新追踪单：采用精确张数与 close:False (与 execution_oms.py 一致)
+    try:
+        # 1. Gate.io 官方 API 规则对齐：多单止损需跌破触发(rule 2)
         rule = 2 if pos_side == 'LONG' else 1
         native_symbol = ex.market_id(gate_symbol)
+        
+        # 🚨 修复 3：生成带有精确时间戳的唯一标识符
+        unique_sl_text = f"tsl_{int(time.time()*1000)}"
+        
+        # 2. 先建立新防线
         ex.private_futures_post_settle_price_orders({
             "settle": "usdt",
-            "initial": {"contract": native_symbol, "size": int(pos_size), "close": False, "price": "0", "tif": "ioc", "text": "trailing_sl"},
-            "trigger": {"strategy_type": 0, "price_type": 1, "price": str(ex.price_to_precision(gate_symbol, new_sl_price)), "rule": rule}
+            "initial": {
+                "contract": native_symbol, 
+                "size": exact_size, 
+                "close": True,       # 标记平仓单
+                "price": "0", 
+                "tif": "ioc", 
+                "text": unique_sl_text
+            },
+            "trigger": {
+                "strategy_type": 0, 
+                "price_type": 1, 
+                "price": str(ex.price_to_precision(gate_symbol, new_sl_price)), 
+                "rule": rule
+            }
         })
+
+        # 3. 新单挂载成功后，立刻拉取现有止损单，撤除所有不是该 unique_sl_text 的单子
+        time.sleep(0.5) 
+        stops = ex.fetch_open_orders(gate_symbol, params={'stop': True})
+        for o in stops:
+            t = str(o.get('clientOrderId', '') or o['info'].get('initial', {}).get('text', '')).lower()
+            if t != unique_sl_text:
+                try: 
+                    ex.cancel_order(o['id'], gate_symbol, params={'stop': True})
+                except Exception: 
+                    pass
+                    
         return True
     except Exception as e:
-        print(f"   ⚠️ 交易所止损单上移请求失败 (等待下秒重试): {e}")
+        print(f"   ⚠️ 交易所追踪止损单上移请求失败 (保留原防线兜底): {e}")
         return False
 
 def bailout_worker():
@@ -206,11 +234,31 @@ def bailout_worker():
                         'dynamic_sl_phys': -abs(hard_sl),
                         'trailing_active': False,
                         'entry_time': entry_time,
-                        'last_sl_update_px': 0.0
+                        'last_sl_update_px': 0.0,
+                        'last_entry_px': entry_px  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
                     }
                     
                 mem = tracking_mem[base_sym]
-                
+                # ---------------------------------------------------------
+                # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
+                # ---------------------------------------------------------
+                if 'last_entry_px' not in mem: 
+                    mem['last_entry_px'] = entry_px
+                    
+                # 如果交易所最新返回的均价和我们内存中的均价偏差超过 0.01%，说明触发了实盘加仓！
+                if abs(entry_px - mem['last_entry_px']) / mem['last_entry_px'] > 0.0001:
+                    # 记住当时的物理绝对止损价格
+                    if pos_side == 'LONG':
+                        abs_sl = mem['last_entry_px'] * (1 + mem['dynamic_sl_phys'])
+                        mem['dynamic_sl_phys'] = max((abs_sl - entry_px) / entry_px, -abs(hard_sl))
+                        mem['max_phys_pnl'] = (current_close - entry_px) / entry_px
+                    else:
+                        abs_sl = mem['last_entry_px'] * (1 - mem['dynamic_sl_phys'])
+                        mem['dynamic_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
+                        mem['max_phys_pnl'] = (entry_px - current_close) / entry_px
+                        
+                    mem['last_entry_px'] = entry_px
+                    print(f"⚖️ [{base_sym}] 右脑侦测到阶梯加仓行为！新均价 ${entry_px:.4f}，已平移止损防线防止误杀。")
                 # ---------------------------------------------------------
                 # 📈 轨道 1：动态物理状态机 (更新底层 OCO 止损单)
                 # ---------------------------------------------------------
