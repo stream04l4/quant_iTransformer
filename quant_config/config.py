@@ -113,16 +113,3 @@ E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.3))
 
 CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))
-
-# ==========================================
-# 6.1 实盘模型拓扑与架构超参数 (严格隔离命名空间)
-# ==========================================
-# 使用 LIVE_ 前缀，即使与回测在同一个环境中运行，也不会发生全局变量污染
-LIVE_SEQ_LEN = int(os.environ.get("LIVE_SEQ_LEN", 336))
-
-# BATCH_SIZE, EPOCHS, LEARNING_RATE 是训练期算子参数，不参与实盘推理，故不予设立
-
-LIVE_D_MODEL = int(os.environ.get("LIVE_D_MODEL", 256))
-LIVE_E_LAYERS = int(os.environ.get("LIVE_E_LAYERS", 2))
-LIVE_DROPOUT = float(os.environ.get("LIVE_DROPOUT", 0.3)) 
-LIVE_CLASS_THRESHOLD = float(os.environ.get("LIVE_CLASS_THRESHOLD", 0.015))

@@ -19,7 +19,8 @@ load_dotenv()
 from quant_config.config import (
     SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
-    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI
+    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
+    FORECAST_HORIZON
 )
 
 # --- 核心配置路径 ---
@@ -27,6 +28,16 @@ ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
 
 # --- UI 页面配置与高频轮询开关 ---
 st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
+ 
+# --- 🧠 加载概率门槛 ---
+th = {}
+try:
+    json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{FORECAST_HORIZON}h.json")
+    if os.path.exists(json_path):
+        with open(json_path, 'r') as f:
+            th = json.load(f)
+except Exception:
+    pass
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -143,11 +154,24 @@ with st.sidebar:
 
 
 # --- 资产组合监控模块 (Portfolio Monitor) ---
+PORTFOLIO_SNAPSHOT_GRACE_SEC = 12
+
 def get_gate_portfolio():
-    """ 架构解耦：直接读取 engine.py 在后台写好的本地 JSON 快照，0 网络请求！"""
+    """架构解耦：读取本地快照，并对瞬时空快照做短暂抗抖处理。"""
     state_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json")
+    cache_key = "portfolio_snapshot_cache"
+
+    def load_cached_snapshot():
+        cached = st.session_state.get(cache_key)
+        if not cached:
+            return None, [], []
+        cache_age = time.time() - cached.get('cached_at', 0)
+        if cache_age > PORTFOLIO_SNAPSHOT_GRACE_SEC:
+            return None, [], []
+        return cached['balance'], cached['positions'], cached['open_stops']
+
     if not os.path.exists(state_file):
-        return None, [], []
+        return load_cached_snapshot()
     try:
         with open(state_file, 'r') as f:
             state = json.load(f)
@@ -155,11 +179,36 @@ def get_gate_portfolio():
         balance = state.get('balance', {})
         positions = state.get('positions', [])
         open_stops = state.get('open_stops', [])
+        updated_at = float(state.get('updated_at', 0) or 0)
         
-        active_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
-        return balance, active_positions, open_stops
-    except Exception as e:
-        return None, [], []
+        active_positions = [p for p in positions if abs(float(p.get('contracts', 0) or 0)) > 1e-8]
+        cached = st.session_state.get(cache_key)
+        cached_positions = cached.get('positions', []) if cached else []
+
+        is_suspicious_empty = (
+            not active_positions
+            and bool(cached_positions)
+            and (time.time() - cached.get('cached_at', 0) <= PORTFOLIO_SNAPSHOT_GRACE_SEC)
+        ) if cached else False
+
+        if is_suspicious_empty:
+            return cached['balance'], cached['positions'], cached['open_stops']
+
+        has_meaningful_snapshot = bool(balance) or bool(active_positions) or bool(open_stops)
+        is_fresh = updated_at > 0 and (time.time() - updated_at) <= PORTFOLIO_SNAPSHOT_GRACE_SEC
+
+        if has_meaningful_snapshot or is_fresh:
+            st.session_state[cache_key] = {
+                'balance': balance,
+                'positions': active_positions,
+                'open_stops': open_stops,
+                'cached_at': time.time(),
+            }
+            return balance, active_positions, open_stops
+
+        return load_cached_snapshot()
+    except Exception:
+        return load_cached_snapshot()
 
 
 def load_trade_history_for_symbol(symbol):
@@ -1076,6 +1125,9 @@ st.sidebar.markdown(f"""
 | ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |
 | 📊 爆量乘数 | `{BAILOUT_VOL_MULTI}x` |
 | 🛡️ 资金使用率红线 | `{MAX_MARGIN_UTILIZATION:.0%}` |
+| --- | --- |
+| **📈 做多门槛 (Tier 1/2/3)** | `{th.get('up_top_10', 0):.2%} / {th.get('up_top_5', 0):.2%} / {th.get('up_top_1', 0):.2%}` |
+| **📉 做空门槛 (Tier 1/2/3)** | `{th.get('down_top_10', 0):.2%} / {th.get('down_top_5', 0):.2%} / {th.get('down_top_1', 0):.2%}` |
 """)
 
 st.sidebar.divider()
@@ -1173,8 +1225,8 @@ def render_market_radar():
         # 通过多空原始概率动态推导震荡概率 (保证和为1)
         p_flat = max(0.0, 1.0 - p_up - p_down)
         
-        adj_p_up = inference_data.get("adj_prob_up", p_up)
-        adj_p_down = inference_data.get("adj_prob_down", p_down)
+        adj_p_up = inference_data.get("adj_prob_up_tier1", p_up)
+        adj_p_down = inference_data.get("adj_prob_down_tier1", p_down)
         
         is_uptrend_proxy = current_price > (df_actual['close'].mean() if not df_actual.empty else current_price)
         ema_macro_slope = 0.001 if is_uptrend_proxy else -0.001
@@ -1193,7 +1245,7 @@ def render_market_radar():
         c1, c2, c3, c4, c5 = st.columns(5)
         
         c1.metric("当前标的价格", f"${current_price:,.4f}")
-        c2.metric("宏观情绪加成", f"{macro_score:+.2%}", delta_color="normal" if macro_score != 0 else "off")
+        c2.metric("宏观情绪加成", f"{macro_score:+.2f}", delta_color="normal" if macro_score != 0 else "off")
         c3.metric("看涨概率 (p_up)", f"{adj_p_up:.2%}", f"原始: {p_up:.2%}")
         c4.metric("震荡概率 (p_flat)", f"{p_flat:.2%}")
         c5.metric("看跌概率 (p_down)", f"{adj_p_down:.2%}", f"原始: {p_down:.2%}")

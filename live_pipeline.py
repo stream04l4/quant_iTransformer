@@ -22,14 +22,14 @@ from quant_config.config import (
     EXPERIMENT_ID, TRAIN_DATA_DIR  
 )
 # ==========================================
-# 1. 加载实盘配置 (固定单模型路径)
+# 1. 加载实盘配置 (基于 EXPERIMENT_ID 精准定位)
 # ==========================================
 GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 🚨 对齐用户指定的文件名
-MODEL_PATH = MODEL_DIR / f"itransformer_BTCUSDT_best_{FORECAST_HORIZON}h.pth" 
-JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{FORECAST_HORIZON}h.json"
+# 🚨 修复 1：基于 EXPERIMENT_ID 精准定位，防止加载成别的策略包
+MODEL_PATH = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth" 
+JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
@@ -160,9 +160,12 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     
     for p in [14, 48]:
         delta = df['close'].diff()
-        gain = delta.clip(lower=0).ewm(span=p, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(span=p, adjust=False).mean()
+        gain = delta.clip(lower=0).ewm(alpha=1.0/p, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0/p, adjust=False).mean()
         df[f'rsi_{p}'] = ((100 - (100 / (1 + gain / (loss + 1e-9)))) - 50) / 50.0
+
+    # 🚨 修复 2：补齐缺漏的掩码特征。实盘数据均为物理真实发生，不存在断网填充，恒为 0
+    df['is_synthetic'] = 0.0
 
     for w in [24, 72, 168]:
         low_min = df['low'].rolling(window=w).min()
@@ -221,7 +224,7 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     for col in final_cols:
         if col not in df.columns: df[col] = np.nan
 
-    inference_window = df[final_cols].iloc[-LIVE_SEQ_LEN:]
+    inference_window = df[final_cols].iloc[-ACTUAL_SEQ_LEN:]
     
     if inference_window.isnull().any().any():
         missing_cols = inference_window.columns[inference_window.isnull().any()].tolist()
@@ -294,29 +297,42 @@ def run_live():
     threading.Thread(target=bailout_worker, daemon=True).start()
     
     # --- 1. 加载单一神级模型 ---
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"❌ 找不到模型权重，请检查 EXPERIMENT_ID 是否正确: {MODEL_PATH}")
+        
     print(f"📥 正在加载模型权重: {MODEL_PATH}")
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    feature_cols = checkpoint['feature_cols']
     
-    # 动态构建网络拓扑
-    dynamic_n_heads = max(2, LIVE_D_MODEL // 16) 
-    dynamic_d_ff = LIVE_D_MODEL * 4
+    # 🚨 修复 2：彻底丢弃 LIVE_D_MODEL 等伪隔离参数，全量从 Checkpoint 提取拓扑
+    feature_cols = checkpoint['feature_cols']
+    ckpt_seq_len = checkpoint.get('seq_len')
+    ckpt_d_model = checkpoint.get('d_model')
+    ckpt_n_heads = checkpoint.get('n_heads')
+    ckpt_d_ff = checkpoint.get('d_ff')
+    ckpt_e_layers = checkpoint.get('e_layers')
+    ckpt_dropout = checkpoint.get('dropout')
+    
+    # 把提取出的动态窗口长度作为全局变量使用，替换掉旧版的 LIVE_SEQ_LEN
+    global ACTUAL_SEQ_LEN
+    ACTUAL_SEQ_LEN = ckpt_seq_len
     
     model = InvertedTransformer(
         num_variates=len(feature_cols), 
-        seq_len=LIVE_SEQ_LEN, 
-        d_model=LIVE_D_MODEL, 
-        n_heads=dynamic_n_heads, 
-        d_ff=dynamic_d_ff, 
-        e_layers=LIVE_E_LAYERS,
-        dropout=LIVE_DROPOUT
+        seq_len=ckpt_seq_len, 
+        d_model=ckpt_d_model, 
+        n_heads=ckpt_n_heads, 
+        d_ff=ckpt_d_ff, 
+        e_layers=ckpt_e_layers,
+        dropout=ckpt_dropout
     ).to(DEVICE)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
     with open(JSON_PATH, 'r') as f:
-        th = json.load(f)
+        config_data = json.load(f)
+        # 🚨 修复 3：兼容解包 Metadata 格式的 JSON 阈值配置
+        th = config_data.get("thresholds", config_data)
             
     print(f"✅ 模型与阈值加载成功。")
     

@@ -12,6 +12,7 @@ class GlobalState:
         self.active_pos_map = {}
         self.gate_markets = {}        
         self.dynamic_settings = {}
+        self.recent_pushes = {} # {symbol: timestamp}
 
 
 

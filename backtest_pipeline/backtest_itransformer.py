@@ -14,42 +14,52 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
-    SEQ_LEN, D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, EXPERIMENT_ID,
-    FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, LEVERAGE_1, LEVERAGE_2, LEVERAGE_3,
-    FORECAST_HORIZON  # 🚨 新增：引入预测窗口长度
+    EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, 
+    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON
 )
 from historical_pipeline.train_itransformer import InvertedTransformer
 
 
 def run_backtest():
-    data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"*_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
-    model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
+    DEVICE = torch.device("cuda")  # 明确 H100 环境
     
-    if not data_files or not model_files:
-        print("❌ 找不到数据或模型文件！")
+    # 1. 优先定位模型权重文件，一切以它保存的元数据为准
+    model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
+    if not model_files:
+        print("❌ 找不到对应的模型权重文件！")
         return
         
-    data_path = data_files[-1]
     model_path = model_files[-1]
-    print(f"🚀 启动终极回测 V4 (Softmax 概率引擎 + 动态杠杆)...")
+    print(f"🚀 启动终极回测 V5 (绝对严谨财务核算 + 动态杠杆)...")
 
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     
+    # 🚨 防呆机制 1：全面从 checkpoint 读取真实的超参，切断隐性错配
+    ckpt_horizon = checkpoint.get('forecast_horizon', FORECAST_HORIZON)
+    ckpt_seq_len = checkpoint.get('seq_len')
+    ckpt_d_model = checkpoint.get('d_model')
+    ckpt_n_heads = checkpoint.get('n_heads')
+    ckpt_d_ff = checkpoint.get('d_ff')
+    ckpt_e_layers = checkpoint.get('e_layers')
+    ckpt_dropout = checkpoint.get('dropout')
     feature_cols = checkpoint['feature_cols']
-    
-    # 显式对齐架构参数
-    dynamic_n_heads = max(2, D_MODEL // 16) 
-    dynamic_d_ff = D_MODEL * 4
 
+    # 基于真实 horizon 精准匹配特征宽表
+    data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"{SYMBOL}_Master_Training_Matrix_{ckpt_horizon}h_*.parquet")))
+    if not data_files:
+        print(f"❌ 找不到对应 Horizon ({ckpt_horizon}h) 的数据文件！")
+        return
+    data_path = data_files[-1]
+
+    # 显式对齐架构参数并加载模型
     model = InvertedTransformer(
         num_variates=len(feature_cols), 
-        seq_len=SEQ_LEN,
-        d_model=D_MODEL,     
-        n_heads=dynamic_n_heads, # 🚨 自适应：比如 d_model=64 时为 4，d_model=32 时为 2
-        d_ff=dynamic_d_ff,       # 🚨 自适应：比如 d_model=64 时为 256，d_model=32 时为 128
-        e_layers=E_LAYERS,   
-        dropout=DROPOUT      
+        seq_len=ckpt_seq_len,
+        d_model=ckpt_d_model,     
+        n_heads=ckpt_n_heads, 
+        d_ff=ckpt_d_ff,       
+        e_layers=ckpt_e_layers,   
+        dropout=ckpt_dropout      
     ).to(DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -59,22 +69,25 @@ def run_backtest():
     X_raw = df.select(feature_cols).to_numpy().astype('float32')
     timestamps = df.select("hour_timestamp").to_series().to_numpy()
     
-    split_idx = int(len(X_raw) * 0.8) + FORECAST_HORIZON
-    X_test_raw = X_raw[split_idx:]
+    # 🚨 防呆机制 2：彻底消灭时空错位。使用 seq_len 预热对齐测试集原点
+    split_idx = int(len(X_raw) * 0.8) + ckpt_horizon
+    warmup_start_idx = split_idx - ckpt_seq_len + 1
+    
+    if warmup_start_idx < 0:
+        print(f"❌ 数据量不足以支撑 seq_len={ckpt_seq_len} 的预热！")
+        return
+
+    X_test_raw = X_raw[warmup_start_idx:]
     test_timestamps = timestamps[split_idx:]
+    valid_timestamps = test_timestamps.tolist() 
     
     print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
     
-    # 1. 一次性将全量数据推送至 GPU 显存
     X_tensor = torch.tensor(X_test_raw, dtype=torch.float32, device=DEVICE)
-    
-    # 2. 利用底层 C++ unfold 瞬间生成滑动窗口的内存视图
-    X_windows = X_tensor.unfold(0, SEQ_LEN, 1).transpose(1, 2)
+    # 加速修复：补齐 .contiguous() 消除显存碎片
+    X_windows = X_tensor.unfold(0, ckpt_seq_len, 1).transpose(1, 2).contiguous()
     
     predictions_probs = []
-    valid_timestamps = test_timestamps[SEQ_LEN - 1 :].tolist()
-    
-    # 3. 显存内极速批处理 (摆脱 CPU 束缚，Batch Size 可拉爆到 4096)
     INFERENCE_BATCH_SIZE = 4096 
     
     with torch.no_grad():
@@ -94,7 +107,7 @@ def run_backtest():
         print(f"❌ 找不到原始 K 线，请先运行 build_main_features.py 完成下载！错误: {e}")
         return
 
-    # 🚨 降维打击：全部强制转换为 int64 的秒级 Unix 绝对时间，彻底消除 NumPy 精度错乱
+    # 全部强制转换为 int64 的秒级 Unix 绝对时间，防止 Numpy 精度错乱
     ts_1h = df_1h["timestamp"].to_numpy().astype('datetime64[s]').astype(np.int64)
     opens_1h = df_1h["open"].to_numpy()
     closes_1h = df_1h["close"].to_numpy()
@@ -104,7 +117,6 @@ def run_backtest():
     lows_1m = df_1m["low"].to_numpy()
     closes_1m = df_1m["close"].to_numpy()
 
-    # 专门为撮合引擎生成一份秒级信号时间戳 (画图依然保留原来的 datetime 格式)
     valid_timestamps_sec = np.array(valid_timestamps).astype('datetime64[s]').astype(np.int64)
 
     # ==========================================
@@ -114,8 +126,12 @@ def run_backtest():
     if not json_path.exists():
         print("❌ 找不到 dynamic_thresholds.json，请先运行 check_prob_distribution.py！")
         return
+        
     with open(json_path, "r") as f:
-        th = json.load(f)
+        config_data = json.load(f)
+        # 🚨 防呆机制 3：兼容带有 metadata 的新结构 JSON 和老版 Flat JSON
+        th = config_data.get("thresholds", config_data)
+        
     print("📥 已成功加载动态分位数阈值。")
     
     equity = 1.0             
@@ -128,10 +144,15 @@ def run_backtest():
     trade_start_equity = 1.0 
     current_leverage = 0.0   
     entry_time = None
-    cumulative_funding = 0.0  # 🚨 新增：单笔交易累计资金费率追踪器
     
-    max_unrealized_pnl = 0.0 
-    is_trailing = False      
+    # 🚨 引入严格的财务账本变量
+    cumulative_funding = 0.0 
+    open_cost = 0.0
+    
+    max_unrealized_phys_pnl = 0.0 
+    trailing_active = False
+    dynamic_sl_phys = -abs(HARD_SL)
+    
     trade_count = 0
     win_count = 0
     liquidated = False       
@@ -143,21 +164,18 @@ def run_backtest():
     
     print("\n⚔️ 正在执行工业级撮合 (1h 决策开仓 + 1m 盘中悲观碰撞)...")
     
-    # 🚨 补充实盘摩擦力参数
-    SLIPPAGE = 0.0002 # 单边滑点万分之二 (应对市价单冲击成本)
-    HOURLY_FUNDING_COST = 0.0001 / 8 # 假设平均资金费率为万分之一/8小时，均摊到每小时
+    SLIPPAGE = 0.0002 
+    HOURLY_FUNDING_COST = 0.0001 / 8 
 
-    # 新增出场原因计数器
     exit_reasons = {
-        "REVERSAL_EXIT": 0,    # 概率反转直接斩仓
-        "HARD_SL_EXIT": 0,     # 触碰硬止损线
-        "TRAILING_EXIT": 0,    # 追踪止盈/止损出场
-        "TIME_LIMIT_EXIT": 0   # 24小时到期斩仓
+        "REVERSAL_EXIT": 0,    
+        "HARD_SL_EXIT": 0,     
+        "TRAILING_EXIT": 0,    
+        "TIME_LIMIT_EXIT": 0   
     }
-    pnl_list = [] # 记录每笔交易的纯利润，用于算偏度
+    pnl_list = [] 
 
     for i in range(len(predictions_probs)):
-        # 🚨 增加进度回显，打破静默卡死错觉
         if i > 0 and i % 1000 == 0:
             print(f"   ⏳ 已撮合 {i} / {len(predictions_probs)} 小时...")
             
@@ -168,7 +186,7 @@ def run_backtest():
             
         p_down, p_flat, p_up = predictions_probs[i]
         signal_time = valid_timestamps_sec[i] 
-        exec_time = signal_time + 3600  # 🚨 1小时 = 3600秒，极速纯整数加法
+        exec_time = signal_time + 3600
         exec_idx_1h = np.searchsorted(ts_1h, exec_time)
         
         if exec_idx_1h < len(closes_1h):
@@ -195,30 +213,30 @@ def run_backtest():
             if target_pos != 0 and exec_idx_1h < len(opens_1h):
                 current_pos = target_pos
                 current_leverage = dynamic_leverage
-                hold_timer_mins = HOLD_PERIOD * 60  # 时间锁转换为分钟
+                hold_timer_mins = HOLD_PERIOD * 60 
                 
-                # 💡 核心升级：按 exec_time 对应 K 线的开盘价直接进场，消除旧版的 1 小时滑点延迟
                 entry_price = opens_1h[exec_idx_1h] 
                 entry_time = ts_1h[exec_idx_1h]
                 
+                # 🚨 财务修复 1：严格记录入场成本并锁定账本基数
                 trade_start_equity = equity 
-                equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
-                cumulative_funding = 0.0  # 🚨 新增：每次全新开仓时，重置资金费累加器
+                open_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
+                equity = trade_start_equity - open_cost 
+                cumulative_funding = 0.0  
                 
                 if target_pos == 1: long_trades += 1
                 if target_pos == -1: short_trades += 1
                 
-                # 👇 【修改：初始化纯物理追踪状态机】
-                max_unrealized_phys_pnl = 0.0   # 最高水位线 (物理幅度)
-                trailing_active = False         # 追踪止盈状态开关
-                dynamic_sl_phys = -abs(HARD_SL) # 动态止损线，初始以硬止损兜底
+                max_unrealized_phys_pnl = 0.0   
+                trailing_active = False         
+                dynamic_sl_phys = -abs(HARD_SL) 
 
         # ------------------------------------------
-        # 2. 1分钟级别显微镜追踪持仓 (盘中碰撞与状态机跃迁)
+        # 2. 1分钟级别显微镜追踪持仓
         # ------------------------------------------
         if current_pos != 0:
             start_1m_idx = np.searchsorted(ts_1m, entry_time)
-            chunk_end_time = exec_time + 3600 # 🚨 1小时 = 3600秒，极速纯整数加法
+            chunk_end_time = exec_time + 3600
             end_1m_idx = np.searchsorted(ts_1m, chunk_end_time)
             
             close_position = False
@@ -226,30 +244,22 @@ def run_backtest():
             close_pnl_pct = 0.0 
             close_return = 0.0
             
-            # 👇 【触发器 1：换线时刻的概率反转判定】
-            # 在每小时拿到最新预测概率的瞬间，立即进行预判
             is_reversal = False
-            if current_pos == 1 and p_down > th["down_top_1"]:
-                is_reversal = True
-            elif current_pos == -1 and p_up > th["up_top_1"]:
-                is_reversal = True
+            if current_pos == 1 and p_down > th["down_top_1"]: is_reversal = True
+            elif current_pos == -1 and p_up > th["up_top_1"]: is_reversal = True
                 
             if is_reversal:
-                # 获取该小时开盘瞬间的物理盈亏
                 current_hour_open = opens_1h[exec_idx_1h]
                 current_phys_profit = (current_hour_open - entry_price) / entry_price if current_pos == 1 else (entry_price - current_hour_open) / entry_price
                 
                 if current_phys_profit < 0.005:
-                    # 状态一：小于 0.5%，立即斩仓
                     close_position = True
                     actual_exit_pct = current_phys_profit * current_leverage
-                    exit_reasons["REVERSAL_EXIT"] += 1 # 记录反转斩仓
+                    exit_reasons["REVERSAL_EXIT"] += 1 
                 else:
-                    # 状态二：大于等于 0.5%，锁定 0.5% 止损线并激活追踪
                     trailing_active = True
                     dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
             
-            # 如果在小时边界存活，进入 1 分钟盘中微观碰撞
             if not close_position:
                 for m_idx in range(start_1m_idx, end_1m_idx):
                     if m_idx >= len(closes_1m): break
@@ -258,7 +268,6 @@ def run_backtest():
                     m_low = lows_1m[m_idx]
                     m_close = closes_1m[m_idx]
                     
-                    # 统一使用无杠杆的物理涨跌幅进行刻度衡量
                     if current_pos == 1:
                         worst_intra = (m_low - entry_price) / entry_price
                         best_intra = (m_high - entry_price) / entry_price
@@ -270,73 +279,48 @@ def run_backtest():
 
                     hold_timer_mins -= 1
 
-                    # ==========================================
-                    # 💀 第一关：问生死 (用这1分钟的最低价，去撞【上一分钟】定下的老防线)
-                    # ==========================================
                     worst_pnl_pct = current_leverage * worst_intra
-                    # 1. 极限爆仓检测 (资金毁灭，优先级最高)
-                    if trade_start_equity * (1 - current_leverage * FEE_RATE + worst_pnl_pct) <= 0:
+                    # 爆仓判定 (资金毁灭，使用带上双边滑点预期最恶劣的情况)
+                    if trade_start_equity - open_cost - (trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)) + (trade_start_equity * worst_pnl_pct) <= 0:
                         liquidated = True
                         break
                         
-                    # 2. 击穿当前存续的物理防线
                     if worst_intra <= dynamic_sl_phys:
                         close_position = True
                         actual_exit_pct = dynamic_sl_phys * current_leverage
-                        
-                        # 👇 补齐：通过追踪开关，智能判断是硬止损还是移动止盈
-                        if trailing_active:
-                            exit_reasons["TRAILING_EXIT"] += 1
-                        else:
-                            exit_reasons["HARD_SL_EXIT"] += 1
+                        if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
+                        else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
 
-                    # ==========================================
-                    # 💰 第二关：论富贵 (活下来了，才能用这1分钟的最高价去更新水位)
-                    # ==========================================
                     if best_intra > max_unrealized_phys_pnl:
                         max_unrealized_phys_pnl = best_intra
                         
-                    # 【触发器 2：触及止盈线 (超过硬止盈 0.5%)】
                     if max_unrealized_phys_pnl >= abs(HARD_TP) + 0.005:
                         trailing_active = True
                         dynamic_sl_phys = max(dynamic_sl_phys, abs(HARD_TP))
                         
-                    # 【触发器 3：超过 24 小时时间锁到期】
                     if hold_timer_mins <= 0 and not trailing_active:
                         if close_return < 0.005:
                             close_position = True
                             actual_exit_pct = close_return * current_leverage
-                            
-                            # 👇 补齐：耗尽时间亏损离场
                             exit_reasons["TIME_LIMIT_EXIT"] += 1
                             break
                         else:
                             trailing_active = True
                             dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
                             
-                    # 【追踪算法：应用 1% 的实际盈亏步长回撤限制】
                     if trailing_active:
                         dynamic_sl_phys = max(dynamic_sl_phys, max_unrealized_phys_pnl - 0.01)
 
-                    # ==========================================
-                    # 🗡️ 第三关：防插针回马枪 (提完防线后，防范同 1 分钟内的天地针)
-                    # ==========================================
                     if worst_intra <= dynamic_sl_phys:
                         close_position = True
                         actual_exit_pct = dynamic_sl_phys * current_leverage
-                        
-                        # 👇 补齐：逻辑与第一关完全一致
-                        if trailing_active:
-                            exit_reasons["TRAILING_EXIT"] += 1
-                        else:
-                            exit_reasons["HARD_SL_EXIT"] += 1
+                        if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
+                        else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
 
-                # 记录本小时结束时的带杠杆收益率，供隔夜资金费结算
                 close_pnl_pct = close_return * current_leverage
 
-            # 统一交割结算
             if liquidated:
                 equity = 0
                 current_pos = 0
@@ -347,10 +331,11 @@ def run_backtest():
                 continue
                 
             if close_position:
-                floating_equity = trade_start_equity * (1 - current_leverage * FEE_RATE + actual_exit_pct)
-                floating_equity -= trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE) # 扣除平仓滑点和手续费
-                floating_equity -= cumulative_funding  # 🚨 核心修复：真实扣除持有期间累计产生的资金费率
-                equity = floating_equity
+                # 🚨 财务修复 2：统一严谨结算（本金 + 收益 - 开仓摩擦 - 平仓摩擦 - 累计资金费）
+                close_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
+                final_pnl = trade_start_equity * actual_exit_pct
+                
+                equity = trade_start_equity + final_pnl - open_cost - close_cost - cumulative_funding
                 
                 trade_pnl = equity - trade_start_equity
                 if trade_pnl > 0: 
@@ -363,14 +348,12 @@ def run_backtest():
                 current_pos = 0 
                 current_leverage = 0.0
                 
-                # 👇 【核心补漏】：把这笔交易“扣除所有摩擦成本后”的纯粹净收益率记入账本
                 pnl_list.append(trade_pnl / trade_start_equity)
             else:
-                # 🚨 核心修复：将本小时的真实资金费率滚入累计池
+                # 🚨 财务修复 3：跨小时浮动结算，同样严格遵守完整公式，防止资金幽灵恢复
                 cumulative_funding += trade_start_equity * current_leverage * HOURLY_FUNDING_COST
-                # 若持仓跨越当前小时，账面浮盈以本小时最后一分钟收盘价计，并扣减所有历史累计资金费
-                equity = trade_start_equity * (1 - current_leverage * FEE_RATE + close_pnl_pct) - cumulative_funding
-                # 将追踪起点推移至下一个 1 小时的开端
+                floating_pnl = trade_start_equity * close_pnl_pct
+                equity = trade_start_equity + floating_pnl - open_cost - cumulative_funding
                 entry_time = chunk_end_time
                 
         equity_curve.append(equity)
@@ -379,47 +362,31 @@ def run_backtest():
     valid_timestamps = valid_timestamps[:len(equity_curve)]
     benchmark_prices = np.array(benchmark_prices)
 
-    # 计算最大回撤 (Max Drawdown)
     rolling_max = np.maximum.accumulate(equity_curve)
     drawdowns = (equity_curve - rolling_max) / rolling_max
     max_drawdown = np.min(drawdowns) * 100 if len(drawdowns) > 0 else 0.0
 
-    # 计算盈亏比 (Profit Factor)
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-
-    # 计算多空比
     ls_ratio = (long_trades / short_trades) if short_trades > 0 else float('inf')
 
-    # 计算卡玛比率 (Calmar Ratio)
     total_return = equity_curve[-1] - 1.0
     years = len(predictions_probs) / 8760
     annualized_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
     calmar = (annualized_return / (abs(max_drawdown)/100)) if max_drawdown < 0 else float('inf')
     
-    # 修复基准对齐：动态构建的 benchmark_prices 已经完全对齐了每次开仓时刻
-    if len(benchmark_prices) > 0:
-        benchmark_curve = benchmark_prices / benchmark_prices[0]
-    else:
-        benchmark_curve = np.ones(len(predictions_probs))
+    if len(benchmark_prices) > 0: benchmark_curve = benchmark_prices / benchmark_prices[0]
+    else: benchmark_curve = np.ones(len(predictions_probs))
 
-    if trade_count > 0:
-        win_rate = (win_count / trade_count) * 100
-    else:
-        win_rate = 0.0
+    win_rate = (win_count / trade_count) * 100 if trade_count > 0 else 0.0
         
     returns_series = pd.Series(equity_curve).pct_change().fillna(0).to_numpy()
     returns_series[0] = 0 
-    if np.std(returns_series) != 0:
-        sharpe = (np.mean(returns_series) / np.std(returns_series)) * np.sqrt(8760)
-    else:
-        sharpe = 0.0
+    sharpe = (np.mean(returns_series) / np.std(returns_series)) * np.sqrt(8760) if np.std(returns_series) != 0 else 0.0
 
-    # --- 深度性能指标计算 ---
-    total_net_profit = equity_curve[-1] - 1.0
     avg_win = np.mean([p for p in pnl_list if p > 0]) if any(p > 0 for p in pnl_list) else 0
     avg_loss = np.mean([p for p in pnl_list if p <= 0]) if any(p <= 0 for p in pnl_list) else 0
     expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
-    recovery_factor = total_net_profit / (abs(max_drawdown)/100) if max_drawdown != 0 else 0
+    recovery_factor = total_return / (abs(max_drawdown)/100) if max_drawdown != 0 else 0
 
     print("\n" + "="*50)
     print(f" 📜 TimesFM 引擎终极回测审计报告 | {SYMBOL}")

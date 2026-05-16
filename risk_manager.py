@@ -19,7 +19,7 @@ load_dotenv()
 
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
-JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{FORECAST_HORIZON}h.json"
+JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
 def execute_bailout(ex, base_sym, p, reason, current_price):
     """右脑专用：执行紧急市价逃生"""
     gate_sym = p['symbol']
@@ -84,12 +84,13 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
             f"<b>{pnl_icon}：</b>{abs_profit:+.2f} USDT ({realized_roe:+.2%})"
         )
         state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
+        state.recent_pushes[base_sym] = time.time()
         
     except Exception as e:
         print(f"   ⚠️ 右脑熔断清仓失败: {e}")
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
 
-def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price):
+def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
     """向交易所发送 API：撤销旧追踪，挂载统管全局的新追踪止损"""
     try:
         # 1. 撤销旧单：一旦右脑接管，清理掉所有碎片化止损
@@ -97,12 +98,12 @@ def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price):
             try: ex.cancel_order(o['id'], gate_symbol, params={'stop': True})
             except: pass
         
-        # 2. 挂载新追踪单：采用 size:0 与 close:True 一键接管净头寸
+        # 2. 挂载新追踪单：采用精确张数与 close:False (与 execution_oms.py 一致)
         rule = 2 if pos_side == 'LONG' else 1
         native_symbol = ex.market_id(gate_symbol)
         ex.private_futures_post_settle_price_orders({
             "settle": "usdt",
-            "initial": {"contract": native_symbol, "size": 0, "close": True, "price": "0", "tif": "ioc", "text": "trailing_sl"},
+            "initial": {"contract": native_symbol, "size": int(pos_size), "close": False, "price": "0", "tif": "ioc", "text": "trailing_sl"},
             "trigger": {"strategy_type": 0, "price_type": 1, "price": str(ex.price_to_precision(gate_symbol, new_sl_price)), "rule": rule}
         })
         return True
@@ -124,7 +125,9 @@ def bailout_worker():
     th = {}
     try:
         with open(JSON_PATH, 'r') as f:
-            th = json.load(f)
+            config_data = json.load(f)
+            # 🚨 修复 2：解包带有 metadata 信息的工业级 JSON 格式
+            th = config_data.get("thresholds", config_data)
     except Exception as e:
         print(f"❌ 右脑加载阈值文件失败，请检查模型编号: {e}")
 
@@ -150,9 +153,10 @@ def bailout_worker():
                         live_status = json.load(f)
                 except: pass
                 
+            # 🚨 修复 1：读取模型最原始的输出概率，切断字段命名错位
             inference_data = live_status.get("model_inference", {})
-            adj_p_up = inference_data.get("adj_prob_up", 0.0)
-            adj_p_down = inference_data.get("adj_prob_down", 0.0)
+            raw_p_up = inference_data.get("raw_prob_up", 0.0)
+            raw_p_down = inference_data.get("raw_prob_down", 0.0)
 
             hard_tp = HARD_TP   # K线物理止盈幅度（直接来自 config）
             hard_sl = HARD_SL   # K线物理底部止损幅度（直接来自 config）
@@ -214,9 +218,11 @@ def bailout_worker():
                 mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
                 hold_hours = (time.time() - mem['entry_time']) / 3600.0
                 
+                # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
+                # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
                 is_reversal = False
-                if pos_side == 'LONG' and adj_p_down > th.get('down_top_1', 1.0): is_reversal = True
-                if pos_side == 'SHORT' and adj_p_up > th.get('up_top_1', 1.0): is_reversal = True
+                if pos_side == 'LONG' and raw_p_down > th.get('down_top_1', 1.0): is_reversal = True
+                if pos_side == 'SHORT' and raw_p_up > th.get('up_top_1', 1.0): is_reversal = True
                 
                 need_market_close = False
                 close_reason = ""
@@ -252,7 +258,8 @@ def bailout_worker():
                 if mem['trailing_active']:
                     diff_pct = abs(target_sl_px - mem['last_sl_update_px']) / (entry_px + 1e-9)
                     if diff_pct > 0.001: 
-                        success = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px)
+                        pos_size = abs(float(p['info'].get('size', p.get('contracts', 0))))
+                        success = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
                         if success:
                             mem['last_sl_update_px'] = target_sl_px
                             print(f"📍 [{base_sym}] {pos_side} 追踪止损已上移至 ${target_sl_px:.4f} (物理保底: {mem['dynamic_sl_phys']*100:+.2f}%)")

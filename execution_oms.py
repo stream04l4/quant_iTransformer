@@ -8,6 +8,8 @@ import random
 from datetime import datetime
 import ccxt
 import threading
+import tempfile
+import fcntl
 from ccxt.base.errors import NetworkError, ExchangeError, RequestTimeout
 from state_manager import state
 from quant_config.config import (
@@ -19,6 +21,7 @@ load_dotenv()
 
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
+PUSHPLUS_TOKEN   = os.environ.get("PUSHPLUS_TOKEN", "")
 
 global_gate = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 global_gate.set_sandbox_mode(True)
@@ -43,11 +46,60 @@ def push_worker():
 # 启动守护线程 (程序关闭时自动销毁)
 threading.Thread(target=push_worker, daemon=True).start()
 
+
+def atomic_write_json(payload, target_file):
+    """Write JSON via a process-unique temp file to avoid cross-process rename races."""
+    target_dir = os.path.dirname(target_file)
+    os.makedirs(target_dir, exist_ok=True)
+
+    fd, tmp_file = tempfile.mkstemp(
+        prefix=os.path.basename(target_file) + ".",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, target_file)
+    except Exception:
+        try:
+            os.unlink(tmp_file)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def acquire_process_lock(lock_name):
+    """Acquire a non-blocking cross-process lock; return fd on success, else None."""
+    lock_dir = os.path.join(LIVE_DATA_DIR, "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, lock_name)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        return lock_fd
+    except OSError:
+        os.close(lock_fd)
+        return None
+
 def portfolio_sync_worker():
     """ 
     🏦 [供货线程] 全能查询员：
     集中处理所有私有查询任务，更新内存账本并同步 JSON 供前端读取。
     """
+    lock_fd = acquire_process_lock("portfolio_sync_worker.lock")
+    if lock_fd is None:
+        print("⚠️ [供货线程] 检测到其他进程已接管 portfolio 快照写入，本进程跳过该线程。")
+        return
+
+    portfolio_sync_worker.lock_fd = lock_fd
+    if not hasattr(portfolio_sync_worker, 'empty_positions_streak'):
+        portfolio_sync_worker.empty_positions_streak = 0
+
     print("🏦 [供货线程] 集中查询引擎已启动 (隔离 Nonce B)...")
     while True:
         try:
@@ -61,14 +113,50 @@ def portfolio_sync_worker():
             # 2. 独立查仓位 (同步给右脑)
             try:
                 pos = sync_ex.fetch_positions()
+                new_active_pos_map = {
+                    p['symbol'].split(':')[0].replace('/', ''): p
+                    for p in pos
+                    if abs(float(p.get('contracts', 0) or 0)) > 1e-8
+                }
+
+                had_active_positions = bool(state.active_pos_map)
+                suspicious_empty_positions = not new_active_pos_map and had_active_positions
+
+                if suspicious_empty_positions:
+                    portfolio_sync_worker.empty_positions_streak += 1
+                    if portfolio_sync_worker.empty_positions_streak < 2:
+                        raise RuntimeError("仓位快照瞬时返回空列表，已保留上一帧等待二次确认")
+                else:
+                    portfolio_sync_worker.empty_positions_streak = 0
+
                 state.portfolio_memory['positions'] = pos
-                
-                active_pos_map = {p['symbol'].split(':')[0].replace('/', ''): p for p in pos if float(p.get('contracts', 0)) > 0}
+
                 with state.pos_lock:
-                    dead_keys = [k for k in list(state.active_pos_map.keys()) if k not in active_pos_map]
+                    dead_keys = [k for k in list(state.active_pos_map.keys()) if k not in new_active_pos_map]
                     for k in dead_keys:
+                        old_p = state.active_pos_map.get(k)
                         state.active_pos_map.pop(k, None)
-                    state.active_pos_map.update(active_pos_map)
+                        
+                        # 👇 [新增：被动平仓推送逻辑]
+                        # 如果该币种在 10 秒内没有触发过主动熔断推送，说明是交易所 OCO 触发的被动平仓
+                        last_push_ts = state.recent_pushes.get(k, 0)
+                        if time.time() - last_push_ts > 10 and PUSHPLUS_TOKEN:
+                            try:
+                                dir_str = "多单 🟢" if str(old_p.get('side', '')).lower() == 'long' else "空单 🔴"
+                                contracts = old_p.get('contracts', 0)
+                                push_title = f"🏁 [Gate实盘] {k} 仓位已平仓"
+                                push_content = (
+                                    f"<b>🔹 交易标的：</b>{k} ({dir_str})<br>"
+                                    f"<b>🔸 平仓类型：</b>交易所系统结算 (止盈/止损/手动)<br>"
+                                    f"<b>📦 结算数量：</b>{contracts} 张<br>"
+                                    f"<b>⏰ 时间：</b>{datetime.now().strftime('%H:%M:%S')}"
+                                )
+                                state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
+                                state.recent_pushes[k] = time.time()
+                            except Exception as e:
+                                print(f"   ⚠️ 被动平仓推送入队失败: {e}")
+
+                    state.active_pos_map.update(new_active_pos_map)
             except Exception as e:
                 print(f"   ⚠️ 供货线程-仓位查询延迟: {e}")
 
@@ -98,13 +186,25 @@ def portfolio_sync_worker():
                 'balance': state.portfolio_memory.get('balance', {}),
                 'positions': state.portfolio_memory.get('positions', []),
                 'open_stops': state.portfolio_memory.get('open_stops', []),
-                'updated_at': time.time()
+                'updated_at': time.time(),
+                'writer_pid': os.getpid(),
             })
-            tmp_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json.tmp")
+
+            has_any_payload = (
+                bool(sync_state['balance'])
+                or bool(sync_state['positions'])
+                or bool(sync_state['open_stops'])
+            )
+            last_snapshot = getattr(portfolio_sync_worker, 'last_good_snapshot', None)
+            if not has_any_payload and last_snapshot:
+                sync_state = copy.deepcopy(last_snapshot)
+                sync_state['updated_at'] = time.time()
+                sync_state['writer_pid'] = os.getpid()
+            elif has_any_payload:
+                portfolio_sync_worker.last_good_snapshot = copy.deepcopy(sync_state)
+
             target_file = os.path.join(LIVE_DATA_DIR, "portfolio_state.json")
-            with open(tmp_file, "w") as f:
-                json.dump(sync_state, f)
-            os.replace(tmp_file, target_file)
+            atomic_write_json(sync_state, target_file)
 
         except Exception as e:
             print(f"   ⚠️ 供货线程遭遇系统级异常: {e}")
@@ -169,7 +269,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         has_existing_same_side = False
         positions = exchange_private.fetch_positions([gate_symbol])
         for pos in positions:
-            if float(pos.get('contracts', 0)) > 1e-8:
+            if abs(float(pos.get('contracts', 0) or 0)) > 1e-8:
                 current_pos_side = str(pos.get('side', '')).lower()
                 
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
@@ -366,6 +466,32 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         except Exception as e:
             print(f"   ⚠️ 交易记录入库失败: {e}")
 
+        # ---------------------------------------------------------
+        # 5. 异步推送：进场成功通知
+        # ---------------------------------------------------------
+        if PUSHPLUS_TOKEN:
+            try:
+                push_title = f"🚀 [Gate实盘] {symbol} 开仓成功！"
+                dir_str = "做多 🟢" if side == 'buy' else "做空 🔴"
+                push_content = (
+                    f"<b>🔹 交易标的：</b>{symbol} ({dir_str})<br>"
+                    f"<b>🎯 进场均价：</b>${actual_fill_price:.4f}<br>"
+                    f"<b>📦 下单张数：</b>{order_amount} 张<br>"
+                    f"<b>🛡️ 初始止损：</b>${sl_price:.4f}<br>"
+                    f"<b>💰 保证金占用：</b>{risk_margin_usd:.2f} USDT"
+                )
+                state.push_queue.put({
+                    "token": PUSHPLUS_TOKEN,
+                    "title": push_title,
+                    "content": push_content,
+                    "template": "html"
+                })
+                # 记录推送时间，防止与同步线程冲突（虽然这是开仓，同步线程只管平仓，但保持习惯）
+                base_sym = symbol.split(':')[0].replace('/', '')
+                state.recent_pushes[base_sym] = time.time()
+            except Exception as e:
+                print(f"   ⚠️ 推送任务入队失败: {e}")
+
         return True, float(risk_margin_usd)
 
     # 【核心修复：分层处理网络超时幻影丢单，并同步前端日志】
@@ -408,18 +534,54 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                                               (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
                                                amount REAL, fill_price REAL, slippage REAL,
                                                tp_price REAL, sl_price REAL, margin_used REAL)''')
-                            # 动态升级旧表
-                            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
-                            except sqlite3.OperationalError: pass
-                            # 👇 新增
-                            try: cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
-                            except sqlite3.OperationalError: pass
-                            
-                            # 👇 新增：写入 leverage
-                            cursor.execute('''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                           (datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), 'timeout_recovery', side,
-                                            float(order_amount), current_price, 0.0, 0.0, 0.0, float(risk_margin_usd), float(leverage)))
+                            try:
+                                cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
+                            except sqlite3.OperationalError:
+                                pass
+                            try:
+                                cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
+                            except sqlite3.OperationalError:
+                                pass
+
+                            cursor.execute(
+                                '''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                (
+                                    datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
+                                    'timeout_recovery',
+                                    side,
+                                    float(order_amount),
+                                    current_price,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    float(risk_margin_usd),
+                                    float(leverage),
+                                ),
+                            )
                             conn.commit()
+
+                        # 🚨 推送：超时抢救成功通知
+                        if PUSHPLUS_TOKEN:
+                            try:
+                                push_title = f"⚠️ [Gate超时抢救] {symbol} 开仓成功！"
+                                dir_str = "做多 🟢" if side == 'buy' else "做空 🔴"
+                                push_content = (
+                                    f"<b>🚨 预警：</b>网络超时，但已核实开仓成功。"
+                                    f"<br><b>🔹 交易标的：</b>{symbol} ({dir_str})"
+                                    f"<br><b>🎯 参考进场价：</b>${current_price:.4f}"
+                                )
+                                state.push_queue.put(
+                                    {
+                                        "token": PUSHPLUS_TOKEN,
+                                        "title": push_title,
+                                        "content": push_content,
+                                        "template": "html",
+                                    }
+                                )
+                                base_sym = symbol.split(':')[0].replace('/', '')
+                                state.recent_pushes[base_sym] = time.time()
+                            except Exception:
+                                pass
                     except Exception as db_e:
                         print(f"⚠️ 兜底落库失败: {db_e}")
                     return True, float(risk_margin_usd)

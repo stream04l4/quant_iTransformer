@@ -269,16 +269,25 @@ def build_features(horizon):
         time_column="hour_timestamp", 
         every="1h"
     ).with_columns([
-        # 价格、衍生品等状态类特征使用前向填充
-        pl.col("open").fill_null(strategy="forward"),
-        pl.col("high").fill_null(strategy="forward"),
-        pl.col("low").fill_null(strategy="forward"),
+        # 🚨 深度修复：全数据源断档监控。只要 K线、持仓量或溢价中任意一个断网缺失，即判定该行为人工合成
+        pl.any_horizontal([
+            pl.col("close").is_null(),
+            pl.col("sum_open_interest").is_null(),
+            pl.col("premium_close").is_null()
+        ]).cast(pl.Int8).alias("is_synthetic")
+    ]).with_columns([
+        # 第一步：只对 close 和其他宏观状态类特征做前向填充
         pl.col("close").fill_null(strategy="forward"),
         pl.col("eth_usdt_close").fill_null(strategy="forward"),
         pl.col("last_funding_rate").fill_null(strategy="forward"),
         pl.col("premium_close").fill_null(strategy="forward"),
         pl.col("sum_open_interest").fill_null(strategy="forward"),
-        pl.col("sum_toptrader_long_short_ratio").fill_null(strategy="forward"),
+        pl.col("sum_toptrader_long_short_ratio").fill_null(strategy="forward")
+    ]).with_columns([
+        # 第二步：缺失的 open, high, low 必须对齐已经被填补的 close，表示这段时间价格彻底冻结，防止制造幽灵波动率
+        pl.col("open").fill_null(pl.col("close")),
+        pl.col("high").fill_null(pl.col("close")),
+        pl.col("low").fill_null(pl.col("close")),
         # 交易量维度数据若缺失，视为该小时 0 成交，绝不能 forward fill
         pl.col("volume").fill_null(0.0),
         pl.col("quote_volume").fill_null(0.0),
@@ -415,7 +424,13 @@ def build_features(horizon):
 
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
     if list(PROCESSED_AGGTRADES_DIR.glob("*.parquet")):
-        df_agg = pl.scan_parquet(PROCESSED_AGGTRADES_DIR / "*.parquet").collect().sort("hour_timestamp")
+        # 🚨 致命缺陷修复：强行按时间去重，防范月度包与日线增量包交叉覆盖导致的行数爆炸
+        df_agg = (
+            pl.scan_parquet(PROCESSED_AGGTRADES_DIR / "*.parquet")
+            .collect()
+            .sort("hour_timestamp")
+            .unique(subset=["hour_timestamp"], keep="last")
+        )
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
             pl.col("cvd").fill_null(0),
             pl.col("whale_net_flow").fill_null(0),
@@ -432,13 +447,13 @@ def build_features(horizon):
     if "cvd" in features.columns:
         rolling_cols.extend(["cvd", "whale_net_flow"])
 
-    # 步骤 1: 计算 rolling median
+    # 步骤 1: 计算 rolling median (严格事前：使用 t-1 往前的 168 个窗口作为环境基准)
     features = features.with_columns([
-        pl.col(c).rolling_median(window_size=168).alias(f"{c}_median") for c in rolling_cols
+        pl.col(c).rolling_median(window_size=168).shift(1).alias(f"{c}_median") for c in rolling_cols
     ])
-    # 步骤 2: 计算 rolling MAD (Median Absolute Deviation)
+    # 步骤 2: 计算 rolling MAD (Median Absolute Deviation)，同样 shift(1)
     features = features.with_columns([
-        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168).alias(f"{c}_mad") for c in rolling_cols
+        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168).shift(1).alias(f"{c}_mad") for c in rolling_cols
     ])
     # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4]
     zscore_exprs = [
@@ -457,8 +472,8 @@ def build_features(horizon):
 
     # 🚨 终极核对：新增 max_ret_24h，剔除 oi_price_cross 与 vpt_zscore
     final_cols = [
-        "hour_timestamp", "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
-        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
+        "hour_timestamp", "is_synthetic", "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
+        "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta",
         "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
         "oi_delta_pct", "ls_ratio",
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 

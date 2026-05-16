@@ -16,10 +16,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR, SYMBOL
 
-# ==========================================
-# 1. 双轨寻优空间定义
-# ==========================================
-# 模式一：纯粹的 Alpha 预测力寻优 (不带任何止盈止损)
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [36],
     'SEQ_LEN': [2016],
@@ -32,7 +28,6 @@ ALPHA_SEARCH_SPACE = {
     'EPOCHS': [50]
 }
 
-# 模式二：基于某一个绝佳 Alpha 模型的出场参数寻优
 BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_1': [1.0, 2.0],
     'LEVERAGE_2': [3.0, 4.0],
@@ -42,23 +37,25 @@ BACKTEST_SEARCH_SPACE = {
     'HARD_SL': [0.015, 0.02, 0.03, 0.04]
 }
 
-def extract_alpha_metrics(output):
-    """解析 alpha_ic_evaluator.py 的输出"""
+# 🚨 修复：传入 target_horizon，精准提取目标周期的核心指标
+def extract_alpha_metrics(output, target_horizon):
     metrics = {}
     pattern = r"\[N=(\d+)h\]\s+胜率:\s*([\d\.]+)%\s*\|\s*单笔期望:\s*([\+\-\d\.]+)%\s*\|\s*IC:\s*([\+\-\d\.]+)\s*\|\s*Rank_IC:\s*([\+\-\d\.]+)"
     matches = re.findall(pattern, output)
     
     for m in matches:
-        n = m[0]
+        n = int(m[0])
         metrics[f'acc_{n}h'] = float(m[1])
         metrics[f'mean_ret_{n}h'] = float(m[2])
         metrics[f'ic_{n}h'] = float(m[3])
         metrics[f'rank_ic_{n}h'] = float(m[4])
-        metrics['primary_rank_ic'] = float(m[4]) # 默认最后一个为主要排序指标
+        
+    # 精准锚定主要排序指标
+    metrics['primary_rank_ic'] = metrics.get(f'rank_ic_{target_horizon}h', 0.0)
+    metrics['primary_acc'] = metrics.get(f'acc_{target_horizon}h', 0.0)
     return metrics
 
 def extract_backtest_metrics(output):
-    """解析 backtest_itransformer.py 的输出"""
     metrics = {
         'win_rate': 0.0, 'final_equity': 0.0, 'sharpe': 0.0, 'trades': 0,
         'max_drawdown': 0.0, 'profit_factor': 0.0, 'calmar': 0.0, 'ls_ratio': 0.0,
@@ -90,7 +87,6 @@ def run_experiment(params, mode, base_model, save_models):
     
     env["OMP_NUM_THREADS"] = "1"
     env["POLARS_MAX_THREADS"] = "1"
-    # 👇 核心修复：绝对压制底层 NumPy/SciPy 的多线程分裂，防止 CPU 踩踏！
     env["MKL_NUM_THREADS"] = "1"
     env["OPENBLAS_NUM_THREADS"] = "1"
     
@@ -100,19 +96,19 @@ def run_experiment(params, mode, base_model, save_models):
     if mode == 'alpha':
         scripts = ['train_itransformer.py', 'check_prob_distribution.py', 'alpha_ic_evaluator.py']
         for script in scripts:
-            # 只有训练脚本在 historical，其余都在 backtest 文件夹下
             script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
             result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 return {"error": f"💥 {script} 报错:\n{result.stderr}", **params}
             if script == 'alpha_ic_evaluator.py':
                 stdout_log = result.stdout
-        res = extract_alpha_metrics(stdout_log)
+        # 获取当前实验对应的 Horizon
+        target_horizon = params.get('FORECAST_HORIZON', 12)
+        res = extract_alpha_metrics(stdout_log, target_horizon)
         
     elif mode == 'backtest':
         src_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{base_model}.pth"
         src_json = MODEL_DIR / f"dynamic_thresholds_{base_model}.json"
-        
         tmp_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
         tmp_json = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
         
@@ -131,7 +127,6 @@ def run_experiment(params, mode, base_model, save_models):
             stdout_log = result.stdout
             res = extract_backtest_metrics(stdout_log)
             
-        # 回测打完立刻销毁临时分身
         try:
             os.remove(tmp_model)
             os.remove(tmp_json)
@@ -140,7 +135,6 @@ def run_experiment(params, mode, base_model, save_models):
     res.update(params)
     res['exp_id'] = exp_id
     
-    # 【第一道防线】：根据 --save-models 决定是否清理当前进程产物
     if not save_models:
         try: os.remove(MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth") 
         except: pass
@@ -179,11 +173,12 @@ def main():
             
     print(f"🔥 启动双轨引擎 | 当前模式: 【{args.mode.upper()}】")
     print(f"   参数组合数: {len(base_combinations)} (总任务数: {len(combinations)})")
-    print(f"   保存模型开关: {'开启 💾 (将占用磁盘空间)' if args.save_models else '关闭 🗑️ (跑完即焚)'}")
+    print(f"   保存模型开关: {'开启 💾' if args.save_models else '关闭 🗑️'}")
     if args.mode == 'backtest': print(f"   基座 Alpha 模型: {args.base_model}")
     print("=" * 80)
 
-    MAX_WORKERS = 16 if args.mode == 'alpha' else 16 
+    # 🚨 修复单卡 H100 灾难：alpha 模式最多 2 个并发，保障显存安全；backtest 模式 20 核 CPU 开 16 并发。
+    MAX_WORKERS = 2 if args.mode == 'alpha' else 16 
     batches = [combinations[i:i + MAX_WORKERS] for i in range(0, len(combinations), MAX_WORKERS)]
     
     all_results = []
@@ -204,16 +199,15 @@ def main():
                     print(f"   {progress_str} ❌ 失败:\n{res['error']}")
                 else:
                     if args.mode == 'alpha':
+                        target_hz = res.get('FORECAST_HORIZON', 12)
                         rank_ic = res.get('primary_rank_ic', 0)
-                        acc_12h = res.get('acc_12h', 0)
-                        print(f"   {progress_str} 🧠 [Alpha] 核心 Rank_IC: {rank_ic:>+6.4f} | 12h 胜率: {acc_12h:>5.2f}% | ID: {res['exp_id']}")
+                        acc_val = res.get('primary_acc', 0)
+                        print(f"   {progress_str} 🧠 [Alpha] 核心 {target_hz}h Rank_IC: {rank_ic:>+6.4f} | 胜率: {acc_val:>5.2f}% | ID: {res['exp_id']}")
                     else:
                         print(f"   {progress_str} 🏦 [回测] 期望值: {res['expectancy_pct']:>+6.3f}% | 恢复因子: {res['recovery_factor']:>5.2f} | ID: {res['exp_id']}")
         
-        # 每批次保存 CSV 
         pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
 
-        # 【第二道防线】：如果未开启 save-models，进行批次级别的物理兜底清理
         if not args.save_models:
             swept_files = 0
             for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
@@ -226,7 +220,7 @@ def main():
                 try: os.remove(f); swept_files += 1 
                 except Exception: pass
             if swept_files > 0:
-                print(f"   🧹 第 {batch_idx} 批次收尾 | 强制清理了 {swept_files} 个僵尸残余文件。")
+                print(f"   🧹 第 {batch_idx} 批次收尾 | 清理了 {swept_files} 个僵尸文件。")
 
     print("=" * 80)
     print(f"🎉 任务完成！耗时: {(time.time() - start_time) / 60:.2f} 分钟。报告已存至 {RESULTS_CSV.name}")
