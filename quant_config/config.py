@@ -13,7 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 主要模块目录
 BACKTEST_DIR = PROJECT_ROOT / "backtest_pipeline"
 HISTORICAL_DIR = PROJECT_ROOT / "historical_pipeline"
-CONFIG_DIR = PROJECT_ROOT / "quant_config"
 
 # 数据与模型目录
 DATA_DIR = PROJECT_ROOT / "data"
@@ -24,7 +23,6 @@ TEMP_DIR = TRAIN_DATA_DIR / "raw_temp"
 PROCESSED_AGGTRADES_DIR = TRAIN_DATA_DIR / "processed" / "aggtrades_1h"
 PROCESSED_MAIN_DIR = TRAIN_DATA_DIR / "processed" / "main_features_1h"
 MODEL_DIR = PROJECT_ROOT / "model"
-LOG_DIR = LIVE_DATA_DIR / "logs"
 
 # ==========================================
 # 2. 交易标的与业务参数 (Trading & Features)
@@ -58,12 +56,6 @@ FUNDING_COLS = ["calc_time", "funding_interval_hours", "last_funding_rate"]
 
 AGGTRADE_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id", 
                  "last_trade_id", "transact_time", "is_buyer_maker"]
-
-METRICS_COLS = [
-    "create_time", "symbol", "sum_open_interest", "sum_open_interest_value", 
-    "count_toptrader_long_short_ratio", "sum_toptrader_long_short_ratio", 
-    "count_long_short_ratio", "sum_taker_long_short_vol_ratio"
-]
 # ==========================================
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
@@ -79,7 +71,6 @@ HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.05))
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 
 # --- 实盘专用风控与仓位参数 ---
-TRADE_COOLDOWN_SEC = 3500            # 开仓后防连续发车冷却时间(秒)
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
 MACRO_ALPHA_TOP_10 = 1.20            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
 MACRO_ALPHA_TOP_5 = 0.50             # Tier 2 (波段加仓): 宏观权重中等
@@ -92,9 +83,6 @@ MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
 # --- 账户资金管理参数 ---
 INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累计收益率
 BASE_RISK_BUDGET = 0.2              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
-MAX_OPEN_POSITIONS = 1               # 最大允许同时持仓数量
-MAX_MARGIN_UTILIZATION = 1         # 最大资金使用率红线(70%)
-MIN_ORDER_NOTIONAL = 1.0             # 最小下单名义价值(USDT)
 
 # --- 右脑高频熔断参数 ---
 BAILOUT_ATR_MULTI = 2.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发

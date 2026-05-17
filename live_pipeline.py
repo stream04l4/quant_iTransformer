@@ -14,9 +14,9 @@ import sqlite3
 import os
 from datetime import datetime
 from quant_config.config import (
-    DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
+    LIVE_DATA_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
-    TRADE_COOLDOWN_SEC, MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
+    MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR  
 )
@@ -77,8 +77,9 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df = df.iloc[:-1]
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    if len(df) < (ACTUAL_SEQ_LEN + 168):
-        raise ValueError(f"主K线历史长度不足 (需>={ACTUAL_SEQ_LEN + 168}，当前{len(df)})")
+    required_history = ACTUAL_SEQ_LEN + 336
+    if len(df) < required_history:
+        raise ValueError(f"主K线历史长度不足 (需>={required_history}，当前{len(df)})")
 
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
 
@@ -204,8 +205,9 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct", "cvd", "whale_net_flow"]
     for c in rolling_cols:
         if c in df.columns:
-            median = df[c].rolling(window=168, min_periods=1).median()
-            mad = (df[c] - median).abs().rolling(window=168, min_periods=1).median()
+            # 与离线训练完全对齐：环境基准必须只使用 t-1 以前的数据。
+            median = df[c].rolling(window=168, min_periods=168).median().shift(1)
+            mad = (df[c] - median).abs().rolling(window=168, min_periods=168).median().shift(1)
             df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
         else:
             df[f"{c}_zscore"] = np.nan

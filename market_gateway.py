@@ -10,7 +10,11 @@ from datetime import datetime
 import time
 import sqlite3
 import polars as pl
-from quant_config.config import SYMBOL, AUX_SYMBOLS, WHALE_THRESHOLD, RETAIL_THRESHOLD, LIVE_DATA_DIR, PROCESSED_AGGTRADES_DIR
+from quant_config.config import (
+    SYMBOL, AUX_SYMBOLS, WHALE_THRESHOLD, RETAIL_THRESHOLD,
+    LIVE_DATA_DIR, TEMP_DIR, PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR,
+    KLINE_COLS, FUNDING_COLS
+)
 
 app = FastAPI(title="Binance链币种: {} 极速行情网关".format(SYMBOL))
 
@@ -53,6 +57,384 @@ for sym in all_symbols:
 # ==========================================
 LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = LIVE_DATA_DIR / "gateway_state.db"
+DERIVATIVE_LOOKBACK_HOURS = 1250
+DERIVATIVE_HISTORY_WINDOW_MS = DERIVATIVE_LOOKBACK_HOURS * 3600000
+PROCESSED_DERIVATIVE_CANDIDATE_DIRS = [PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR]
+ONE_MINUTE_HISTORY_LIMIT = 35000
+
+
+def print_gateway_data_chain():
+    print("🧭 [网关链路] 1h K线: TEMP_DIR/raw_1h.parquet -> SQLite 本地底座 -> Binance REST 补洞 -> WS 实时续流")
+    print("🧭 [网关链路] 1m 显微镜: TEMP_DIR/raw_1m.parquet -> Binance REST 差量补齐 -> WS 实时续流")
+    print("🧭 [网关链路] 衍生品: Binance REST 最新时序 -> TEMP_DIR 原始 premium/funding/metrics -> processed 特征文件兜底")
+
+
+def _is_temporal_dtype(dtype):
+    """兼容 Polars 1.0+，避免使用已弃用的 TEMPORAL_DTYPES。"""
+    if dtype is None:
+        return False
+    base_type = dtype.base_type() if hasattr(dtype, "base_type") else dtype
+    return base_type in (pl.Datetime, pl.Date, pl.Time, pl.Duration)
+
+
+def _load_cached_1m_history(symbol, cutoff_ts_ms):
+    raw_1m_path = TEMP_DIR / "klines" / symbol / f"{symbol}_raw_1m.parquet"
+    if not raw_1m_path.exists():
+        return []
+
+    try:
+        schema = pl.read_parquet_schema(raw_1m_path)
+        select_cols = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in schema]
+        if not {"timestamp", "open", "high", "low", "close"}.issubset(set(select_cols)):
+            return []
+
+        df = pl.read_parquet(raw_1m_path, columns=select_cols)
+        if "volume" not in df.columns:
+            df = df.with_columns(pl.lit(0.0).alias("volume"))
+
+        ts_col = "timestamp"
+        ts_dtype = df.schema.get(ts_col)
+        if _is_temporal_dtype(ts_dtype):
+            df = df.with_columns(pl.col(ts_col).dt.epoch(time_unit="ms").alias("ts_ms"))
+        else:
+            df = df.with_columns(pl.col(ts_col).cast(pl.Int64, strict=False).alias("ts_ms"))
+
+        df = df.filter(pl.col("ts_ms") >= cutoff_ts_ms).sort("ts_ms").tail(ONE_MINUTE_HISTORY_LIMIT)
+        if df.is_empty():
+            return []
+
+        records = [
+            [
+                int(row["ts_ms"]),
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row["volume"]),
+            ]
+            for row in df.iter_rows(named=True)
+        ]
+        print(f"   ♻️ [1m本地缓存] {symbol} 复用 raw_1m.parquet {len(records)} 根。")
+        return records
+    except Exception as e:
+        print(f"   ⚠️ [1m本地缓存] {symbol} 读取失败: {e}")
+        return []
+
+
+def seed_sqlite_from_cached_1h(symbol):
+    """启动阶段优先用本地 raw_1h.parquet 填充 SQLite 底座。"""
+    raw_1h_path = TEMP_DIR / "klines" / symbol / f"{symbol}_raw_1h.parquet"
+    if not raw_1h_path.exists():
+        return 0
+
+    try:
+        schema = pl.read_parquet_schema(raw_1h_path)
+        select_cols = [c for c in ["timestamp", "open", "high", "low", "close", "volume", "quote_volume", "count", "taker_buy_volume"] if c in schema]
+        if not {"timestamp", "open", "high", "low", "close"}.issubset(set(select_cols)):
+            return 0
+
+        df = pl.read_parquet(raw_1h_path, columns=select_cols)
+        if "volume" not in df.columns:
+            df = df.with_columns(pl.lit(0.0).alias("volume"))
+        if "quote_volume" not in df.columns:
+            df = df.with_columns(pl.lit(0.0).alias("quote_volume"))
+        if "count" not in df.columns:
+            df = df.with_columns(pl.lit(0).alias("count"))
+        if "taker_buy_volume" not in df.columns:
+            df = df.with_columns(pl.lit(0.0).alias("taker_buy_volume"))
+
+        ts_dtype = df.schema.get("timestamp")
+        if _is_temporal_dtype(ts_dtype):
+            df = df.with_columns(pl.col("timestamp").dt.epoch(time_unit="ms").alias("ts_ms"))
+        else:
+            df = df.with_columns(pl.col("timestamp").cast(pl.Int64, strict=False).alias("ts_ms"))
+
+        df = df.sort("ts_ms").tail(DERIVATIVE_LOOKBACK_HOURS)
+        if df.is_empty():
+            return 0
+
+        records = []
+        for row in df.iter_rows(named=True):
+            volume = float(row["volume"])
+            taker_buy_volume = float(row["taker_buy_volume"])
+            records.append((
+                symbol,
+                int(row["ts_ms"]),
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                volume,
+                float(row["quote_volume"]),
+                int(row["count"]),
+                taker_buy_volume,
+                max(0.0, volume - taker_buy_volume),
+                None,
+                None,
+                None,
+            ))
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
+            conn.commit()
+
+        print(f"   ♻️ [1h本地缓存] {symbol} 已从 raw_1h.parquet 注入 SQLite 底座 {len(records)} 根。")
+        return len(records)
+    except Exception as e:
+        print(f"   ⚠️ [1h本地缓存] {symbol} 注入 SQLite 失败: {e}")
+        return 0
+
+
+def _read_raw_kline_csv(csv_path):
+    for kwargs in (
+        {"has_header": True, "infer_schema_length": 200},
+        {"has_header": False, "new_columns": KLINE_COLS, "infer_schema_length": 200},
+    ):
+        try:
+            df = pl.read_csv(csv_path, **kwargs)
+            if {"open_time", "close"}.issubset(set(df.columns)):
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def _read_raw_funding_csv(csv_path):
+    for kwargs in (
+        {"has_header": True, "infer_schema_length": 200},
+        {"has_header": False, "new_columns": FUNDING_COLS, "infer_schema_length": 200},
+    ):
+        try:
+            df = pl.read_csv(csv_path, **kwargs)
+            if {"calc_time", "last_funding_rate"}.issubset(set(df.columns)):
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def load_tempdir_derivative_history(symbol, cutoff_ts_ms):
+    """优先读取训练阶段保留下来的 TEMP_DIR 原始缓存。"""
+    cutoff_dt = datetime.utcfromtimestamp(cutoff_ts_ms / 1000.0)
+    result = {}
+
+    premium_files = sorted((TEMP_DIR / "premiumIndexKlines" / symbol).glob("*/*.csv"))
+    if premium_files:
+        frames = []
+        for file_path in premium_files:
+            df = _read_raw_kline_csv(file_path)
+            if df is None:
+                continue
+            frames.append(
+                df.select([
+                    pl.from_epoch(pl.col("open_time").cast(pl.Int64, strict=False), time_unit="ms").dt.truncate("1h").alias("hour_timestamp"),
+                    pl.col("close").cast(pl.Float64, strict=False).alias("premium_close")
+                ]).drop_nulls(["hour_timestamp", "premium_close"])
+            )
+        if frames:
+            merged = pl.concat(frames, how="vertical_relaxed").filter(pl.col("hour_timestamp") >= cutoff_dt).sort("hour_timestamp")
+            merged = merged.group_by("hour_timestamp").agg(pl.col("premium_close").drop_nulls().last().alias("premium_close")).sort("hour_timestamp")
+            if not merged.is_empty():
+                result["premium_history"] = [
+                    [int(row["hour_timestamp"].timestamp() * 1000), float(row["premium_close"])]
+                    for row in merged.iter_rows(named=True)
+                ]
+
+    funding_files = sorted((TEMP_DIR / "fundingRate" / symbol).glob("*/*.csv"))
+    if funding_files:
+        frames = []
+        for file_path in funding_files:
+            df = _read_raw_funding_csv(file_path)
+            if df is None:
+                continue
+            frames.append(
+                df.select([
+                    pl.from_epoch(pl.col("calc_time").cast(pl.Int64, strict=False), time_unit="ms").dt.truncate("1h").alias("hour_timestamp"),
+                    pl.col("last_funding_rate").cast(pl.Float64, strict=False).alias("funding_rate")
+                ]).drop_nulls(["hour_timestamp", "funding_rate"])
+            )
+        if frames:
+            merged = pl.concat(frames, how="vertical_relaxed").filter(pl.col("hour_timestamp") >= cutoff_dt).sort("hour_timestamp")
+            merged = merged.group_by("hour_timestamp").agg(pl.col("funding_rate").drop_nulls().last().alias("funding_rate")).sort("hour_timestamp")
+            if not merged.is_empty():
+                result["funding_history"] = [
+                    [int(row["hour_timestamp"].timestamp() * 1000), float(row["funding_rate"])]
+                    for row in merged.iter_rows(named=True)
+                ]
+
+    metrics_files = sorted((TEMP_DIR / "metrics" / symbol).glob("*/*.csv"))
+    if metrics_files:
+        frames = []
+        for file_path in metrics_files:
+            try:
+                df = pl.read_csv(file_path, has_header=True, infer_schema_length=0).select([
+                    "create_time", "sum_open_interest", "sum_toptrader_long_short_ratio"
+                ]).with_columns([
+                    pl.col("create_time").str.slice(0, 19).str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False).alias("exact_timestamp"),
+                    pl.col("sum_open_interest").cast(pl.Float64, strict=False),
+                    pl.col("sum_toptrader_long_short_ratio").cast(pl.Float64, strict=False),
+                ])
+                frames.append(df)
+            except Exception:
+                continue
+        if frames:
+            merged = pl.concat(frames, how="vertical_relaxed").with_columns(
+                pl.col("exact_timestamp").dt.truncate("1h").alias("hour_timestamp")
+            ).filter(pl.col("hour_timestamp") >= cutoff_dt).sort("exact_timestamp").group_by("hour_timestamp").last().sort("hour_timestamp")
+            if not merged.is_empty():
+                oi_df = merged.select(["hour_timestamp", "sum_open_interest"]).drop_nulls()
+                ls_df = merged.select(["hour_timestamp", "sum_toptrader_long_short_ratio"]).drop_nulls()
+                if not oi_df.is_empty():
+                    result["oi_history"] = [
+                        [int(row["hour_timestamp"].timestamp() * 1000), float(row["sum_open_interest"])]
+                        for row in oi_df.iter_rows(named=True)
+                    ]
+                if not ls_df.is_empty():
+                    result["ls_history"] = [
+                        [int(row["hour_timestamp"].timestamp() * 1000), float(row["sum_toptrader_long_short_ratio"])]
+                        for row in ls_df.iter_rows(named=True)
+                    ]
+
+    if result:
+        print(f"   ♻️ [TEMP_DIR衍生品缓存] {symbol} 命中: {list(result.keys())}")
+    return result
+
+
+def _load_single_offline_derivative_file(file_path):
+    """从单个离线文件中抽取可用于实盘的衍生品时序字段。"""
+    suffix = file_path.suffix.lower()
+    if suffix not in {".parquet", ".csv"}:
+        return None
+
+    try:
+        if suffix == ".parquet":
+            schema = pl.read_parquet_schema(file_path)
+        else:
+            schema = pl.read_csv(file_path, n_rows=5, infer_schema_length=50).schema
+    except Exception:
+        return None
+
+    col_names = set(schema.keys())
+    time_col = next((c for c in ["hour_timestamp", "timestamp", "exact_timestamp", "open_time"] if c in col_names), None)
+    if time_col is None:
+        return None
+
+    normalized_cols = {}
+    for normalized_name, aliases in {
+        "premium_close": ["premium_close", "premium_index", "premium_index_close"],
+        "funding_rate": ["last_funding_rate", "funding_rate"],
+        "sum_open_interest": ["sum_open_interest", "open_interest"],
+        "ls_ratio": ["ls_ratio", "sum_toptrader_long_short_ratio", "longShortRatio"],
+    }.items():
+        match = next((alias for alias in aliases if alias in col_names), None)
+        if match:
+            normalized_cols[normalized_name] = match
+
+    if not normalized_cols:
+        return None
+
+    select_cols = [time_col] + list(dict.fromkeys(normalized_cols.values()))
+    try:
+        if suffix == ".parquet":
+            df = pl.read_parquet(file_path, columns=select_cols)
+        else:
+            df = pl.read_csv(file_path, columns=select_cols, infer_schema_length=200)
+    except Exception:
+        return None
+
+    ts_dtype = df.schema.get(time_col)
+    if _is_temporal_dtype(ts_dtype):
+        ts_expr = pl.col(time_col).dt.truncate("1h")
+    elif ts_dtype == pl.Utf8:
+        ts_expr = pl.col(time_col).str.strptime(pl.Datetime, strict=False).dt.truncate("1h")
+    else:
+        ts_expr = pl.from_epoch(pl.col(time_col).cast(pl.Int64, strict=False), time_unit="ms").dt.truncate("1h")
+
+    exprs = [ts_expr.alias("hour_timestamp")]
+    for normalized_name, source_col in normalized_cols.items():
+        exprs.append(pl.col(source_col).cast(pl.Float64, strict=False).alias(normalized_name))
+
+    return df.select(exprs).drop_nulls(["hour_timestamp"])
+
+
+def load_processed_derivative_history(symbol, cutoff_ts_ms):
+    """最后一层兜底：扫描 processed 目录中的宽表或聚合特征文件。"""
+    frames = []
+    scanned_files = 0
+
+    for directory in PROCESSED_DERIVATIVE_CANDIDATE_DIRS:
+        if not directory.exists():
+            continue
+
+        symbol_files = sorted(directory.glob(f"{symbol}*.parquet")) + sorted(directory.glob(f"{symbol}*.csv"))
+        candidate_files = symbol_files if symbol_files else (sorted(directory.glob("*.parquet")) + sorted(directory.glob("*.csv")))
+
+        for file_path in candidate_files:
+            scanned_files += 1
+            df = _load_single_offline_derivative_file(file_path)
+            if df is not None and not df.is_empty():
+                frames.append(df)
+
+    if not frames:
+        return {}
+
+    cutoff_dt = datetime.utcfromtimestamp(cutoff_ts_ms / 1000.0)
+    merged = pl.concat(frames, how="diagonal_relaxed").filter(
+        pl.col("hour_timestamp") >= cutoff_dt
+    ).sort("hour_timestamp")
+
+    if merged.is_empty():
+        return {}
+
+    value_cols = [c for c in ["premium_close", "funding_rate", "sum_open_interest", "ls_ratio"] if c in merged.columns]
+    agg_exprs = [pl.col(c).drop_nulls().last().alias(c) for c in value_cols]
+    if not agg_exprs:
+        return {}
+
+    merged = merged.group_by("hour_timestamp").agg(agg_exprs).sort("hour_timestamp")
+    if merged.is_empty():
+        return {}
+
+    result = {}
+    for source_col, target_key in {
+        "premium_close": "premium_history",
+        "funding_rate": "funding_history",
+        "sum_open_interest": "oi_history",
+        "ls_ratio": "ls_history",
+    }.items():
+        if source_col not in merged.columns:
+            continue
+        sub_df = merged.select(["hour_timestamp", source_col]).drop_nulls()
+        if sub_df.is_empty():
+            continue
+        result[target_key] = [
+            [int(row["hour_timestamp"].timestamp() * 1000), float(row[source_col])]
+            for row in sub_df.iter_rows(named=True)
+        ]
+
+    if result:
+        print(f"   📚 [processed衍生品兜底] {symbol} 已从本地扫描 {scanned_files} 个文件并装载历史兜底。")
+    return result
+
+
+def merge_derivative_history(primary_history, offline_history, cutoff_ts_ms):
+    """用离线历史回补早期缺口，但始终让 API 最新值覆盖旧值。"""
+    merged = {}
+
+    for source in (offline_history or []):
+        if len(source) != 2 or source[1] is None:
+            continue
+        merged[int(source[0])] = float(source[1])
+
+    for source in (primary_history or []):
+        if len(source) != 2 or source[1] is None:
+            continue
+        merged[int(source[0])] = float(source[1])
+
+    if not merged:
+        return []
+
+    return [[ts, merged[ts]] for ts in sorted(merged) if ts >= cutoff_ts_ms]
 
 def init_sqlite_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -388,12 +770,11 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
                         hist[-1] = [ts, val]
 
             # ==========================================
-            # 🧹 内存泄露防护：控制历史数组的最大长度 (对齐历史预热的 500)
+            # 🧹 内存泄露防护：控制历史数组的最大长度，但必须保留完整 1250h 推理窗口
             # ==========================================
             for key in ["premium_history", "oi_history", "ls_history", "funding_history"]:
-                if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > 600:
-                    # 裁剪头部冗余数据，保留最新 600 个时间节点
-                    market_data_store[symbol][key] = market_data_store[symbol][key][-600:]
+                if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > DERIVATIVE_LOOKBACK_HOURS + 64:
+                    market_data_store[symbol][key] = market_data_store[symbol][key][-(DERIVATIVE_LOOKBACK_HOURS + 64):]
 
         except Exception as e:
             # 去除之前的 pass，将网络抖动和底层 API 拒载显式抛出
@@ -407,6 +788,8 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
     自愈式预热：检查本地库是否存在时间空隙 (Gaps)，发现即重拉，绝不补0。
     """
     print(f"🔍 [网关自愈] 正在校验 {symbol} 历史数据的连续性...")
+
+    await asyncio.to_thread(seed_sqlite_from_cached_1h, symbol)
     
     with sqlite3.connect(DB_PATH) as conn:
         # 获取最近 1000 根 K 线的时间戳
@@ -472,12 +855,16 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
     # === 新增：网关包揽 1m K线与所有衍生品的历史时序拉取 ===
     if not is_spot:
         print(f"🔍 [网关自愈] 正在拉取 {symbol} 衍生品时序与 1m 显微镜底座...")
+        end_time = int(time.time() * 1000)
+        cutoff_ts_ms = end_time - DERIVATIVE_HISTORY_WINDOW_MS
         try:
-            print(f"🔍 [网关自愈] 正在全量拉取 {symbol} 过去 1250 小时的 1m 显微数据 (约7.5万根)...")
-            end_time = int(time.time() * 1000)
+            print(f"🔍 [网关自愈] 1m 链路: 先读本地 raw_1m 缓存，再用 REST 补最新缺口...")
             start_time = end_time - 1250 * 3600 * 1000 # 匹配 1250 小时回溯
-            all_1m = []
-            curr_ts = start_time
+            all_1m = _load_cached_1m_history(symbol, start_time)
+            curr_ts = all_1m[-1][0] + 60000 if all_1m else start_time
+
+            if not all_1m:
+                print(f"   ⏳ [1m本地缓存] {symbol} 未命中 raw_1m.parquet，直接走 REST 拉取。")
 
             while curr_ts < end_time:
                 batch = await exchange.fetch_ohlcv(swap_symbol, '1m', since=curr_ts, limit=1500)
@@ -487,44 +874,69 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
                 curr_ts = batch[-1][0] + 60000 # 步进 1 分钟
                 await asyncio.sleep(0.1) # 防护 API 速率限制
 
+            if all_1m:
+                dedup_1m = {int(row[0]): row for row in all_1m if len(row) >= 6}
+                all_1m = [dedup_1m[ts] for ts in sorted(dedup_1m)][-ONE_MINUTE_HISTORY_LIMIT:]
             market_data_store[symbol]["1m"].clear()
             market_data_store[symbol]["1m"].extend(all_1m)
             print(f"   ✅ {symbol} 1m 高频数据装填完毕，共 {len(all_1m)} 根。")
 
             raw_sym = exchange.market_id(swap_symbol)
 
-            # 2. 补齐溢价指数时序 (1250小时，Binance 接口上限 1500)
-            prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 1500})
-            market_data_store[symbol]["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines]
+            try:
+                prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 1500})
+                market_data_store[symbol]["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines]
+            except Exception as e:
+                print(f"   ⚠️ {symbol} premium 历史拉取失败: {e}")
 
-            # 3. 补齐资金费率时序 (资金费率 8 小时一次，500 个够 4000 小时)
-            fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
-            market_data_store[symbol]["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist]
+            try:
+                fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
+                market_data_store[symbol]["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist]
+            except Exception as e:
+                print(f"   ⚠️ {symbol} funding 历史拉取失败: {e}")
 
-            # 4. 补齐 Open Interest 时序 (1250小时，接口上限500，需要循环)
-            oi_hist = []
-            curr_end = end_time
-            while len(oi_hist) < 1250:
-                batch = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
-                if not batch: break
-                oi_hist = batch + oi_hist
-                curr_end = int(batch[0]['timestamp']) - 1
-                await asyncio.sleep(0.2)
-            market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist[-1250:]]
+            try:
+                oi_hist = []
+                curr_end = end_time
+                while len(oi_hist) < DERIVATIVE_LOOKBACK_HOURS:
+                    batch = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
+                    if not batch:
+                        break
+                    oi_hist = batch + oi_hist
+                    curr_end = int(batch[0]['timestamp']) - 1
+                    await asyncio.sleep(0.2)
+                market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist]
+            except Exception as e:
+                print(f"   ⚠️ {symbol} open interest 历史拉取失败: {e}")
 
-            # 5. 补齐大户多空比时序 (1250小时，接口上限500，需要循环)
-            ls_hist = []
-            curr_end = end_time
-            while len(ls_hist) < 1250:
-                batch = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
-                if not batch: break
-                ls_hist = batch + ls_hist
-                curr_end = int(batch[0]['timestamp']) - 1
-                await asyncio.sleep(0.2)
-            market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist[-1250:]]
-            
+            try:
+                ls_hist = []
+                curr_end = end_time
+                while len(ls_hist) < DERIVATIVE_LOOKBACK_HOURS:
+                    batch = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
+                    if not batch:
+                        break
+                    ls_hist = batch + ls_hist
+                    curr_end = int(batch[0]['timestamp']) - 1
+                    await asyncio.sleep(0.2)
+                market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist]
+            except Exception as e:
+                print(f"   ⚠️ {symbol} 大户多空比历史拉取失败: {e}")
+
         except Exception as e:
-            print(f"⚠️ {symbol} 衍生品时序拉取异常: {e}")
+            print(f"⚠️ {symbol} 衍生品/1m 预热阶段异常: {e}")
+
+        print(f"🔍 [网关自愈] 衍生品链路: API 最新值 -> TEMP_DIR 原始缓存 -> processed 兜底...")
+        temp_derivatives = await asyncio.to_thread(load_tempdir_derivative_history, symbol, cutoff_ts_ms)
+        processed_derivatives = await asyncio.to_thread(load_processed_derivative_history, symbol, cutoff_ts_ms)
+        for hist_key in ["premium_history", "funding_history", "oi_history", "ls_history"]:
+            api_hist = market_data_store[symbol].get(hist_key, [])
+            temp_hist = temp_derivatives.get(hist_key, [])
+            processed_hist = processed_derivatives.get(hist_key, [])
+            merged_hist = merge_derivative_history(api_hist, temp_hist, cutoff_ts_ms)
+            merged_hist = merge_derivative_history(merged_hist, processed_hist, cutoff_ts_ms)
+            if merged_hist:
+                market_data_store[symbol][hist_key] = merged_hist
 async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=None, limit=500):
     """通用拉取并落库逻辑，直接从交易所获取物理真实 K 线"""
     params = {'startTime': startTime} if startTime else {}
@@ -567,19 +979,34 @@ async def sync_local_aggtrades_to_db(symbol):
         if not parquet_files:
             return
 
-        df = pl.scan_parquet(PROCESSED_AGGTRADES_DIR / f"{symbol}_aggTrades_*.parquet").collect()
-        records = df.select(["whale_buy", "whale_sell", "retail_vol", "hour_timestamp"]).to_numpy().tolist()
+        df = (
+            pl.scan_parquet(PROCESSED_AGGTRADES_DIR / f"{symbol}_aggTrades_*.parquet")
+            .collect()
+            .sort("hour_timestamp")
+            .unique(subset=["hour_timestamp"], keep="last")
+            .with_columns(
+                pl.col("hour_timestamp").dt.epoch(time_unit="ms").alias("timestamp_ms")
+            )
+        )
+        records = list(df.select(["whale_buy", "whale_sell", "retail_vol", "timestamp_ms"]).iter_rows())
         
         def _update_db():
             with sqlite3.connect(DB_PATH) as conn:
                 conn.executemany(
-                    f"UPDATE memory_1h SET whale_buy=?, whale_sell=?, retail_vol=? WHERE symbol='{symbol}' AND timestamp=?",
-                    records
+                    "UPDATE memory_1h SET whale_buy=?, whale_sell=?, retail_vol=? WHERE symbol=? AND timestamp=?",
+                    [(wb, ws, rv, symbol, int(ts_ms)) for wb, ws, rv, ts_ms in records]
                 )
                 conn.commit()
-                
-        await asyncio.to_thread(_update_db)
-        print("   ✅ 历史订单流特征已成功挂载入网关底座。")
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) FROM memory_1h WHERE symbol=? AND retail_vol IS NOT NULL",
+                    (symbol,)
+                )
+                updated_rows = int(cur.fetchone()[0])
+                return updated_rows
+
+        updated_rows = await asyncio.to_thread(_update_db)
+        print(f"   ✅ 历史订单流特征已成功挂载入网关底座，当前命中 {updated_rows} 个小时桶。")
     except Exception as e:
         print(f"   ❌ 回填订单流特征异常: {e}")
 
@@ -652,6 +1079,7 @@ async def start_gateways():
     spot_ex = ccxtpro.binance()
     
     try:
+        print_gateway_data_chain()
         print("⏳ 正在拉取 Binance 市场列表，进行合约与现货合法性校验...")
         try:
             await asyncio.gather(futures_ex.load_markets(), spot_ex.load_markets())

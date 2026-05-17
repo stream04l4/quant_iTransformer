@@ -17,10 +17,10 @@ import requests  # 新增：用于发送 Webhook 请求
 from dotenv import load_dotenv
 load_dotenv()
 from quant_config.config import (
-    SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
+    SYMBOL, DATA_DIR, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
-    MAX_MARGIN_UTILIZATION, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
-    FORECAST_HORIZON
+    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
+    FORECAST_HORIZON, EXPERIMENT_ID
 )
 
 # --- 核心配置路径 ---
@@ -32,10 +32,11 @@ st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
 # --- 🧠 加载概率门槛 ---
 th = {}
 try:
-    json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{FORECAST_HORIZON}h.json")
+    json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{EXPERIMENT_ID}.json")
     if os.path.exists(json_path):
         with open(json_path, 'r') as f:
-            th = json.load(f)
+            raw_data = json.load(f)
+            th = raw_data.get("thresholds", raw_data)
 except Exception:
     pass
 
@@ -274,12 +275,75 @@ def load_trade_history_for_symbol(symbol):
         pred_lev = pd.to_numeric(df_live.get('pred_leverage', pd.Series(np.nan, index=df_live.index)), errors='coerce')
         df_live['effective_leverage'] = np.where(live_lev > 0, live_lev, np.where(pred_lev > 0, pred_lev, 10.0))
         df_live['xgb_prob'] = pd.to_numeric(df_live.get('kelly_prob', pd.Series(np.nan, index=df_live.index)), errors='coerce')
-        df_live['trade_version'] = df_live.get('data_version', pd.Series(np.nan, index=df_live.index)).fillna("v1.0")
+        df_live['trade_version'] = df_live.get('data_version', pd.Series(np.nan, index=df_live.index)).fillna("unknown")
         df_live.insert(0, '交易对', symbol)
         return df_live
     except Exception as e:
         st.error(f"❌ 加载 {symbol} 交易历史失败: {e}")
         return pd.DataFrame()
+
+
+def resolve_current_serving_model(symbol):
+    """统一解析当前服役模型身份，优先级: EXPERIMENT_ID > registry > 最新本地权重。"""
+    current_inf_version = str(EXPERIMENT_ID or "").strip() or "unknown"
+    curr_m_data_version = current_inf_version
+    curr_m_name = "未命名"
+    curr_m_created_at = pd.NaT
+
+    registry_file = os.path.join(MODEL_DIR, "model_registry.json")
+    if os.path.exists(registry_file):
+        try:
+            with open(registry_file, "r", encoding="utf-8") as f:
+                reg_data = json.load(f)
+            reg_item = reg_data.get(current_inf_version, {})
+            if reg_item:
+                curr_m_data_version = reg_item.get('data_version', curr_m_data_version) or curr_m_data_version
+                curr_m_name = reg_item.get('name', curr_m_name) or curr_m_name
+                curr_m_created_at = pd.to_datetime(reg_item.get('created_at'), errors='coerce')
+        except Exception:
+            pass
+
+    model_file = os.path.join(MODEL_DIR, f"itransformer_{symbol}_best_{current_inf_version}.pth")
+    if os.path.exists(model_file):
+        if curr_m_name == "未命名":
+            curr_m_name = os.path.splitext(os.path.basename(model_file))[0]
+        if pd.isna(curr_m_created_at):
+            curr_m_created_at = pd.to_datetime(os.path.getmtime(model_file), unit='s')
+    else:
+        latest_model_file = None
+        latest_model_mtime = None
+        prefix = f"itransformer_{symbol}_best_"
+        try:
+            for fname in os.listdir(MODEL_DIR):
+                if not (fname.startswith(prefix) and fname.endswith(".pth")):
+                    continue
+                full_path = os.path.join(MODEL_DIR, fname)
+                file_mtime = os.path.getmtime(full_path)
+                if latest_model_mtime is None or file_mtime > latest_model_mtime:
+                    latest_model_file = full_path
+                    latest_model_mtime = file_mtime
+        except Exception:
+            latest_model_file = None
+
+        if latest_model_file:
+            inferred_version = os.path.basename(latest_model_file)[len(prefix):-4]
+            if current_inf_version in {"unknown", "default_run", "v1.0"}:
+                current_inf_version = inferred_version
+                curr_m_data_version = inferred_version
+            if curr_m_name == "未命名":
+                curr_m_name = os.path.splitext(os.path.basename(latest_model_file))[0]
+            if pd.isna(curr_m_created_at):
+                curr_m_created_at = pd.to_datetime(latest_model_mtime, unit='s')
+
+    if pd.isna(curr_m_created_at):
+        curr_m_created_at = pd.to_datetime('2000-01-01')
+
+    return {
+        'inference_version': current_inf_version,
+        'data_version': curr_m_data_version,
+        'name': curr_m_name,
+        'created_at': curr_m_created_at,
+    }
 
 st.title("iTransformer 预测引擎")
 
@@ -429,7 +493,6 @@ def render_realtime_portfolio():
         realized_pnl = wallet_balance - initial_cap
 
         margin_utilization = (total_margin_used / total_equity) if total_equity > 0 else 0.0
-        max_utilization = float(MAX_MARGIN_UTILIZATION)  # 直接来自 config
 
         # UI 重构：增加进度条刻度
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -441,13 +504,12 @@ def render_realtime_portfolio():
         m_col3.metric("未实现盈亏", f"${unrealized_pnl:,.2f}", delta=delta_label, delta_color="normal" if unrealized_pnl >= 0 else "inverse")
         
         # 保持第四个卡片为战略预备队雷达
-        util_color = "normal" if margin_utilization < max_utilization else "inverse"
-        m_col4.metric("资金使用率", f"{margin_utilization:.1%}", delta=f"红线: {max_utilization:.0%}", delta_color=util_color)
+        m_col4.metric("资金使用率", f"{margin_utilization:.1%}")
         
-        # 👇 【UI 修复】：解除除以 max_utilization 的扭曲，让进度条回归真实的 0~100% 绝对物理刻度
+        # 👇 【UI 修复】：让进度条回归真实的 0~100% 绝对物理刻度
         st.progress(
             min(margin_utilization, 1.0), 
-            text=f"🛡️ 全局资金水位 (红线 {max_utilization:.0%}) | 场内已用资金: {total_margin_used:,.2f} USDT | 可用保证金: {avail_margin:,.2f} USDT"
+            text=f"🛡️ 场内已用资金: {total_margin_used:,.2f} USDT | 可用保证金: {avail_margin:,.2f} USDT"
         )
         pass
         active_pos_count = len(positions) if positions else 0
@@ -625,7 +687,7 @@ if hist_data:
                     'real_roe': real_roe,
                     'account_impact': (real_roe * mem['margin']) / initial_cap,
                     'hold_hours': (ts - mem['ts']).total_seconds() / 3600,
-                    'version': mem.get('version', 'v1.0'), # 👈 继承入场时的血统
+                    'version': mem.get('version', 'unknown'), # 👈 继承入场时的血统
                     'xgb_prob': mem.get('xgb_prob', 0.5)    # 👈 继承入场时的概率
                 })
                 color = "🟢" if real_roe > 0 else "🔴"
@@ -939,51 +1001,31 @@ with dash_tab4:
     st.markdown("##### 🤖 当前服役主模型 (Live) 实盘绩效监控")
     st.caption("此处仅对当前实盘正在加载的 AI 模型进行单独剥离分析，排除历史其他老旧型号的混合数据污染，用于直观评估【大模型当下的实战准确度与诚实度】。")
 
-    current_inf_version = "v1.0"
     if not df_closed_trades.empty:
-        
-        # 1. 查找当前模型的身世
-        registry_file = os.path.join(MODEL_DIR, "model_registry.json")
-        curr_m_data_version = "v1.0"
-        curr_m_created_at = pd.to_datetime('2000-01-01', errors='coerce')
-        curr_m_name = "未命名"
-        
-        if os.path.exists(registry_file):
-            try:
-                with open(registry_file, "r", encoding="utf-8") as f:
-                    reg_data = json.load(f)
-                    if current_inf_version in reg_data:
-                        curr_m_data_version = reg_data[current_inf_version].get('data_version', 'v1.0')
-                        curr_m_name = reg_data[current_inf_version].get('name', '未命名')
-                        curr_m_created_at = pd.to_datetime(reg_data[current_inf_version].get('created_at', '2000-01-01'), errors='coerce')
-            except Exception: pass
+        model_meta = resolve_current_serving_model(SYMBOL)
+        current_inf_version = model_meta['inference_version']
+        curr_m_data_version = model_meta['data_version']
+        curr_m_created_at = model_meta['created_at']
+        curr_m_name = model_meta['name']
 
-        default_win = 0.52
-
-        if pd.isna(curr_m_created_at):
-            curr_m_created_at = pd.to_datetime('2000-01-01')
-
-        # 2. 优先剥离当前数据血统 + 模型诞生后的实盘订单；若无样本则自动降级放宽时间条件。
-        v_df_curr = df_closed_trades[
-            (df_closed_trades['version'] == curr_m_data_version) &
-            (df_closed_trades['exec_ts'] >= curr_m_created_at) &
-            (abs(df_closed_trades['xgb_prob'].fillna(default_win) - default_win) > 0.001)
-        ].copy()
+        version_series = df_closed_trades.get('version', pd.Series(index=df_closed_trades.index, dtype='object')).fillna("unknown")
+        version_matched_df = df_closed_trades[version_series == curr_m_data_version].copy()
+        v_df_curr = version_matched_df[version_matched_df['exec_ts'] >= curr_m_created_at].copy()
 
         fallback_reason = ""
         if v_df_curr.empty:
-            v_df_curr = df_closed_trades[
-                (df_closed_trades['version'] == curr_m_data_version) &
-                (abs(df_closed_trades['xgb_prob'].fillna(default_win) - default_win) > 0.001)
-            ].copy()
+            v_df_curr = version_matched_df.copy()
             if not v_df_curr.empty:
                 fallback_reason = "当前主模型上线后的闭环样本为空，已回退为同血统历史样本。"
         if v_df_curr.empty:
-            any_ai_df = df_closed_trades[abs(df_closed_trades['xgb_prob'].fillna(default_win) - default_win) > 0.001].copy()
-            if not any_ai_df.empty:
-                latest_version = any_ai_df.sort_values('exec_ts').iloc[-1]['version']
-                v_df_curr = any_ai_df[any_ai_df['version'] == latest_version].copy()
+            known_version_df = df_closed_trades[version_series != "unknown"].copy()
+            if not known_version_df.empty:
+                latest_version = known_version_df.sort_values('exec_ts').iloc[-1]['version']
+                v_df_curr = known_version_df[known_version_df['version'] == latest_version].copy()
                 fallback_reason = f"当前主模型血统暂无闭环样本，已临时展示最近一个有实盘样本的模型血统 `{latest_version}`。"
+        if v_df_curr.empty and (version_series == "unknown").any():
+            v_df_curr = df_closed_trades[version_series == "unknown"].copy()
+            fallback_reason = "历史流水缺少模型血统字段，已退化展示未标注版本的实盘样本。"
         
         st.info(f"🛡️ **正在服役的主将**: `[{curr_m_data_version}] {curr_m_name}` (指纹 UUID: `{current_inf_version}`)")
         
@@ -1018,23 +1060,29 @@ with dash_tab4:
             with col2:
                 st.markdown("###### ⚖️ AI 诚实度校准 (Confidence Calibration)")
                 bins = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-                v_df_curr.loc[:, 'prob_bin'] = pd.cut(v_df_curr['xgb_prob'], bins=bins)
-                cal_stats = v_df_curr.groupby('prob_bin', observed=False)['real_roe'].apply(lambda x: (x > 0).mean() if len(x) > 0 else 0).fillna(0)
-                
-                fig_cal = go.Figure(data=[
-                    go.Bar(
-                        x=[f"{b.left*100:.0f}%-{b.right*100:.0f}%" for b in cal_stats.index], 
-                        y=cal_stats.values, marker_color='#00FFAA',
-                        text=[f"{v*100:.1f}%" for v in cal_stats.values], textposition='auto'
+                v_df_cal = v_df_curr[pd.to_numeric(v_df_curr['xgb_prob'], errors='coerce').between(0.5, 1.0, inclusive='both')].copy()
+                if v_df_cal.empty:
+                    st.info("⏳ 当前批次平仓样本未记录有效置信度，暂时无法绘制校准诚实度柱状图。")
+                else:
+                    v_df_cal.loc[:, 'prob_bin'] = pd.cut(v_df_cal['xgb_prob'], bins=bins, include_lowest=True)
+                    cal_stats = v_df_cal.groupby('prob_bin', observed=False)['real_roe'].apply(
+                        lambda x: (x > 0).mean() if len(x) > 0 else 0
+                    ).fillna(0)
+                    
+                    fig_cal = go.Figure(data=[
+                        go.Bar(
+                            x=[f"{b.left*100:.0f}%-{b.right*100:.0f}%" for b in cal_stats.index],
+                            y=cal_stats.values, marker_color='#00FFAA',
+                            text=[f"{v*100:.1f}%" for v in cal_stats.values], textposition='auto'
+                        )
+                    ])
+                    fig_cal.update_layout(
+                        height=240, margin=dict(l=0,r=0,t=10,b=0),
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        yaxis=dict(tickformat=".0%", range=[0, 1.1])
                     )
-                ])
-                fig_cal.update_layout(
-                    height=240, margin=dict(l=0,r=0,t=10,b=0),
-                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                    yaxis=dict(tickformat=".0%", range=[0, 1.1])
-                )
-                st.plotly_chart(fig_cal, width='stretch')
-                st.caption("*(图解：完美的 AI 应该在预期胜率更高的区间，展现出对应的高物理胜率，即**极佳的校准诚实度**)*")
+                    st.plotly_chart(fig_cal, width='stretch')
+                    st.caption("*(图解：完美的 AI 应该在预期胜率更高的区间，展现出对应的高物理胜率，即**极佳的校准诚实度**)*")
     else:
         st.info("💡 暂无平仓流水。")
 # ==========================================
@@ -1124,8 +1172,6 @@ st.sidebar.markdown(f"""
 | 🔴 K线物理止损 | `{HARD_SL*100:.1f}%` |
 | ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |
 | 📊 爆量乘数 | `{BAILOUT_VOL_MULTI}x` |
-| 🛡️ 资金使用率红线 | `{MAX_MARGIN_UTILIZATION:.0%}` |
-| --- | --- |
 | **📈 做多门槛 (Tier 1/2/3)** | `{th.get('up_top_10', 0):.2%} / {th.get('up_top_5', 0):.2%} / {th.get('up_top_1', 0):.2%}` |
 | **📉 做空门槛 (Tier 1/2/3)** | `{th.get('down_top_10', 0):.2%} / {th.get('down_top_5', 0):.2%} / {th.get('down_top_1', 0):.2%}` |
 """)
@@ -1232,7 +1278,7 @@ def render_market_radar():
         ema_macro_slope = 0.001 if is_uptrend_proxy else -0.001
         
         up_prob = adj_p_up if adj_p_up > adj_p_down else (1.0 - adj_p_down)
-        auto_leverage = float(MAX_MARGIN_UTILIZATION) * 10  # 直接来自 config
+        auto_leverage = 8.0  # 默认保底杠杆率 8x
         tp_pct = 0.08
         sl_pct = 0.04
         

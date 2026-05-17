@@ -8,7 +8,7 @@ import re
 import yfinance as yf
 from datetime import datetime
 from dotenv import load_dotenv
-from quant_config.config import LIVE_DATA_DIR, LOG_DIR
+from quant_config.config import LIVE_DATA_DIR
 
 # 👇 激活 .env 文件读取
 load_dotenv()

@@ -4,7 +4,6 @@ import requests
 import zipfile
 import numpy as np
 import time
-import shutil
 import polars as pl
 import argparse
 from datetime import datetime, timedelta, date
@@ -52,6 +51,11 @@ def fetch_binance_data(market, data_type, symbol, year, month, timeframe="1h"):
     sandbox_dir = TEMP_DIR / data_type / symbol / f"{year}_{month_str}"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     zip_path = sandbox_dir / "temp.zip"
+
+    existing_csvs = [p for p in sandbox_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+    if existing_csvs:
+        print(f"♻️ 复用本地缓存: {data_type} ({timeframe}) | {symbol} | {year}-{month_str}")
+        return existing_csvs[0]
     
     print(f"⬇️ 正在下载: {data_type} ({timeframe}) | {symbol} | {year}-{month_str}")
     
@@ -93,7 +97,6 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
             df = pl.read_csv(csv_path, has_header=(market=="futures"), new_columns=cols)
             time_col = "calc_time" if data_type == "fundingRate" else "open_time"
             df = df.cast({col: pl.Float64 for col in cols if col != time_col})
-            shutil.rmtree(csv_path.parent, ignore_errors=True) # 🚨 摧毁整个独立沙盒，回收硬盘
             return df
         return None
 
@@ -124,7 +127,10 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
         raw_dir = TEMP_DIR / "klines" / symbol
         raw_dir.mkdir(parents=True, exist_ok=True)
         output_path = raw_dir / f"{symbol}_raw_{timeframe}.parquet"
-        full_df.select(["exact_timestamp", "open", "high", "low", "close"]).rename({"exact_timestamp": "timestamp"}).write_parquet(output_path)
+        raw_cols = ["exact_timestamp", "open", "high", "low", "close", "volume"]
+        optional_cols = ["quote_volume", "count", "taker_buy_volume"]
+        raw_cols.extend([c for c in optional_cols if c in full_df.columns])
+        full_df.select(raw_cols).rename({"exact_timestamp": "timestamp"}).write_parquet(output_path)
         print(f"   💾 {timeframe} 物理 K 线库合并完成并生成缓存: {output_path.name}")
         
     return full_df.with_columns(
@@ -156,6 +162,10 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
         sandbox_dir = type_temp_dir / date_str
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         zip_path = sandbox_dir / "temp.zip"
+
+        existing_csvs = [p for p in sandbox_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+        if existing_csvs:
+            return existing_csvs[0]
         
         for attempt in range(3):
             try:
@@ -200,8 +210,6 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
             dfs.append(df)
         except Exception as e:
             print(f"   ⚠️ 跳过异常 Metrics 文件 {p.name}: {e}")
-        finally:
-            shutil.rmtree(p.parent, ignore_errors=True)
     
     metrics_df = pl.concat(dfs)
     
