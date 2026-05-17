@@ -9,9 +9,9 @@ from quant_config.config import MODEL_DIR
 
 # 这是我们要保留的 5 个精英模型的 ID
 SAFE_IDS = [
-    "07373A9A",
-    "1626B0D2",
-    "B84CD094",
+    "D47B1607",
+    "E68E2CD0",
+    "3747D2DB",
     "55D81945",
     "94D14540"
 ]
@@ -19,8 +19,8 @@ SAFE_IDS = [
 
 def cleanup_models(directory, safe_ids):
     # 构建匹配模式：匹配所有以 itransformer_BTCUSDT_best_EXP_ 开头且以 .pth 结尾的文件
-    pattern = os.path.join(directory, "itransformer_BTCUSDT_best_EXP_*.pth")
-    #pattern = os.path.join(directory, "dynamic_thresholds_EXP_*.json")
+    #pattern = os.path.join(directory, "itransformer_BTCUSDT_best_EXP_*.pth")
+    pattern = os.path.join(directory, "dynamic_thresholds_EXP_*.json")
     #pattern = os.path.join(directory, "backtest_probabilistic_EXP_*.png")
     all_files = glob.glob(pattern)
     

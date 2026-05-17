@@ -18,20 +18,20 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
-    'SEQ_LEN': [336, 672],
+    'SEQ_LEN': [672],
     'CLASS_THRESHOLD': [0.015],
     'E_LAYERS': [2],
-    'D_MODEL': [64, 128, 256],
-    'DROPOUT': [0.3, 0.4],
-    'BATCH_SIZE': [128, 256],
-    'LEARNING_RATE': [1e-5, 5e-6],
+    'D_MODEL': [128],
+    'DROPOUT': [0.2],
+    'BATCH_SIZE': [128],
+    'LEARNING_RATE': [5e-6],
     'EPOCHS': [50]
 }
 
 BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_1': [1.0, 2.0],
-    'LEVERAGE_2': [3.0, 4.0],
-    'LEVERAGE_3': [5.0, 7.0],
+    'LEVERAGE_2': [2.0, 3.0],
+    'LEVERAGE_3': [3.0, 4.0, 5.0],
     'HOLD_PERIOD': [6, 12, 24],
     'HARD_TP': [0.03, 0.04, 0.05],
     'HARD_SL': [0.015, 0.02, 0.03, 0.04]
@@ -93,60 +93,61 @@ def run_experiment(params, mode, base_model, save_models):
     stdout_log = ""
     res = {}
     
-    if mode == 'alpha':
-        scripts = ['train_itransformer.py', 'check_prob_distribution.py', 'alpha_ic_evaluator.py']
-        for script in scripts:
-            script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
+    try:
+        if mode == 'alpha':
+            scripts = ['train_itransformer.py', 'check_prob_distribution.py', 'alpha_ic_evaluator.py']
+            for script in scripts:
+                script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
+                result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
+                if result.returncode != 0:
+                    return {"error": f"💥 {script} 报错:\n{result.stderr}", **params, 'exp_id': exp_id}
+                if script == 'alpha_ic_evaluator.py':
+                    stdout_log = result.stdout
+            # 获取当前实验对应的 Horizon
+            target_horizon = params.get('FORECAST_HORIZON', 12)
+            res = extract_alpha_metrics(stdout_log, target_horizon)
+            
+        elif mode == 'backtest':
+            src_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{base_model}.pth"
+            src_json = MODEL_DIR / f"dynamic_thresholds_{base_model}.json"
+            tmp_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
+            tmp_json = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+            
+            try:
+                shutil.copy(src_model, tmp_model)
+                shutil.copy(src_json, tmp_json)
+            except Exception as e:
+                return {"error": f"💥 基座模型复制失败: {e}", **params, 'exp_id': exp_id}
+                
+            script_path = BACKTEST_DIR / 'backtest_itransformer.py'
             result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
+            
             if result.returncode != 0:
-                return {"error": f"💥 {script} 报错:\n{result.stderr}", **params}
-            if script == 'alpha_ic_evaluator.py':
+                res = {"error": f"💥 回测报错:\n{result.stderr}", **params}
+            else:
                 stdout_log = result.stdout
-        # 获取当前实验对应的 Horizon
-        target_horizon = params.get('FORECAST_HORIZON', 12)
-        res = extract_alpha_metrics(stdout_log, target_horizon)
+                res = extract_backtest_metrics(stdout_log)
+
+        res.update(params)
+        res['exp_id'] = exp_id
         
-    elif mode == 'backtest':
-        src_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{base_model}.pth"
-        src_json = MODEL_DIR / f"dynamic_thresholds_{base_model}.json"
-        tmp_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
-        tmp_json = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
-        
-        try:
-            shutil.copy(src_model, tmp_model)
-            shutil.copy(src_json, tmp_json)
-        except Exception as e:
-            return {"error": f"💥 基座模型复制失败: {e}", **params}
-            
-        script_path = BACKTEST_DIR / 'backtest_itransformer.py'
-        result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
-        
-        if result.returncode != 0:
-            res = {"error": f"💥 回测报错:\n{result.stderr}", **params}
+        if not save_models:
+            res['model_file'] = "Deleted"
         else:
-            stdout_log = result.stdout
-            res = extract_backtest_metrics(stdout_log)
-            
-        try:
-            os.remove(tmp_model)
-            os.remove(tmp_json)
-        except: pass
+            res['model_file'] = f"itransformer_{SYMBOL}_best_{exp_id}.pth"
 
-    res.update(params)
-    res['exp_id'] = exp_id
-    
-    if not save_models:
-        try: os.remove(MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth") 
-        except: pass
-        try: os.remove(MODEL_DIR / f"dynamic_thresholds_{exp_id}.json") 
-        except: pass
-        try: os.remove(MODEL_DIR / f"backtest_probabilistic_{exp_id}.png")
-        except: pass
-        res['model_file'] = "Deleted"
-    else:
-        res['model_file'] = f"itransformer_{SYMBOL}_best_{exp_id}.pth"
+        return res
 
-    return res
+    finally:
+        if not save_models:
+            for f in [
+                MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth",
+                MODEL_DIR / f"dynamic_thresholds_{exp_id}.json",
+                MODEL_DIR / f"backtest_probabilistic_{exp_id}.png"
+            ]:
+                try: 
+                    if f.exists(): os.remove(f)
+                except: pass
 
 def main():
     parser = argparse.ArgumentParser(description='Auto Optimize TimesFM')
@@ -178,7 +179,7 @@ def main():
     print("=" * 80)
 
     # 🚨 修复单卡 H100 灾难：alpha 模式最多 2 个并发，保障显存安全；backtest 模式 20 核 CPU 开 16 并发。
-    MAX_WORKERS = 16 
+    MAX_WORKERS = 8
     batches = [combinations[i:i + MAX_WORKERS] for i in range(0, len(combinations), MAX_WORKERS)]
     
     all_results = []
@@ -207,20 +208,6 @@ def main():
                         print(f"   {progress_str} 🏦 [回测] 期望值: {res['expectancy_pct']:>+6.3f}% | 恢复因子: {res['recovery_factor']:>5.2f} | ID: {res['exp_id']}")
         
         pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
-
-        if not args.save_models:
-            swept_files = 0
-            for f in MODEL_DIR.glob("dynamic_thresholds_EXP_*.json"):
-                try: os.remove(f); swept_files += 1 
-                except Exception: pass
-            for f in MODEL_DIR.glob("backtest_probabilistic_EXP_*.png"):
-                try: os.remove(f); swept_files += 1
-                except Exception: pass
-            for f in MODEL_DIR.glob("itransformer_*_best_EXP_*.pth"):
-                try: os.remove(f); swept_files += 1 
-                except Exception: pass
-            if swept_files > 0:
-                print(f"   🧹 第 {batch_idx} 批次收尾 | 清理了 {swept_files} 个僵尸文件。")
 
     print("=" * 80)
     print(f"🎉 任务完成！耗时: {(time.time() - start_time) / 60:.2f} 分钟。报告已存至 {RESULTS_CSV.name}")
