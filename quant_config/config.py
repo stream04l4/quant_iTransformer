@@ -1,5 +1,9 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded before configuration parsing
+load_dotenv()
 
 # ==========================================
 # 1. 目录结构配置 (Directory Paths)
@@ -101,7 +105,7 @@ BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确�
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)
 # ==========================================
-EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "EXP_D47B1607")
+EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))

@@ -71,6 +71,36 @@ init_sqlite_db()
 # ==========================================
 # 🛰️ WebSocket 搬运工：死循环监听流
 # ==========================================
+async def handle_ws_exception(exchange, symbol, stream_name, e, was_dead, retry_delay):
+    is_timeout = isinstance(e, asyncio.TimeoutError)
+    err_str = str(e).lower()
+    
+    if "假死重连" in err_str:
+        return True, retry_delay, 1
+        
+    if is_timeout or "timeout" in err_str or "network" in err_str or "closed" in err_str or "client connection dropped" in err_str:
+        if is_timeout:
+            print(f"   ⚠️ [WS 看门狗] {symbol} {stream_name} 超过 180 秒无变动，触发重连！")
+        else:
+            print(f"   ⚠️ [WS 断线] {symbol} {stream_name} 连接异常: {e}，清理连接并休眠 {retry_delay}s...")
+            
+        for url, client in list(exchange.clients.items()):
+            for f in list(client.futures.values()):
+                if isinstance(f, list):
+                    for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
+                else:
+                    f.add_done_callback(lambda x: x.exception())
+            client.reject(Exception(f"{symbol} {stream_name}触发假死重连"))
+            exchange.clients.pop(url, None)
+            
+        sleep_time = retry_delay
+        new_retry_delay = min(60, retry_delay * 2)
+        return True, new_retry_delay, sleep_time
+        
+    if stream_name != "最新价流": # 最新价流报错太多，屏蔽未知异常打印
+        print(f"   ❌ [WS 未知异常] {symbol} {stream_name}: {type(e).__name__} -> {e}")
+    return was_dead, retry_delay, 5
+
 async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, startup_delay):
     """ 纯粹的 K 线 WebSocket 监听流 (历史预热已交由中台全局引擎处理) """
     # 严格的错峰启动，杜绝 Binance 并发订阅静默丢包
@@ -78,6 +108,7 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
     print(f"📡 [WS] 启动 {symbol} ({timeframe}) {engine_type}K线订阅...")
     
     was_dead = False
+    retry_delay = 2
     while True:
         try:
             # 🛡️ 【看门狗防线】：90秒收不到任何 K 线跳动，强制视为假死并抛出异常
@@ -89,6 +120,7 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} ({timeframe}) {engine_type}K线流已成功重新连接并收到数据！")
                 was_dead = False
+            retry_delay = 2
                 
             for candle in ohlcvs:
                 q = market_data_store[symbol][timeframe]
@@ -100,35 +132,10 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
                     q.append(candle)
                     
         except Exception as e:
-            is_timeout = isinstance(e, asyncio.TimeoutError)
-            err_str = str(e).lower()
-            
-            if "假死重连" in str(e):
-                # 兄弟线程已经把共享的 websocket 砸了重建，我们只需要默默跟随重连即可，不要大声喧哗
-                was_dead = True
-                await asyncio.sleep(1)
-                continue
-                
-            if is_timeout or "timeout" in err_str or "network" in err_str or "closed" in err_str:
-                if is_timeout:
-                    print(f"   ⚠️ [WS 看门狗] {symbol} ({timeframe}) 超过 180 秒无变动，触发 WebSocket 重连！")
-                else:
-                    print(f"   ⚠️ [WS 断线] {symbol} ({timeframe}) 连接异常: {e}，触发底舱清理与重连！")
-                
-                # 强制清理底层死锁的 WS 客户端，促使下次调用重新发 SUBSCRIBE 请求
-                for url, client in list(exchange.clients.items()):
-                    for f in list(client.futures.values()):
-                        if isinstance(f, list):
-                            for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
-                        else:
-                            f.add_done_callback(lambda x: x.exception())
-                    client.reject(Exception(f"底层引擎触发假死重连"))
-                    exchange.clients.pop(url, None)
-                was_dead = True
-                await asyncio.sleep(2)
-            else:
-                print(f"   ❌ [WS 未知异常] {symbol} {timeframe}: {type(e).__name__} -> {e}")
-                await asyncio.sleep(5)
+            was_dead, retry_delay, sleep_time = await handle_ws_exception(
+                exchange, symbol, f"({timeframe}) K线流", e, was_dead, retry_delay
+            )
+            await asyncio.sleep(sleep_time)
 
 async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听盘口流 (增量自动合并) """
@@ -136,6 +143,7 @@ async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_del
     print(f"📡 [WS] 启动 {symbol} {engine_type}盘口深度订阅...")
     
     was_dead = False
+    retry_delay = 2
     while True:
         try:
             # 🛡️ 【看门狗防线】：90秒收不到盘口变动，强制视为假死
@@ -146,26 +154,17 @@ async def orderbook_loop(exchange, symbol, swap_symbol, engine_type, startup_del
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}盘口深度流已成功恢复！")
                 was_dead = False
+            retry_delay = 2
                 
             market_data_store[symbol]["orderbook"] = {
                 "bids": orderbook['bids'],
                 "asks": orderbook['asks']
             }
-        except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 盘口深度超过 180 秒无变动，触发假死重连！")
-            for url, client in list(exchange.clients.items()):
-                for f in list(client.futures.values()):
-                    if isinstance(f, list):
-                        for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
-                    else:
-                        f.add_done_callback(lambda x: x.exception())
-                client.reject(Exception(f"{symbol} 盘口深度流假死重连"))
-                exchange.clients.pop(url, None)
-            was_dead = True
-            await asyncio.sleep(2)
         except Exception as e:
-            print(f"   ❌ [WS 盘口异常] {symbol}: {e}")
-            await asyncio.sleep(5)
+            was_dead, retry_delay, sleep_time = await handle_ws_exception(
+                exchange, symbol, "盘口深度流", e, was_dead, retry_delay
+            )
+            await asyncio.sleep(sleep_time)
 
 async def ticker_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听最新价流 """
@@ -173,6 +172,7 @@ async def ticker_loop(exchange, symbol, swap_symbol, engine_type, startup_delay)
     print(f"📡 [WS] 启动 {symbol} {engine_type}最新价流订阅...")
     
     was_dead = False
+    retry_delay = 2
     while True:
         try:
             # 🛡️ 【看门狗防线】：90秒收不到最新价跳动，强制视为假死
@@ -183,31 +183,30 @@ async def ticker_loop(exchange, symbol, swap_symbol, engine_type, startup_delay)
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}最新价流已成功恢复！")
                 was_dead = False
+            retry_delay = 2
                 
             market_data_store[symbol]["ticker"]["last"] = ticker['last']
             market_data_store[symbol]["status"] = "live"
-        except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 最新价超过 180 秒无跳动，触发假死重连！")
-            for url, client in list(exchange.clients.items()):
-                for f in list(client.futures.values()):
-                    if isinstance(f, list):
-                        for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
-                    else:
-                        f.add_done_callback(lambda x: x.exception())
-                client.reject(Exception(f"{symbol} 最新价流假死重连"))
-                exchange.clients.pop(url, None)
-            was_dead = True
-            await asyncio.sleep(2)
         except Exception as e:
-            await asyncio.sleep(5)
+            was_dead, retry_delay, sleep_time = await handle_ws_exception(
+                exchange, symbol, "最新价流", e, was_dead, retry_delay
+            )
+            await asyncio.sleep(sleep_time)
 async def liquidation_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听币安实时爆仓流 (CCXT 强力防呆兼容版) """
     await asyncio.sleep(startup_delay)
     print(f"📡 [WS] 启动 {symbol} {engine_type}爆仓流订阅...")
     
+    was_dead = False
+    retry_delay = 2
     while True:
         try:
             liquidations = await exchange.watch_liquidations(swap_symbol)
+            if was_dead:
+                print(f"   ✅ [WS 恢复] {symbol} {engine_type}爆仓流已成功恢复！")
+                was_dead = False
+            retry_delay = 2
+            
             for liq in liquidations:
                 # 👇 核心防呆设计：CCXT 某些版本的字段映射不全，我们使用 .get() 穿透到底层 info
                 
@@ -236,9 +235,10 @@ async def liquidation_loop(exchange, symbol, swap_symbol, engine_type, startup_d
                 # print(f"   💥 [CCXT 爆仓侦测] {symbol} {dir_icon} | 金额: ${usd_val:,.0f}")
                 
         except Exception as e:
-            # 捕获异常，休眠后重试
-            print(f"   ❌ [WS 爆仓流致命异常] {symbol}: {type(e).__name__} -> {e}")
-            await asyncio.sleep(5)
+            was_dead, retry_delay, sleep_time = await handle_ws_exception(
+                exchange, symbol, "爆仓流", e, was_dead, retry_delay
+            )
+            await asyncio.sleep(sleep_time)
 
 async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听逐笔成交流，降维聚合为 1h 级别的高级量价与订单流特征 """
@@ -246,6 +246,7 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     print(f"📡 [WS] 启动 {symbol} {engine_type}逐笔成交流订阅 (包含大单拆解)...")
     
     was_dead = False
+    retry_delay = 2
     while True:
         try:
             trades = await asyncio.wait_for(
@@ -255,6 +256,7 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
             if was_dead:
                 print(f"   ✅ [WS 恢复] {symbol} {engine_type}逐笔成交流已成功恢复！")
                 was_dead = False
+            retry_delay = 2
                 
             for t in trades:
                 # 按 1h 降维 (对齐离线特征的 truncate("1h"))
@@ -288,26 +290,17 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
                 if amount <= RETAIL_THRESHOLD:
                     stats["retail_vol"] += amount
             
-            # 定期垃圾回收：保留最近 3 小时的字典即可
+            # 定期垃圾回收：配合 1250 小时的回溯需求，延长保留期
             current_hour = int(datetime.utcnow().timestamp() / 3600) * 3600000
-            old_keys = [k for k in list(bucket.keys()) if k < current_hour - 504 * 3600000]
+            old_keys = [k for k in list(bucket.keys()) if k < current_hour - 1250 * 3600000]
             for k in old_keys:
                 del bucket[k]
                 
-        except asyncio.TimeoutError:
-            print(f"   ⚠️ [WS 看门狗] {symbol} 逐笔成交超时 180 秒，触发重连！")
-            for url, client in list(exchange.clients.items()):
-                for f in list(client.futures.values()):
-                    if isinstance(f, list):
-                        for sub_f in f: sub_f.add_done_callback(lambda x: x.exception())
-                    else:
-                        f.add_done_callback(lambda x: x.exception())
-                client.reject(Exception(f"{symbol} 逐笔成交流假死重连"))
-                exchange.clients.pop(url, None)
-            was_dead = True
-            await asyncio.sleep(2)
         except Exception as e:
-            await asyncio.sleep(5)
+            was_dead, retry_delay, sleep_time = await handle_ws_exception(
+                exchange, symbol, "逐笔成交流", e, was_dead, retry_delay
+            )
+            await asyncio.sleep(sleep_time)
 
 async def mark_price_loop(exchange, symbol, swap_symbol):
     """ 监听标记价格流，提取溢价指数 (Premium Index) """
@@ -421,38 +414,51 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
         cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
         ts_list = [r[0] for r in cursor.fetchall()]
 
-    if len(ts_list) < 2:
-        # 初次启动，拉取全量
-        print(f"   🆕 {symbol} 本地无数据，执行全量预热...")
-        await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, limit=1250)
-    else:
-        # 检查时间轴空隙
-        ts_list.reverse()
-        gaps = []
-        for i in range(len(ts_list) - 1):
-            if ts_list[i+1] - ts_list[i] != 3600000: # 1h 差值应为 3600000ms
-                gaps.append((ts_list[i], ts_list[i+1]))
+    if len(ts_list) < 1250:
+        print(f"   ⚠️ {symbol} 历史数据不足 1250 根 (当前 {len(ts_list)} 根)，正在向过去回溯拉取...")
+        oldest_ts = ts_list[-1] if ts_list else int(time.time() * 1000)
         
-        if gaps:
-            print(f"   ⚠️ {symbol} 侦测到 {len(gaps)} 处数据空隙，正在强制回填物理数据...")
-            for start, end in gaps:
-                # 针对每一处空隙，精准拉取
-                await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=start+1, limit=500)
-        else:
-            print(f"   ✅ {symbol} 时间轴完美连续。")
+        while len(ts_list) < 1250:
+            missing = 1250 - len(ts_list)
+            batch = min(missing, 1000)
+            target_start = oldest_ts - batch * 3600000
+            await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=target_start, limit=batch)
+            oldest_ts = target_start
+            await asyncio.sleep(0.5)
+            
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
+                ts_list = [r[0] for r in cursor.fetchall()]
+
+    # 检查时间轴空隙
+    ts_list.reverse()
+    gaps = []
+    for i in range(len(ts_list) - 1):
+        if ts_list[i+1] - ts_list[i] != 3600000: # 1h 差值应为 3600000ms
+            gaps.append((ts_list[i], ts_list[i+1]))
+    
+    if gaps:
+        print(f"   ⚠️ {symbol} 侦测到 {len(gaps)} 处数据空隙，正在强制回填物理数据...")
+        for start, end in gaps:
+            # 针对每一处空隙，精准拉取
+            await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=start+1, limit=500)
+    else:
+        print(f"   ✅ {symbol} 时间轴完美连续。")
 
     # 🚨 触发一次性回填
     if not is_spot:
         await sync_local_aggtrades_to_db(symbol)
 
-# ================= 终极步骤：将完美的 1250 根数据灌入内存 =================
+    # 🚨 在所有回填结束后，重新从数据库加载完整无缝的底座特征到内存
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
-        rows = cursor.fetchall()
-
-    rows.reverse()
-    for r in rows:
+        final_rows = cursor.fetchall()
+        
+    final_rows.reverse()
+    market_data_store[symbol]["1h"].clear()
+    for r in final_rows:
         ts = r[1]
         market_data_store[symbol]["1h"].append([ts, r[2], r[3], r[4], r[5], r[6]])
         if not is_spot:
@@ -461,13 +467,15 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
                 "taker_buy_volume": r[9], "taker_sell_volume": r[10],
                 "whale_buy": r[11], "whale_sell": r[12], "retail_vol": r[13]
             }
+
+
     # === 新增：网关包揽 1m K线与所有衍生品的历史时序拉取 ===
     if not is_spot:
         print(f"🔍 [网关自愈] 正在拉取 {symbol} 衍生品时序与 1m 显微镜底座...")
         try:
-            print(f"🔍 [网关自愈] 正在全量拉取 {symbol} 过去 504 小时的 1m 显微数据 (约3万根)...")
+            print(f"🔍 [网关自愈] 正在全量拉取 {symbol} 过去 1250 小时的 1m 显微数据 (约7.5万根)...")
             end_time = int(time.time() * 1000)
-            start_time = end_time - 505 * 3600 * 1000 # 多拉 1 小时容错
+            start_time = end_time - 1250 * 3600 * 1000 # 匹配 1250 小时回溯
             all_1m = []
             curr_ts = start_time
 
@@ -485,21 +493,35 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
 
             raw_sym = exchange.market_id(swap_symbol)
 
-            # 2. 补齐溢价指数时序 (500小时)
-            prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 500})
+            # 2. 补齐溢价指数时序 (1250小时，Binance 接口上限 1500)
+            prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 1500})
             market_data_store[symbol]["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines]
 
-            # 3. 补齐资金费率时序 (500个节点)
+            # 3. 补齐资金费率时序 (资金费率 8 小时一次，500 个够 4000 小时)
             fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
             market_data_store[symbol]["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist]
 
-            # 4. 补齐 Open Interest 时序 (500小时)
-            oi_hist = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500})
-            market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist]
+            # 4. 补齐 Open Interest 时序 (1250小时，接口上限500，需要循环)
+            oi_hist = []
+            curr_end = end_time
+            while len(oi_hist) < 1250:
+                batch = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
+                if not batch: break
+                oi_hist = batch + oi_hist
+                curr_end = int(batch[0]['timestamp']) - 1
+                await asyncio.sleep(0.2)
+            market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist[-1250:]]
 
-            # 5. 补齐大户多空比时序 (500小时)
-            ls_hist = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500})
-            market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist]
+            # 5. 补齐大户多空比时序 (1250小时，接口上限500，需要循环)
+            ls_hist = []
+            curr_end = end_time
+            while len(ls_hist) < 1250:
+                batch = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
+                if not batch: break
+                ls_hist = batch + ls_hist
+                curr_end = int(batch[0]['timestamp']) - 1
+                await asyncio.sleep(0.2)
+            market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist[-1250:]]
             
         except Exception as e:
             print(f"⚠️ {symbol} 衍生品时序拉取异常: {e}")
@@ -511,7 +533,7 @@ async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTim
             if not is_spot:
                 klines = await exchange.fapiPublicGetKlines({'symbol': exchange.market_id(swap_symbol), 'interval': '1h', 'limit': limit, **params})
             else:
-                klines = await exchange.fetch_ohlcv(swap_symbol, '1h', params=params)
+                klines = await exchange.fetch_ohlcv(swap_symbol, '1h', since=startTime, limit=limit)
         
         new_records = []
         for k in klines:

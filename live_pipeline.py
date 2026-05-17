@@ -13,8 +13,6 @@ from state_manager import state
 import sqlite3
 import os
 from datetime import datetime
-from dotenv import load_dotenv
-load_dotenv()
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, TEMP_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
@@ -22,7 +20,8 @@ from quant_config.config import (
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR  
 )
-
+from dotenv import load_dotenv
+load_dotenv()
 # ==========================================
 # 1. 加载实盘配置 (基于 EXPERIMENT_ID 精准定位)
 # ==========================================
@@ -78,8 +77,8 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df = df.iloc[:-1]
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    if len(df) < (LIVE_SEQ_LEN + 168):
-        raise ValueError(f"主K线历史长度不足 (需>={LIVE_SEQ_LEN + 168}，当前{len(df)})")
+    if len(df) < (ACTUAL_SEQ_LEN + 168):
+        raise ValueError(f"主K线历史长度不足 (需>={ACTUAL_SEQ_LEN + 168}，当前{len(df)})")
 
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
 
@@ -116,6 +115,10 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
     state_cols = ['eth_btc_close', 'premium_close', 'sum_open_interest', 'ls_ratio']
     df[state_cols] = df[state_cols].ffill(limit=3)
+    
+    # 🚨 实盘补丁：币安 API 仅提供 30 天 (720小时) 历史，引擎预热需要 840 小时。采用向后兜底填充防止开头熔断
+    df[state_cols] = df[state_cols].bfill()
+    df['funding_rate'] = df['funding_rate'].bfill()
 
     # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的 35000 根纯净 1m K线
     if 'ohlcv_1m' in main_snap and len(main_snap['ohlcv_1m']) > 0:
@@ -128,6 +131,8 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df = df.merge(rv_df, on='hour_timestamp', how='left')
     else:
         df['realized_vol_1h'] = np.nan
+        
+    df['realized_vol_1h'] = df['realized_vol_1h'].bfill().fillna(0.0)
 
     # 5. 订单流特征
     taker_stats = main_snap.get('taker_stats_1h', {})
@@ -217,7 +222,6 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # 8. 终极截取与熔断防线 (🚨 像素级对齐训练集特征与顺序)
     final_cols = [
         "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
         "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
@@ -227,7 +231,8 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         "rv_term_structure", 
         "funding_rate_momentum", "premium_delta", "eth_btc_return", 
         "hour_sin", "hour_cos", "week_sin", "week_cos", 
-        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence"
+        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence",
+        "is_synthetic"
     ]
     
     for col in final_cols:
@@ -421,7 +426,7 @@ def run_live():
                     features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
                     
                     # 提取喂给模型的那个精确窗口
-                    inference_window = features_df[feature_cols].iloc[-LIVE_SEQ_LEN:]
+                    inference_window = features_df[feature_cols].iloc[-ACTUAL_SEQ_LEN:]
                     input_raw = inference_window.values.astype('float32')
                     x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                     
