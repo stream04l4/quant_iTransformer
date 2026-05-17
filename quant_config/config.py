@@ -64,15 +64,15 @@ METRICS_COLS = [
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
 # 👇 全部改为动态获取，供 Mode 2 寻优
-LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 1.0))
-LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 3.0))
-LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 7.0))
+LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 2.0))
+LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 2.0))
+LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 3.0))
 
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.03))           
-HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.03))
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.05))           
+HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 
 # --- 实盘专用风控与仓位参数 ---
 TRADE_COOLDOWN_SEC = 3500            # 开仓后防连续发车冷却时间(秒)
@@ -101,7 +101,7 @@ BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确�
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)
 # ==========================================
-EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
+EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "EXP_D47B1607")
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))
