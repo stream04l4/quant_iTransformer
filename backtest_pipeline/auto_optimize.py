@@ -70,10 +70,17 @@ def extract_backtest_metrics(output):
             
         if match := re.search(r"▪ 最终净值\s+: ([\-\+\d\.]+)", output): metrics['final_equity'] = float(match.group(1))
         if match := re.search(r"▪ 胜率 \(WR\)\s+: ([\-\+\d\.]+)%", output): metrics['win_rate'] = float(match.group(1))
+        if match := re.search(r"▪ 盈亏比 \(PF\):\s*([\-\+\d\.inf]+)", output): metrics['profit_factor'] = float(match.group(1)) if match.group(1) != 'inf' else 99.0
         if match := re.search(r"▪ 夏普比率\s+: ([\-\+\d\.]+)", output): metrics['sharpe'] = float(match.group(1))
+        if match := re.search(r"▪ 卡玛比率\s*:\s*([\-\+\d\.inf]+)", output): metrics['calmar'] = float(match.group(1)) if match.group(1) != 'inf' else 99.0
         if match := re.search(r"▪ 最大回撤\s+: ([\-\+\d\.]+)%", output): metrics['max_drawdown'] = float(match.group(1))
         if match := re.search(r"▪ 恢复因子\s+: ([\-\+\d\.inf]+)", output): metrics['recovery_factor'] = float(match.group(1)) if match.group(1) != 'inf' else 99.0
         if match := re.search(r"▪ 交易期望值 : ([\-\+\d\.]+)%", output): metrics['expectancy_pct'] = float(match.group(1))
+        
+        if match := re.search(r"▪ REVERSAL_EXIT\s*:\s*(\d+)", output): metrics['exit_reversal'] = int(match.group(1))
+        if match := re.search(r"▪ HARD_SL_EXIT\s*:\s*(\d+)", output): metrics['exit_hard_sl'] = int(match.group(1))
+        if match := re.search(r"▪ TRAILING_EXIT\s*:\s*(\d+)", output): metrics['exit_trailing'] = int(match.group(1))
+        if match := re.search(r"▪ TIME_LIMIT_EXIT\s*:\s*(\d+)", output): metrics['exit_timeout'] = int(match.group(1))
     except Exception: pass
     return metrics
 
@@ -178,8 +185,8 @@ def main():
     if args.mode == 'backtest': print(f"   基座 Alpha 模型: {args.base_model}")
     print("=" * 80)
 
-    # 🚨 修复单卡 H100 灾难：alpha 模式最多 2 个并发，保障显存安全；backtest 模式 20 核 CPU 开 16 并发。
-    MAX_WORKERS = 8
+    # 🚨 并发控制：alpha 模式 8 并发；backtest 模式 16 并发
+    MAX_WORKERS = 8 if args.mode == 'alpha' else 16
     batches = [combinations[i:i + MAX_WORKERS] for i in range(0, len(combinations), MAX_WORKERS)]
     
     all_results = []
