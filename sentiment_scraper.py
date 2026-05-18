@@ -6,7 +6,7 @@ import logging
 import requests
 import re
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from quant_config.config import LIVE_DATA_DIR
 
@@ -147,6 +147,33 @@ class TradFiScraper:
             "US_Dollar_Index": "DX-Y.NYB",
             "US_10Y_Treasury": "^TNX"
         }
+        self.freshness_threshold_hours = 2.0
+        self.delta_tolerance_hours = 6.0
+
+    def _to_utc_timestamp(self, idx):
+        if getattr(idx, "tzinfo", None):
+            return idx.tz_convert("UTC")
+        return idx.tz_localize("UTC")
+
+    def _compute_24h_delta(self, hist, latest_ts):
+        """按真实时间差回溯 24 小时，避免周末/休市把 96 根交易 K 线误当成自然 24h。"""
+        import pandas as pd
+
+        target_ts = latest_ts - pd.Timedelta(hours=24)
+        anchor_hist = hist[hist.index <= target_ts]
+        if anchor_hist.empty:
+            return None, None
+
+        anchor_ts = anchor_hist.index[-1]
+        elapsed_hours = (latest_ts - anchor_ts).total_seconds() / 3600.0
+        if abs(elapsed_hours - 24.0) > self.delta_tolerance_hours:
+            return None, round(elapsed_hours, 2)
+
+        latest_close = float(hist['Close'].iloc[-1])
+        anchor_close = float(anchor_hist['Close'].iloc[-1])
+        if anchor_close == 0:
+            return None, round(elapsed_hours, 2)
+        return ((latest_close - anchor_close) / anchor_close), round(elapsed_hours, 2)
 
     def fetch(self):
         logging.info("正在抓取传统宏观资产实时序列 (启动高频缝合机制)...")
@@ -159,12 +186,23 @@ class TradFiScraper:
                 hist = ticker.history(period="5d", interval="15m")
                 
                 if len(hist) >= 2:
+                    import pandas as pd
+
+                    if getattr(hist.index, "tz", None) is None:
+                        hist.index = hist.index.tz_localize("UTC")
+                    else:
+                        hist.index = hist.index.tz_convert("UTC")
+
                     # 👇 【核心提速 2】：强制拉取当前最新 1 分钟的 Tick（现价）
                     try:
                         live_tick = ticker.history(period="1d", interval="1m").tail(1)
                         # 如果最新 1 分钟的时间戳比 15 分钟的末尾还要新，直接将它追加到末尾缝合！
+                        if not live_tick.empty:
+                            if getattr(live_tick.index, "tz", None) is None:
+                                live_tick.index = live_tick.index.tz_localize("UTC")
+                            else:
+                                live_tick.index = live_tick.index.tz_convert("UTC")
                         if not live_tick.empty and live_tick.index[0] > hist.index[-1]:
-                            import pandas as pd
                             hist = pd.concat([hist, live_tick])
                     except Exception as e:
                         logging.warning(f"  ⚠️ {symbol} 极速 Tick 缝合失败，回退至基础 K 线: {e}")
@@ -175,18 +213,21 @@ class TradFiScraper:
                     
                     for idx, row in recent_bars.iterrows():
                         trend_data.append({
-                            "time": (idx.tz_convert('UTC') if getattr(idx, 'tzinfo', None) else idx).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            "time": self._to_utc_timestamp(idx).strftime('%Y-%m-%d %H:%M:%S UTC'),
                             "close": round(float(row['Close']), 3)
                         })
                     
                     # === 以下为新增与修改的核心逻辑 ===
+                    latest_ts = self._to_utc_timestamp(recent_bars.index[-1])
+                    now_utc = datetime.now(timezone.utc)
+                    hours_since_update = (now_utc - latest_ts.to_pydatetime()).total_seconds() / 3600.0
+                    is_fresh = hours_since_update <= self.freshness_threshold_hours
+                    market_status = "live_or_recent" if is_fresh else "stale_or_closed"
+
                     last_close = float(recent_bars['Close'].iloc[-1])
                     
-                    # 1. 精确提取 Rolling 24H 变化率 (解决“管中窥豹”未感知昨日大跌的问题)
-                    # 15分钟线一天理论上有 24 * 4 = 96 根，向后回溯找到最接近 24H 前的基准价
-                    lookback_idx = -96 if len(hist) >= 96 else 0
-                    price_24h_ago = float(hist['Close'].iloc[lookback_idx])
-                    daily_delta_pct = (last_close - price_24h_ago) / price_24h_ago
+                    # 1. 精确提取 Rolling 24H 变化率：按真实时间回溯，跨周末/休市则直接标记不可用
+                    daily_delta, delta_window_hours = self._compute_24h_delta(hist, latest_ts)
                     
                     # 2. 跨资产波动率标准化 (Price Z-Score)
                     # 将现价放置在 5 日的统计分布中计算偏离度，抹平美债(波动极小)和纳指(波动极大)的底层差异
@@ -196,10 +237,14 @@ class TradFiScraper:
                     z_score = (last_close - period_mean) / period_std if period_std > 0 else 0.0
                     
                     macro_data[name] = {
-                        "latest_update_time": (recent_bars.index[-1].tz_convert('UTC') if getattr(recent_bars.index[-1], 'tzinfo', None) else recent_bars.index[-1]).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                        "latest_update_time": latest_ts.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                        "hours_since_update": round(hours_since_update, 2),
+                        "is_fresh": is_fresh,
+                        "market_status": market_status,
                         "current_price": round(last_close, 3),
-                        "daily_24h_delta_pct": round(daily_delta_pct * 100, 3),  # 👈 替换掉原先的 2h_delta
-                        "price_z_score": round(z_score, 2),                      # 👈 核心基准：统计学上的标准差偏离度
+                        "daily_24h_delta_pct": None if daily_delta is None else round(daily_delta * 100, 3),
+                        "delta_window_hours": delta_window_hours,
+                        "price_z_score": round(z_score, 2),
                         "recent_k_lines": trend_data 
                     }
             return macro_data
@@ -217,6 +262,10 @@ class DeepSeekMacroAgent:
     def __init__(self):
         self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.url = "https://api.deepseek.com/chat/completions"
+        self.connect_timeout = float(os.environ.get("DEEPSEEK_CONNECT_TIMEOUT", "10"))
+        self.read_timeout = float(os.environ.get("DEEPSEEK_READ_TIMEOUT", "90"))
+        self.max_completion_tokens = int(os.environ.get("DEEPSEEK_MAX_TOKENS", "1200"))
+        self.thinking_mode = os.environ.get("DEEPSEEK_THINKING_MODE", "disabled").lower()
         
         if not self.api_key:
             logging.warning("⚠️ 未检测到 DEEPSEEK_API_KEY！智能体将返回中性兜底数据。")
@@ -231,6 +280,17 @@ class DeepSeekMacroAgent:
         if text.endswith("```"):
             text = text[:-3]
         return text.strip()
+
+    def extract_json_object(self, text):
+        """从混杂文本中提取第一个 JSON 对象，兼容模型偶发前后缀说明。"""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return ""
+        return text[start:end + 1]
 
     def analyze(self, current_context, previous_decision=None, decision_t_10=None, decision_t_50=None):
         if not self.api_key:
@@ -251,12 +311,15 @@ class DeepSeekMacroAgent:
         【跨市场流动性与权重打分基准 (Strict Rubric)】
         1. 权重 40%：美国宏观推力与跨市场溢出 (US Macro & Equities)
            - 数据源：`us_macro_equities`。包含纳指、美元指数、10年期美债。
+           - 你必须逐个资产先检查 `is_fresh`、`hours_since_update`、`market_status`、`delta_window_hours`：
+             * 若 `is_fresh=false` 或 `hours_since_update > 2`，该资产视为【陈旧/休市数据】，只能作为背景参考，单资产权重降到接近 0，不得描述为“刚刚暴涨/暴跌”。
+             * 若 `daily_24h_delta_pct` 为 null，或者 `delta_window_hours` 明显偏离 24 小时，说明该 24H 变化率因周末/休市断档而无效，必须忽略这条涨跌幅信息。
            - ⚠️ 宏观逻辑铁律与 Z-Score 判定标准 (极为关键)：
-             你必须优先查看 `price_z_score` (价格的标准差偏离度) 与 `daily_24h_delta_pct`，不要受各资产绝对波动百分比的干扰。
+             你必须优先查看【新鲜资产】的 `price_z_score` (价格的标准差偏离度) 与 `daily_24h_delta_pct`，不要受各资产绝对波动百分比的干扰。
              * Z-Score 的统计学意义：0 附近为均值回归/横盘。|Z-Score| > 1.0 视为趋势形成，|Z-Score| > 2.0 视为极端单边暴涨/暴跌 (即 2 个标准差事件)。
-             * 10年期美债收益率 (^TNX) 与 美元指数 (DXY)：若 Z-Score > +1.5 且 24H 涨幅为正，代表全球流动性剧烈收紧，对 Crypto 构成【毁灭性打击】，直接给极低分；反之为【利好】。
-             * 纳斯达克 (NQ=F)：若 Z-Score < -1.5 且 24H 涨幅显著为负（例如跌幅超过 1%），代表风险资产崩盘溢出，对 Crypto 是【重大利空】；反之为【利好】。
-           - ⚠️ 数据时效与休市逻辑（严格执行）：【唯一】判断休市的标准是美股数据的 `latest_update_time` 距离【当前系统绝对时间】明确超过 2 小时（此时降权至 10%）。如果时间差在 2 小时以内（如仅相差几分钟到1小时），代表美股**正在正常交易中**，你**绝对不可**以任何理由判定为“休市”，必须维持 40% 的满额权重！
+             * 10年期美债收益率 (^TNX) 与 美元指数 (DXY)：仅当该资产【数据新鲜】且 Z-Score > +1.5 且 24H 涨幅为正，代表全球流动性剧烈收紧，对 Crypto 构成【毁灭性打击】；反之为【利好】。
+             * 纳斯达克 (NQ=F)：仅当该资产【数据新鲜】且 Z-Score < -1.5 且 24H 涨幅显著为负（例如跌幅超过 1%），代表风险资产崩盘溢出，对 Crypto 是【重大利空】；反之为【利好】。
+           - ⚠️ 数据时效与休市逻辑（严格执行）：40% 的满额权重只给【新鲜资产】。某个资产陈旧，不代表整个宏观模块完全失效；你必须逐资产降权，而不是整组一刀切。
 
         2. 权重 30%：Crypto 核心基本面与机构资金 (Institutional Crypto Fundamentals)
            - 数据源：`hot_news`。
@@ -281,7 +344,7 @@ class DeepSeekMacroAgent:
 
         【物理限速锁与历史多重锚点防漂移机制 (State Drift Prevention)】：
         如果用户提供了【历史打分基线】（包含 T-1、T-10、T-50），你必须按以下严格逻辑使用它们：
-        1. T-1 (上一次)：作为短期平滑锚点。在常规震荡市中，本次打分与 T-1 的绝对差值（Delta）尽量控制在 ±0.3 以内。但【例外铁律】：如果 `recent_5d_delta_pct` 显示宏观资产（如美债或美元）出现强劲单边趋势，或者 `hot_news` 包含行业巨震事件，你必须打破 ±0.3 的限制，直接给出符合当前极端情况的跳空打分，不可被 T-1 拖累。
+        1. T-1 (上一次)：作为短期平滑锚点。在常规震荡市中，本次打分与 T-1 的绝对差值（Delta）尽量控制在 ±0.3 以内。但【例外铁律】：如果【新鲜资产】的 `daily_24h_delta_pct` 与 `price_z_score` 同时显示强劲单边趋势，或者 `hot_news` 包含行业巨震事件，你必须打破 ±0.3 的限制，直接给出符合当前极端情况的跳空打分，不可被 T-1 拖累。
         2. T-10 (往前第10次)：作为中期趋势校准锚点。评估当前情绪相比中期周期是处于升温还是降温阶段。
         3. T-50 (往前第50次)：作为长期均值回归 (Mean Reversion) 锚点。防止在连续的微小 Delta 累加下产生长期的“分数漂移”。如果当前宏观基本面与 T-50 时期相似，你的分数趋势应当向 T-50 靠拢收敛。
         
@@ -323,20 +386,62 @@ class DeepSeekMacroAgent:
                 {"role": "user", "content": user_content}
             ],
             "response_format": {"type": "json_object"}, 
-            "temperature": 0.1 
+            "temperature": 0.1,
+            "max_tokens": self.max_completion_tokens,
+            "thinking": {"type": self.thinking_mode}
         }
 
         max_retries = 10
         for attempt in range(1, max_retries + 1):
             try:
-                response = requests.post(self.url, headers=headers, json=payload, timeout=15)
+                response = requests.post(
+                    self.url,
+                    headers=headers,
+                    json=payload,
+                    timeout=(self.connect_timeout, self.read_timeout),
+                )
                 response.raise_for_status()
-                
-                result = response.json()
-                raw_content = result['choices'][0]['message']['content']
-                
-                clean_str = self.clean_json_response(raw_content)
-                decision = json.loads(clean_str)
+
+                response_text = response.text or ""
+                if not response_text.strip():
+                    raise ValueError("DeepSeek HTTP 响应体为空")
+
+                try:
+                    result = response.json()
+                except Exception as json_resp_err:
+                    preview = response_text[:500].replace("\n", "\\n")
+                    raise ValueError(f"DeepSeek HTTP 响应不是合法 JSON: {json_resp_err} | preview={preview}")
+
+                choices = result.get("choices") or []
+                if not choices:
+                    preview = response_text[:500].replace("\n", "\\n")
+                    raise ValueError(f"DeepSeek 响应缺少 choices | preview={preview}")
+
+                choice0 = choices[0] or {}
+                finish_reason = choice0.get("finish_reason")
+                message = choice0.get("message", {}) or {}
+                raw_content = message.get("content", "")
+                if not str(raw_content or "").strip():
+                    reasoning_preview = str(message.get("reasoning_content", "") or "")[:500].replace("\n", "\\n")
+                    preview = response_text[:500].replace("\n", "\\n")
+                    raise ValueError(
+                        f"DeepSeek message.content 为空 | finish_reason={finish_reason} "
+                        f"| reasoning_preview={reasoning_preview} | preview={preview}"
+                    )
+
+                clean_str = self.clean_json_response(str(raw_content))
+                if not clean_str.startswith("{"):
+                    extracted = self.extract_json_object(clean_str)
+                    clean_str = extracted or clean_str
+                if not clean_str:
+                    preview = str(raw_content)[:500].replace("\n", "\\n")
+                    raise ValueError(f"DeepSeek content 中未提取到 JSON 对象 | preview={preview}")
+
+                try:
+                    decision = json.loads(clean_str)
+                except Exception as json_content_err:
+                    preview = clean_str[:500].replace("\n", "\\n")
+                    raise ValueError(f"DeepSeek content 不是合法 JSON: {json_content_err} | preview={preview}")
                 
                 return {
                     "score": round(float(decision.get("score", 0.00)), 2), 
@@ -368,7 +473,9 @@ def compress_historical_context(raw_json_str):
                     compressed[asset] = {
                         "price": asset_data.get("current_price"),
                         "z_score": asset_data.get("price_z_score"),
-                        "daily_delta": asset_data.get("daily_24h_delta_pct")
+                        "daily_delta": asset_data.get("daily_24h_delta_pct"),
+                        "is_fresh": asset_data.get("is_fresh"),
+                        "hours_since_update": asset_data.get("hours_since_update")
                     }   
         # 2. 提取多空比和贪婪指数
         pos = data.get("market_position", {})
@@ -383,6 +490,33 @@ def compress_historical_context(raw_json_str):
     except Exception as e:
         logging.error(f"历史数据降维压缩失败: {e}")
         return {}
+
+
+def build_llm_ready_context(current_context):
+    """压缩当前切片，减少 LLM 超时概率，同时保留真正有判别力的字段。"""
+    compact = {
+        "timestamp": current_context.get("timestamp"),
+        "fear_and_greed": current_context.get("fear_and_greed"),
+        "market_position": current_context.get("market_position"),
+        "hot_news": (current_context.get("hot_news", []) or [])[:5],
+        "us_macro_equities": {},
+    }
+
+    macro = current_context.get("us_macro_equities", {}) or {}
+    for asset, asset_data in macro.items():
+        recent_k_lines = (asset_data.get("recent_k_lines", []) or [])[-4:]
+        compact["us_macro_equities"][asset] = {
+            "latest_update_time": asset_data.get("latest_update_time"),
+            "hours_since_update": asset_data.get("hours_since_update"),
+            "is_fresh": asset_data.get("is_fresh"),
+            "market_status": asset_data.get("market_status"),
+            "current_price": asset_data.get("current_price"),
+            "daily_24h_delta_pct": asset_data.get("daily_24h_delta_pct"),
+            "delta_window_hours": asset_data.get("delta_window_hours"),
+            "price_z_score": asset_data.get("price_z_score"),
+            "recent_k_lines": recent_k_lines,
+        }
+    return compact
 # ==========================================
 # 🔄 中央调度器 (Orchestrator)
 # ==========================================
