@@ -6,7 +6,7 @@ import torch
 import json
 from pathlib import Path
 from historical_pipeline.train_itransformer import InvertedTransformer
-from execution_oms import execute_gate_trade, log_system_alert
+from execution_oms import execute_gate_trade, get_gate_stop_coverage_size, log_system_alert
 from risk_manager import bailout_worker
 import threading
 from state_manager import state
@@ -266,47 +266,377 @@ def apply_logit_fusion(base_prob, macro_score, alpha):
 # ==========================================
 # 3. 实盘主循环
 # ==========================================
-def _reconstruct_tier_state():
-    """
-    重启恢复：从真实交易所仓位 + live_status.json 双轨重建阶梯状态机。
-    优先级：exchange pos_map（真实） > live_status.json（快速兜底）。
-    """
-    # --- 轨道 1：真实交易所仓位（portfolio_sync_worker 已刷入 state.active_pos_map）---
+def _sanitize_tier_state(raw_state):
+    """统一清洗状态机结构，防止脏值把决策闸门带偏。"""
+    raw_state = raw_state or {}
+    try:
+        side = int(raw_state.get("side", 0))
+    except (TypeError, ValueError):
+        side = 0
+    if side not in (-1, 0, 1):
+        side = 0
+
+    try:
+        highest_tier = int(raw_state.get("highest_tier", 0))
+    except (TypeError, ValueError):
+        highest_tier = 0
+    highest_tier = max(0, min(3, highest_tier))
+
+    if side == 0:
+        highest_tier = 0
+
+    return {"side": side, "highest_tier": highest_tier}
+
+
+def _tier_from_leverage(leverage):
+    """根据交易所当前杠杆推导最低可信的阶梯层级。"""
+    if leverage >= LEVERAGE_3:
+        return 3
+    if leverage >= LEVERAGE_2:
+        return 2
+    return 1
+
+
+def _read_persisted_tier_state():
+    """读取上一次落盘的状态机，作为交易所快照未就绪时的兜底。"""
+    status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
+    if not os.path.exists(status_path):
+        return {"side": 0, "highest_tier": 0}
+
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        return _sanitize_tier_state(saved.get("position_tier_state", {}))
+    except Exception as e:
+        print(f"⚠️  [状态恢复] 读取 live_status.json 失败: {e}")
+        return {"side": 0, "highest_tier": 0}
+
+
+def _get_exchange_position_state():
+    """从供货线程同步过来的真实仓位快照推导当前状态。"""
     with state.pos_lock:
         pos_map = dict(state.active_pos_map)
 
     sym_key = SYMBOL.replace("/", "")
-    print(f"🔍 [状态恢复] 正在校验符号: {sym_key}，当前已同步仓位列表: {list(pos_map.keys())}")
-    if sym_key in pos_map:
-        p = pos_map[sym_key]
-        pos_side_str = str(p.get('side', '')).upper()
-        side_int = 1 if pos_side_str == 'LONG' else (-1 if pos_side_str == 'SHORT' else 0)
-        if side_int != 0:
-            lev = float(p.get('leverage', p['info'].get('lever', p['info'].get('leverage', 0))))
-            # 根据杠杆反推当时开仓所属 Tier
-            if   lev >= LEVERAGE_3: tier = 3
-            elif lev >= LEVERAGE_2: tier = 2
-            else:                   tier = 1
-            print(f"♻️  [重启恢复] 从交易所仓位重建状态机: side={side_int}, Tier={tier}, lev={lev}x")
-            return {"side": side_int, "highest_tier": tier}
+    last_sync_ts = float(state.portfolio_memory.get("last_sync_ts", 0) or 0)
+    sync_age = float("inf") if last_sync_ts <= 0 else max(0.0, time.time() - last_sync_ts)
+    sync_fresh = sync_age <= max(HEARTBEAT_INTERVAL * 3, 30)
 
-    # --- 轨道 2：live_status.json 快速兜底（交易所尚未响应时）---
-    status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
-    if os.path.exists(status_path):
+    result = {
+        "side": 0,
+        "highest_tier": 0,
+        "exchange_tier": 0,
+        "has_position": False,
+        "sync_fresh": sync_fresh,
+        "sync_age_sec": sync_age,
+        "source": "exchange"
+    }
+
+    p = pos_map.get(sym_key)
+    if not p:
+        return result
+
+    pos_side_str = str(p.get('side', '')).upper()
+    side_int = 1 if pos_side_str == 'LONG' else (-1 if pos_side_str == 'SHORT' else 0)
+    if side_int == 0:
+        return result
+
+    info = p.get("info", {}) or {}
+    try:
+        lev = float(p.get('leverage', info.get('lever', info.get('leverage', 0))) or 0)
+    except (TypeError, ValueError):
+        lev = 0.0
+
+    tier = _tier_from_leverage(lev) if lev > 0 else 1
+    result.update({
+        "side": side_int,
+        "highest_tier": tier,
+        "exchange_tier": tier,
+        "has_position": True
+    })
+    return result
+
+
+def _reconcile_position_tier_state(cached_state):
+    """
+    每个 tick 都重新对账：
+    1. 真实仓位决定 side。
+    2. highest_tier 取 exchange / 内存 / 落盘三者中同向的最高值，避免初始化错一次后持续漂移。
+    3. 若供货线程快照陈旧，则退化到缓存/磁盘兜底，但不会永久锁死。
+    """
+    cached_state = _sanitize_tier_state(cached_state)
+    persisted_state = _read_persisted_tier_state()
+    exchange_state = _get_exchange_position_state()
+
+    if exchange_state["has_position"]:
+        candidates = [exchange_state["exchange_tier"]]
+        for fallback_state in (cached_state, persisted_state):
+            if fallback_state["side"] == exchange_state["side"]:
+                candidates.append(fallback_state["highest_tier"])
+
+        reconciled = {
+            "side": exchange_state["side"],
+            "highest_tier": max(candidates)
+        }
+        meta = {
+            "source": "exchange_authoritative",
+            "sync_fresh": exchange_state["sync_fresh"],
+            "sync_age_sec": exchange_state["sync_age_sec"]
+        }
+        return reconciled, meta
+
+    if exchange_state["sync_fresh"]:
+        return {"side": 0, "highest_tier": 0}, {
+            "source": "exchange_flat",
+            "sync_fresh": True,
+            "sync_age_sec": exchange_state["sync_age_sec"]
+        }
+
+    fallback_state = cached_state if cached_state["side"] != 0 else persisted_state
+    fallback_source = "cached_memory_fallback" if cached_state["side"] != 0 else "disk_fallback"
+    return fallback_state, {
+        "source": fallback_source,
+        "sync_fresh": False,
+        "sync_age_sec": exchange_state["sync_age_sec"]
+    }
+
+
+def _reconstruct_tier_state():
+    """启动时先做一次对账恢复，后续每个 tick 会继续自动校正。"""
+    with state.pos_lock:
+        pos_keys = list(state.active_pos_map.keys())
+    print(f"🔍 [状态恢复] 正在校验符号: {SYMBOL.replace('/', '')}，当前已同步仓位列表: {pos_keys}")
+
+    reconstructed, meta = _reconcile_position_tier_state({"side": 0, "highest_tier": 0})
+    if reconstructed["side"] != 0:
+        print(
+            f"♻️  [重启恢复] 状态机已恢复: side={reconstructed['side']}, "
+            f"Tier={reconstructed['highest_tier']} | source={meta['source']}"
+        )
+    else:
+        print(f"🆕 [重启恢复] 初始化为空仓 | source={meta['source']}")
+    return reconstructed
+
+
+def _normalize_symbol_key(raw_symbol):
+    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _load_recent_local_open_trades(limit=20):
+    """读取本地开仓流水，用于判断当前库存是否仍在策略可解释范围内。"""
+    db_path = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{_normalize_symbol_key(SYMBOL)}.db")
+    if not os.path.exists(db_path):
+        return []
+
+    try:
+        with sqlite3.connect(db_path, timeout=3.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT exec_ts, side, amount, fill_price, margin_used, leverage
+                FROM live_trades
+                WHERE side IN ('buy', 'sell')
+                ORDER BY exec_ts DESC
+                LIMIT ?
+                """,
+                (int(limit),)
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        print(f"⚠️ [库存守卫] 读取本地交易流水失败: {e}")
+        return []
+
+    records = []
+    for exec_ts, side, amount, fill_price, margin_used, leverage in rows:
         try:
-            with open(status_path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            ts_state = saved.get("position_tier_state", {})
-            side = int(ts_state.get("side", 0))
-            tier = int(ts_state.get("highest_tier", 0))
-            if side != 0:
-                print(f"♻️  [重启恢复] 从 live_status.json 恢复状态机: side={side}, Tier={tier}")
-                return {"side": side, "highest_tier": tier}
-        except Exception as e:
-            print(f"⚠️  [重启恢复] 读取 live_status.json 失败: {e}")
+            parsed_amount = float(amount or 0.0)
+        except (TypeError, ValueError):
+            parsed_amount = 0.0
+        try:
+            parsed_fill = float(fill_price or 0.0)
+        except (TypeError, ValueError):
+            parsed_fill = 0.0
+        try:
+            parsed_margin = float(margin_used or 0.0)
+        except (TypeError, ValueError):
+            parsed_margin = 0.0
+        try:
+            parsed_leverage = float(leverage or 0.0)
+        except (TypeError, ValueError):
+            parsed_leverage = 0.0
 
-    print("🆕 [重启恢复] 未发现持仓记录，状态机初始化为空仓。")
-    return {"side": 0, "highest_tier": 0}
+        records.append({
+            "exec_ts": str(exec_ts),
+            "side": str(side or "").lower(),
+            "amount": parsed_amount,
+            "fill_price": parsed_fill,
+            "margin_used": parsed_margin,
+            "leverage": parsed_leverage
+        })
+
+    return records
+
+
+def _inspect_live_stop_coverage(position):
+    """
+    校验当前持仓是否被交易所止损单完整覆盖。
+    这里只做告警与隔离判定，不擅自修改挂单单位口径。
+    """
+    info = position.get("info", {}) or {}
+    try:
+        expected_contracts = abs(float(info.get("size", position.get("contracts", 0)) or 0.0))
+    except (TypeError, ValueError):
+        expected_contracts = 0.0
+
+    snapshot_stops = list(state.portfolio_memory.get("open_stops", []) or [])
+    sym_key = _normalize_symbol_key(position.get("symbol", SYMBOL))
+    matched_stops = [o for o in snapshot_stops if _normalize_symbol_key(o.get("symbol")) == sym_key]
+
+    if expected_contracts <= 0:
+        return {
+            "status": "no_position",
+            "expected_contracts": 0.0,
+            "matched_stop_count": len(matched_stops),
+            "max_stop_size": 0.0,
+            "coverage_ratio": 1.0,
+            "reason": ""
+        }
+
+    if not matched_stops:
+        return {
+            "status": "missing_stop",
+            "expected_contracts": expected_contracts,
+            "matched_stop_count": 0,
+            "max_stop_size": 0.0,
+            "coverage_ratio": 0.0,
+            "reason": "交易所未查询到任何活动止损单"
+        }
+
+    parsed_sizes = []
+    for stop_order in matched_stops:
+        parsed_size = get_gate_stop_coverage_size(stop_order, expected_contracts)
+        if parsed_size is not None:
+            parsed_sizes.append(parsed_size)
+
+    if not parsed_sizes:
+        return {
+            "status": "unparseable_stop",
+            "expected_contracts": expected_contracts,
+            "matched_stop_count": len(matched_stops),
+            "max_stop_size": 0.0,
+            "coverage_ratio": 0.0,
+            "reason": "止损单存在，但无法解析其原始 size"
+        }
+
+    max_stop_size = max(parsed_sizes)
+    coverage_ratio = max_stop_size / (expected_contracts + 1e-9)
+
+    if coverage_ratio < 0.9:
+        return {
+            "status": "undercovered_stop",
+            "expected_contracts": expected_contracts,
+            "matched_stop_count": len(matched_stops),
+            "max_stop_size": max_stop_size,
+            "coverage_ratio": coverage_ratio,
+            "reason": f"止损单覆盖不足，raw size={max_stop_size:.4f} < 持仓={expected_contracts:.4f}"
+        }
+
+    if coverage_ratio > 1.1:
+        return {
+            "status": "oversized_stop",
+            "expected_contracts": expected_contracts,
+            "matched_stop_count": len(matched_stops),
+            "max_stop_size": max_stop_size,
+            "coverage_ratio": coverage_ratio,
+            "reason": f"止损单数量偏大，raw size={max_stop_size:.4f} > 持仓={expected_contracts:.4f}"
+        }
+
+    return {
+        "status": "ok",
+        "expected_contracts": expected_contracts,
+        "matched_stop_count": len(matched_stops),
+        "max_stop_size": max_stop_size,
+        "coverage_ratio": coverage_ratio,
+        "reason": ""
+    }
+
+
+def _build_inventory_guard(position_tier_state, position_state_meta):
+    """
+    识别“策略自有库存”与“异常外部库存”：
+    一旦进入 external_inventory，主引擎停止继续下单，只保留右脑风控托管。
+    """
+    sym_key = _normalize_symbol_key(SYMBOL)
+    with state.pos_lock:
+        position = dict(state.active_pos_map).get(sym_key)
+
+    if not position:
+        return {
+            "mode": "flat",
+            "block_new_orders": False,
+            "hard_reasons": [],
+            "soft_reasons": [],
+            "current_leverage": 0.0,
+            "configured_leverages": sorted(set(float(x) for x in [LEVERAGE_1, LEVERAGE_2, LEVERAGE_3] if float(x) > 0)),
+            "stop_coverage": {
+                "status": "no_position",
+                "expected_contracts": 0.0,
+                "matched_stop_count": 0,
+                "max_stop_size": 0.0,
+                "coverage_ratio": 1.0,
+                "reason": ""
+            },
+            "matching_open_record_count": 0,
+            "state_source": position_state_meta["source"]
+        }
+
+    info = position.get("info", {}) or {}
+    pos_side = str(position.get("side", "")).upper()
+    local_side = "buy" if pos_side == "LONG" else "sell"
+    configured_leverages = sorted(set(float(x) for x in [LEVERAGE_1, LEVERAGE_2, LEVERAGE_3] if float(x) > 0))
+
+    try:
+        current_leverage = float(position.get("leverage", info.get("lever", info.get("leverage", 0))) or 0.0)
+    except (TypeError, ValueError):
+        current_leverage = 0.0
+
+    hard_reasons = []
+    soft_reasons = []
+
+    if configured_leverages and not any(abs(current_leverage - expected) <= 0.05 for expected in configured_leverages):
+        hard_reasons.append(
+            f"交易所杠杆 {current_leverage:.2f}x 不在策略分层 {configured_leverages} 内"
+        )
+
+    recent_open_trades = _load_recent_local_open_trades(limit=20)
+    matching_open_records = [r for r in recent_open_trades if r["side"] == local_side]
+    if not matching_open_records:
+        soft_reasons.append("本地成交流水缺少与当前仓位同向的开仓记录")
+
+    stop_coverage = _inspect_live_stop_coverage(position)
+    if stop_coverage["status"] in {"missing_stop", "unparseable_stop", "undercovered_stop"}:
+        hard_reasons.append(stop_coverage["reason"])
+    elif stop_coverage["status"] == "oversized_stop":
+        soft_reasons.append(stop_coverage["reason"])
+
+    if not position_state_meta["sync_fresh"] and position_tier_state["side"] != 0:
+        soft_reasons.append("仓位同步快照陈旧，当前库存来源仍处于 fallback 模式")
+
+    block_new_orders = bool(hard_reasons) or (len(soft_reasons) >= 2)
+    mode = "external_inventory" if block_new_orders else "strategy_managed"
+
+    return {
+        "mode": mode,
+        "block_new_orders": block_new_orders,
+        "hard_reasons": hard_reasons,
+        "soft_reasons": soft_reasons,
+        "current_leverage": current_leverage,
+        "configured_leverages": configured_leverages,
+        "stop_coverage": stop_coverage,
+        "matching_open_record_count": len(matching_open_records),
+        "state_source": position_state_meta["source"]
+    }
 
 def run_live():
     print(f"🚀 极速实盘预测引擎启动 (单模型模式: {MODEL_PATH.name})...")
@@ -361,6 +691,7 @@ def run_live():
     last_trade_hour = 0  
     last_trade_signal = 0
     latest_closed_ts = 0
+    last_inventory_guard_mode = "flat"
     
     # 🎯 仓位阶梯状态机：重启时从交易所/磁盘双轨恢复，防止重复开仓
     # portfolio_sync_worker 在后台独立线程中运行，动态等待其完成首次同步
@@ -483,14 +814,20 @@ def run_live():
             adj_down_top10 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_10)
 
             # --- 🎯 阶梯加仓信号决策 ---
+            position_tier_state, position_state_meta = _reconcile_position_tier_state(position_tier_state)
+            inventory_guard = _build_inventory_guard(position_tier_state, position_state_meta)
+            if inventory_guard["mode"] != last_inventory_guard_mode:
+                reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
+                guard_msg = (
+                    f"库存守卫模式切换为 {inventory_guard['mode']} | "
+                    f"杠杆 {inventory_guard['current_leverage']:.2f}x | 原因: {reason_text}"
+                )
+                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧯 {guard_msg}")
+                log_system_alert("🧯 库存守卫", SYMBOL, guard_msg)
+                last_inventory_guard_mode = inventory_guard["mode"]
             target_signal = 0
             target_tier = 0
             dynamic_leverage = 0.0
-            
-            # 判断真实物理仓位是否已空，归零状态机
-            with state.pos_lock:
-                if SYMBOL.replace("/", "") not in state.active_pos_map:
-                    position_tier_state = {"side": 0, "highest_tier": 0}
 
             # 评估是否击穿各层级动态阈值 (用各自阶梯专属的修正概率)
             if adj_up_top1 > th['up_top_1']:        target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
@@ -502,7 +839,9 @@ def run_live():
 
             # 阶梯过滤器核心逻辑
             actual_signal = 0
-            if target_signal != 0:
+            if inventory_guard["block_new_orders"]:
+                actual_signal = 0
+            elif target_signal != 0:
                 if position_tier_state["side"] == 0:
                     actual_signal = target_signal
                 elif position_tier_state["side"] == target_signal:
@@ -513,16 +852,22 @@ def run_live():
 
             if needs_evaluation_log:
                 action_str = "按兵不动"
-                if actual_signal == 1: 
+                if inventory_guard["block_new_orders"]:
+                    action_str = "🧯 异常库存隔离中，主引擎禁止继续下单"
+                elif actual_signal == 1: 
                     action_str = f"🚀 触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
                 elif actual_signal == -1: 
                     action_str = f"🩸 触发做空 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
-                    
+
+                inventory_reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
                     f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
                     f"【融合概率(入场级Tier1)】📈多:{adj_up_top10:.4f} | 📉空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
-                    f"【引擎决策】{action_str} | 状态机: {position_tier_state}"
+                    f"【引擎决策】{action_str} | 状态机: {position_tier_state} | 来源: {position_state_meta['source']} | "
+                    f"仓位同步新鲜: {'是' if position_state_meta['sync_fresh'] else '否'}\n"
+                    f"【库存守卫】模式: {inventory_guard['mode']} | 当前杠杆: {inventory_guard['current_leverage']:.2f}x | "
+                    f"止损覆盖: {inventory_guard['stop_coverage']['status']} | 原因: {inventory_reason_text}"
                 )
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
                 log_system_alert("🧠 决策评估", SYMBOL, eval_log)
@@ -577,6 +922,28 @@ def run_live():
                 "position_tier_state": {
                     "side": int(position_tier_state["side"]),
                     "highest_tier": int(position_tier_state["highest_tier"])
+                },
+                "position_state_meta": {
+                    "source": position_state_meta["source"],
+                    "sync_fresh": bool(position_state_meta["sync_fresh"]),
+                    "sync_age_sec": None if np.isinf(position_state_meta["sync_age_sec"]) else round(float(position_state_meta["sync_age_sec"]), 3)
+                },
+                "inventory_guard": {
+                    "mode": inventory_guard["mode"],
+                    "block_new_orders": bool(inventory_guard["block_new_orders"]),
+                    "current_leverage": float(inventory_guard["current_leverage"]),
+                    "configured_leverages": [float(x) for x in inventory_guard["configured_leverages"]],
+                    "matching_open_record_count": int(inventory_guard["matching_open_record_count"]),
+                    "hard_reasons": inventory_guard["hard_reasons"],
+                    "soft_reasons": inventory_guard["soft_reasons"],
+                    "stop_coverage": {
+                        "status": inventory_guard["stop_coverage"]["status"],
+                        "expected_contracts": float(inventory_guard["stop_coverage"]["expected_contracts"]),
+                        "matched_stop_count": int(inventory_guard["stop_coverage"]["matched_stop_count"]),
+                        "max_stop_size": float(inventory_guard["stop_coverage"]["max_stop_size"]),
+                        "coverage_ratio": float(inventory_guard["stop_coverage"]["coverage_ratio"]),
+                        "reason": inventory_guard["stop_coverage"]["reason"]
+                    }
                 }
             }
 

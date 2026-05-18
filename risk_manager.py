@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 import ccxt
 from state_manager import state
-from execution_oms import log_system_alert
+from execution_oms import build_gate_close_stop_initial, get_gate_stop_coverage_size, log_system_alert
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, MODEL_DIR,
     HARD_TP, HARD_SL, HOLD_PERIOD, 
@@ -20,6 +20,83 @@ load_dotenv()
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
 JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+
+
+def _normalize_symbol_key(raw_symbol):
+    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _inspect_snapshot_stop_coverage(position):
+    """基于供货线程快照检查当前仓位的止损覆盖情况。"""
+    info = position.get("info", {}) or {}
+    try:
+        expected_contracts = abs(float(info.get("size", position.get("contracts", 0)) or 0.0))
+    except (TypeError, ValueError):
+        expected_contracts = 0.0
+
+    snapshot_stops = list(state.portfolio_memory.get("open_stops", []) or [])
+    sym_key = _normalize_symbol_key(position.get("symbol"))
+    matched_stops = [o for o in snapshot_stops if _normalize_symbol_key(o.get("symbol")) == sym_key]
+
+    if expected_contracts <= 0:
+        return {
+            "status": "no_position",
+            "expected_contracts": 0.0,
+            "max_stop_size": 0.0,
+            "matched_stop_count": len(matched_stops),
+            "coverage_ratio": 1.0,
+            "reason": "",
+        }
+
+    if not matched_stops:
+        return {
+            "status": "missing_stop",
+            "expected_contracts": expected_contracts,
+            "max_stop_size": 0.0,
+            "matched_stop_count": 0,
+            "coverage_ratio": 0.0,
+            "reason": "交易所快照中未发现该仓位的活动止损单",
+        }
+
+    parsed_sizes = []
+    for stop_order in matched_stops:
+        parsed_size = get_gate_stop_coverage_size(stop_order, expected_contracts)
+        if parsed_size is not None:
+            parsed_sizes.append(parsed_size)
+
+    if not parsed_sizes:
+        return {
+            "status": "unparseable_stop",
+            "expected_contracts": expected_contracts,
+            "max_stop_size": 0.0,
+            "matched_stop_count": len(matched_stops),
+            "coverage_ratio": 0.0,
+            "reason": "止损单存在，但无法解析其覆盖张数",
+        }
+
+    max_stop_size = max(parsed_sizes)
+    coverage_ratio = max_stop_size / (expected_contracts + 1e-9)
+    if coverage_ratio < 0.9:
+        return {
+            "status": "undercovered_stop",
+            "expected_contracts": expected_contracts,
+            "max_stop_size": max_stop_size,
+            "matched_stop_count": len(matched_stops),
+            "coverage_ratio": coverage_ratio,
+            "reason": f"止损单覆盖不足，size={max_stop_size:.4f} < 持仓={expected_contracts:.4f}",
+        }
+
+    return {
+        "status": "ok",
+        "expected_contracts": expected_contracts,
+        "max_stop_size": max_stop_size,
+        "matched_stop_count": len(matched_stops),
+        "coverage_ratio": coverage_ratio,
+        "reason": "",
+    }
+
+
 def execute_bailout(ex, base_sym, p, reason, current_price):
     """右脑专用：执行紧急市价逃生"""
     gate_sym = p['symbol']
@@ -99,6 +176,8 @@ def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
     try:
         # 1. Gate.io 官方 API 规则对齐：多单止损需跌破触发(rule 2)
         rule = 2 if pos_side == 'LONG' else 1
+        if not getattr(ex, "markets", None) or gate_symbol not in ex.markets:
+            ex.load_markets(True)
         native_symbol = ex.market_id(gate_symbol)
         
         # 🚨 修复 3：生成带有精确时间戳的唯一标识符
@@ -107,14 +186,7 @@ def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
         # 2. 先建立新防线
         ex.private_futures_post_settle_price_orders({
             "settle": "usdt",
-            "initial": {
-                "contract": native_symbol, 
-                "size": exact_size, 
-                "close": True,       # 标记平仓单
-                "price": "0", 
-                "tif": "ioc", 
-                "text": unique_sl_text
-            },
+            "initial": build_gate_close_stop_initial(native_symbol, unique_sl_text, pos_side),
             "trigger": {
                 "strategy_type": 0, 
                 "price_type": 1, 
@@ -144,10 +216,16 @@ def bailout_worker():
     print("🛡️ [右脑] 高频双轨制风控已启动 (追踪止盈 OCO + ATR 主动熔断)...")
     bailout_ex = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     bailout_ex.set_sandbox_mode(True)
+    try:
+        bailout_ex.load_markets(True)
+        print("🔄 [右脑] Gate 市场静态规则已预加载。")
+    except Exception as e:
+        print(f"⚠️ [右脑] 启动预加载市场规则失败，将在补挂时重试: {e}")
     
     # 🧠 物理水位状态机内存池
     tracking_mem = {}
     bailout_cooldown_locks = {}
+    last_worker_error_ts = 0.0
     
     # 加载回测同款概率阈值
     th = {}
@@ -195,7 +273,7 @@ def bailout_worker():
             def fetch_snap(p):
                 base_sym = p['symbol'].split(':')[0].replace('/', '')
                 try:
-                    resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym}", timeout=0.2)
+                    resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym}", timeout=1.0)
                     if resp.status_code == 200:
                         return p, base_sym, resp.json()
                 except: pass
@@ -205,179 +283,225 @@ def bailout_worker():
                 results = list(executor.map(fetch_snap, current_positions))
                 
             for p, base_sym, data in results:
-                if not data: continue
-                gate_sym = p['symbol']
-                pos_side = str(p.get('side', '')).upper()
-                current_close = float(data['current_price'])
-                entry_px = float(p.get('entryPrice', p['info'].get('entry_price', p['info'].get('avgPx', 0))))
-                if entry_px <= 0: continue
-                
-                # 冷却检测 (防重复触发)
-                last_fired_time = bailout_cooldown_locks.get(base_sym, 0)
-                if time.time() - last_fired_time < 5.0:
-                    continue
+                try:
+                    gate_sym = p['symbol']
+                    pos_side = str(p.get('side', '')).upper()
+                    info = p.get('info', {}) or {}
+                    entry_px = float(p.get('entryPrice', info.get('entry_price', info.get('avgPx', 0))) or 0.0)
+                    if entry_px <= 0:
+                        continue
 
-                # 初始化该币种的内存追踪器
-                if base_sym not in tracking_mem:
-                    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
-                    entry_time = time.time()
-                    try:
-                        with sqlite3.connect(db_name, timeout=1.0) as conn:
-                            cur = conn.cursor()
-                            cur.execute("SELECT exec_ts FROM live_trades WHERE side IN ('buy', 'sell') ORDER BY exec_ts DESC LIMIT 1")
-                            row = cur.fetchone()
-                            if row: entry_time = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f').timestamp()
-                    except: pass
-                    
-                    tracking_mem[base_sym] = {
-                        'max_phys_pnl': 0.0,
-                        'dynamic_sl_phys': -abs(hard_sl),
-                        'trailing_active': False,
-                        'entry_time': entry_time,
-                        'last_sl_update_px': 0.0,
-                        'last_entry_px': entry_px  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
-                    }
-                    
-                mem = tracking_mem[base_sym]
-                # ---------------------------------------------------------
-                # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
-                # ---------------------------------------------------------
-                if 'last_entry_px' not in mem: 
-                    mem['last_entry_px'] = entry_px
-                    
-                # 如果交易所最新返回的均价和我们内存中的均价偏差超过 0.01%，说明触发了实盘加仓！
-                if abs(entry_px - mem['last_entry_px']) / mem['last_entry_px'] > 0.0001:
-                    # 记住当时的物理绝对止损价格
-                    if pos_side == 'LONG':
-                        abs_sl = mem['last_entry_px'] * (1 + mem['dynamic_sl_phys'])
-                        mem['dynamic_sl_phys'] = max((abs_sl - entry_px) / entry_px, -abs(hard_sl))
-                        mem['max_phys_pnl'] = (current_close - entry_px) / entry_px
-                    else:
-                        abs_sl = mem['last_entry_px'] * (1 - mem['dynamic_sl_phys'])
-                        mem['dynamic_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
-                        mem['max_phys_pnl'] = (entry_px - current_close) / entry_px
-                        
-                    mem['last_entry_px'] = entry_px
-                    print(f"⚖️ [{base_sym}] 右脑侦测到阶梯加仓行为！新均价 ${entry_px:.4f}，已平移止损防线防止误杀。")
-                # ---------------------------------------------------------
-                # 📈 轨道 1：动态物理状态机 (更新底层 OCO 止损单)
-                # ---------------------------------------------------------
-                current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
-                mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
-                hold_hours = (time.time() - mem['entry_time']) / 3600.0
-                
-                # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
-                # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
-                is_reversal = False
-                if pos_side == 'LONG' and raw_p_down > th.get('down_top_1', 1.0): is_reversal = True
-                if pos_side == 'SHORT' and raw_p_up > th.get('up_top_1', 1.0): is_reversal = True
-                
-                need_market_close = False
-                close_reason = ""
-                
-                # 触发器 1 & 3：反转 或 超过 24 小时
-                if is_reversal or hold_hours >= HOLD_PERIOD:
-                    if current_phys_pnl < 0.005 and not mem['trailing_active']:
-                        need_market_close = True
-                        close_reason = "AI反转" if is_reversal else "24小时持仓超时"
-                        close_reason += " (利润不足0.5%立即斩仓)"
-                    else:
-                        mem['trailing_active'] = True
-                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], 0.005)
-                        
-                # 触发器 2：触及止盈线
-                if mem['max_phys_pnl'] >= hard_tp + 0.005:
-                    mem['trailing_active'] = True
-                    mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], hard_tp)
-                    
-                # 追踪算法应用：1% 回撤限制
-                if mem['trailing_active']:
-                    mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['max_phys_pnl'] - 0.01)
+                    mark_px = float(p.get('markPrice', info.get('mark_price', entry_px)) or entry_px)
+                    current_close = float(data.get('current_price', mark_px) if data else mark_px)
+                    current_close = current_close if current_close > 0 else entry_px
 
-                if need_market_close:
-                    execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)
-                    bailout_cooldown_locks[base_sym] = time.time()
-                    del tracking_mem[base_sym]
-                    continue
-                    
-                target_sl_px = entry_px * (1 + mem['dynamic_sl_phys']) if pos_side == 'LONG' else entry_px * (1 - mem['dynamic_sl_phys'])
-                export_ui_mem[base_sym] = {'current_stop': target_sl_px}
-                
-                if mem['trailing_active']:
-                    diff_pct = abs(target_sl_px - mem['last_sl_update_px']) / (entry_px + 1e-9)
-                    if diff_pct > 0.001: 
-                        pos_size = abs(float(p['info'].get('size', p.get('contracts', 0))))
-                        success = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
-                        if success:
-                            mem['last_sl_update_px'] = target_sl_px
-                            print(f"📍 [{base_sym}] {pos_side} 追踪止损已上移至 ${target_sl_px:.4f} (物理保底: {mem['dynamic_sl_phys']*100:+.2f}%)")
+                    # 冷却检测 (防重复触发)
+                    last_fired_time = bailout_cooldown_locks.get(base_sym, 0)
+                    if time.time() - last_fired_time < 5.0:
+                        continue
 
-                # ---------------------------------------------------------
-                # 🆘 轨道 2：高频瀑布插针熔断 (主动雷达逃生)
-                # ---------------------------------------------------------
-                if 'ohlcv_1m' in data and len(data['ohlcv_1m']) >= 14:
-                    ohlcv_1m = data['ohlcv_1m']
-                    current_high = max(float(ohlcv_1m[-1][2]), current_close)
-                    current_low = min(float(ohlcv_1m[-1][3]), current_close)
-                    current_vol = float(ohlcv_1m[-1][5])
-                    
-                    past_vols = [x[5] for x in ohlcv_1m[:-1]]
-                    avg_vol = sum(past_vols) / len(past_vols) if past_vols else 1e-8
-                    
-                    recent_15 = ohlcv_1m[-15:]
-                    tr_list = []
-                    for i in range(1, len(recent_15)):
-                        prev_close = float(recent_15[i-1][4])
-                        curr_h = float(recent_15[i][2])
-                        curr_l = float(recent_15[i][3])
-                        tr = max(curr_h - curr_l, abs(curr_h - prev_close), abs(curr_l - prev_close))
-                        tr_list.append(tr)
+                    # 初始化该币种的内存追踪器
+                    if base_sym not in tracking_mem:
+                        db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
+                        entry_time = time.time()
+                        try:
+                            with sqlite3.connect(db_name, timeout=1.0) as conn:
+                                cur = conn.cursor()
+                                cur.execute("SELECT exec_ts FROM live_trades WHERE side IN ('buy', 'sell') ORDER BY exec_ts DESC LIMIT 1")
+                                row = cur.fetchone()
+                                if row: entry_time = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                        except: pass
                         
-                    atr_1m = sum(tr_list) / len(tr_list) if tr_list else 0
-                    
-                    if atr_1m > 0:
-                        dyn_atr_multi = BAILOUT_ATR_MULTI   # 直接来自 config
-                        dyn_vol_multi = BAILOUT_VOL_MULTI   # 直接来自 config
+                        tracking_mem[base_sym] = {
+                            'max_phys_pnl': 0.0,
+                            'dynamic_sl_phys': -abs(hard_sl),
+                            'trailing_active': False,
+                            'entry_time': entry_time,
+                            'last_sl_update_px': 0.0,
+                            'last_entry_px': entry_px,  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
+                            'last_stop_repair_ts': 0.0,
+                            'last_snapshot_warn_ts': 0.0,
+                        }
                         
-                        is_flash_crash = False
-                        is_flash_surge = False
+                    mem = tracking_mem[base_sym]
+                    # ---------------------------------------------------------
+                    # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
+                    # ---------------------------------------------------------
+                    if 'last_entry_px' not in mem: 
+                        mem['last_entry_px'] = entry_px
                         
-                        # 设置一个物理底限，防止波动极小时的误触（直接使用 config 中定义的 BAILOUT_MIN_PHYSICAL_DROP）
-                        min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
-                        
+                    # 如果交易所最新返回的均价和我们内存中的均价偏差超过 0.01%，说明触发了实盘加仓！
+                    if abs(entry_px - mem['last_entry_px']) / max(mem['last_entry_px'], 1e-9) > 0.0001:
+                        # 记住当时的物理绝对止损价格
                         if pos_side == 'LONG':
-                            drop_amt = current_high - current_close
-                            if drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
-                                is_flash_crash = True
-                        elif pos_side == 'SHORT':
-                            surge_amt = current_close - current_low
-                            if surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
-                                is_flash_surge = True
-                                
-                        if (is_flash_crash or is_flash_surge) and ('orderbook' in data):
-                            actual_vol_multi = current_vol / (avg_vol + 1e-8)
-                            if actual_vol_multi >= dyn_vol_multi:
-                                ob = data['orderbook']
-                                bid_vol = sum([float(o[0]) * float(o[1]) for o in ob['bids'][:20]])
-                                ask_vol = sum([float(o[0]) * float(o[1]) for o in ob['asks'][:20]])
-                                
-                                obi_thresh = BAILOUT_OBI_THRESH  # 直接使用 config 中定义的订单簿失衡阈值
-                                
-                                if pos_side == 'LONG' and is_flash_crash:
-                                    obi = bid_vol / (ask_vol + 1e-8)
-                                    if obi < obi_thresh:
-                                        execute_bailout(bailout_ex, base_sym, p, f"真瀑布崩塌 (量能放大 {actual_vol_multi:.1f}x)", current_close)
-                                        bailout_cooldown_locks[base_sym] = time.time()
-                                        del tracking_mem[base_sym]
-                                        continue
-                                        
-                                elif pos_side == 'SHORT' and is_flash_surge:
-                                    obi = ask_vol / (bid_vol + 1e-8)
-                                    if obi < obi_thresh:
-                                        execute_bailout(bailout_ex, base_sym, p, f"真逼空爆发 (量能放大 {actual_vol_multi:.1f}x)", current_close)
-                                        bailout_cooldown_locks[base_sym] = time.time()
-                                        del tracking_mem[base_sym]
-                                        continue
+                            abs_sl = mem['last_entry_px'] * (1 + mem['dynamic_sl_phys'])
+                            mem['dynamic_sl_phys'] = max((abs_sl - entry_px) / entry_px, -abs(hard_sl))
+                            mem['max_phys_pnl'] = (current_close - entry_px) / entry_px
+                        else:
+                            abs_sl = mem['last_entry_px'] * (1 - mem['dynamic_sl_phys'])
+                            mem['dynamic_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
+                            mem['max_phys_pnl'] = (entry_px - current_close) / entry_px
+                            
+                        mem['last_entry_px'] = entry_px
+                        print(f"⚖️ [{base_sym}] 右脑侦测到阶梯加仓行为！新均价 ${entry_px:.4f}，已平移止损防线防止误杀。")
+                    # ---------------------------------------------------------
+                    # 📈 轨道 1：动态物理状态机 (更新底层 OCO 止损单)
+                    # ---------------------------------------------------------
+                    current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
+                    mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
+                    hold_hours = (time.time() - mem['entry_time']) / 3600.0
+                    
+                    # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
+                    # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
+                    is_reversal = False
+                    if pos_side == 'LONG' and raw_p_down > th.get('down_top_1', 1.0): is_reversal = True
+                    if pos_side == 'SHORT' and raw_p_up > th.get('up_top_1', 1.0): is_reversal = True
+                    
+                    need_market_close = False
+                    close_reason = ""
+                    
+                    # 触发器 1 & 3：反转 或 超过 24 小时
+                    if is_reversal or hold_hours >= HOLD_PERIOD:
+                        if current_phys_pnl < 0.005 and not mem['trailing_active']:
+                            need_market_close = True
+                            close_reason = "AI反转" if is_reversal else "24小时持仓超时"
+                            close_reason += " (利润不足0.5%立即斩仓)"
+                        else:
+                            mem['trailing_active'] = True
+                            mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], 0.005)
+                            
+                    # 触发器 2：触及止盈线
+                    if mem['max_phys_pnl'] >= hard_tp + 0.005:
+                        mem['trailing_active'] = True
+                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], hard_tp)
+                        
+                    # 追踪算法应用：1% 回撤限制
+                    if mem['trailing_active']:
+                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['max_phys_pnl'] - 0.01)
+
+                    if need_market_close:
+                        execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)
+                        bailout_cooldown_locks[base_sym] = time.time()
+                        del tracking_mem[base_sym]
+                        continue
+                        
+                    target_sl_px = entry_px * (1 + mem['dynamic_sl_phys']) if pos_side == 'LONG' else entry_px * (1 - mem['dynamic_sl_phys'])
+                    export_ui_mem[base_sym] = {'current_stop': target_sl_px}
+
+                    if data is None:
+                        snapshot_warn_cooldown = 60.0
+                        since_last_warn = time.time() - float(mem.get('last_snapshot_warn_ts', 0.0) or 0.0)
+                        if since_last_warn >= snapshot_warn_cooldown:
+                            msg = f"[{base_sym}] 右脑未取到本地行情快照，已退化使用交易所 mark_price=${mark_px:.4f} 维持止损托管。"
+                            print(f"⚠️ {msg}")
+                            log_system_alert("⚠️ 右脑快照缺失", base_sym, msg)
+                            mem['last_snapshot_warn_ts'] = time.time()
+
+                    # ---------------------------------------------------------
+                    # 🩹 轨道 1.5：若交易所止损单丢失/覆盖不足，立即按当前防线补挂
+                    # ---------------------------------------------------------
+                    stop_coverage = _inspect_snapshot_stop_coverage(p)
+                    repairable_statuses = {"missing_stop", "undercovered_stop", "unparseable_stop"}
+                    if stop_coverage["status"] in repairable_statuses:
+                        repair_cooldown = 8.0
+                        since_last_repair = time.time() - float(mem.get('last_stop_repair_ts', 0.0) or 0.0)
+                        if since_last_repair >= repair_cooldown:
+                            pos_size = abs(float(info.get('size', p.get('contracts', 0)) or 0.0))
+                            repaired = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
+                            mem['last_stop_repair_ts'] = time.time()
+                            if repaired:
+                                mem['last_sl_update_px'] = target_sl_px
+                                repair_msg = (
+                                    f"[{base_sym}] 检测到止损缺口，已按当前防线补挂止损 | "
+                                    f"status={stop_coverage['status']} | stop=${target_sl_px:.4f}"
+                                )
+                                print(f"🩹 {repair_msg}")
+                                log_system_alert("🩹 补挂止损", base_sym, repair_msg)
+                            else:
+                                fail_msg = (
+                                    f"[{base_sym}] 检测到止损缺口，但补挂失败 | "
+                                    f"status={stop_coverage['status']} | reason={stop_coverage['reason']}"
+                                )
+                                print(f"⚠️ {fail_msg}")
+                                log_system_alert("⚠️ 止损补挂失败", base_sym, fail_msg)
+                    
+                    if mem['trailing_active']:
+                        diff_pct = abs(target_sl_px - mem['last_sl_update_px']) / (entry_px + 1e-9)
+                        if diff_pct > 0.001: 
+                            pos_size = abs(float(info.get('size', p.get('contracts', 0)) or 0.0))
+                            success = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
+                            if success:
+                                mem['last_sl_update_px'] = target_sl_px
+                                print(f"📍 [{base_sym}] {pos_side} 追踪止损已上移至 ${target_sl_px:.4f} (物理保底: {mem['dynamic_sl_phys']*100:+.2f}%)")
+
+                    # ---------------------------------------------------------
+                    # 🆘 轨道 2：高频瀑布插针熔断 (主动雷达逃生)
+                    # ---------------------------------------------------------
+                    if data and 'ohlcv_1m' in data and len(data['ohlcv_1m']) >= 14:
+                        ohlcv_1m = data['ohlcv_1m']
+                        current_high = max(float(ohlcv_1m[-1][2]), current_close)
+                        current_low = min(float(ohlcv_1m[-1][3]), current_close)
+                        current_vol = float(ohlcv_1m[-1][5])
+                        
+                        past_vols = [x[5] for x in ohlcv_1m[:-1]]
+                        avg_vol = sum(past_vols) / len(past_vols) if past_vols else 1e-8
+                        
+                        recent_15 = ohlcv_1m[-15:]
+                        tr_list = []
+                        for i in range(1, len(recent_15)):
+                            prev_close = float(recent_15[i-1][4])
+                            curr_h = float(recent_15[i][2])
+                            curr_l = float(recent_15[i][3])
+                            tr = max(curr_h - curr_l, abs(curr_h - prev_close), abs(curr_l - prev_close))
+                            tr_list.append(tr)
+                            
+                        atr_1m = sum(tr_list) / len(tr_list) if tr_list else 0
+                        
+                        if atr_1m > 0:
+                            dyn_atr_multi = BAILOUT_ATR_MULTI
+                            dyn_vol_multi = BAILOUT_VOL_MULTI
+                            
+                            is_flash_crash = False
+                            is_flash_surge = False
+                            min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
+                            
+                            if pos_side == 'LONG':
+                                drop_amt = current_high - current_close
+                                if drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                    is_flash_crash = True
+                            elif pos_side == 'SHORT':
+                                surge_amt = current_close - current_low
+                                if surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                    is_flash_surge = True
+                                    
+                            if (is_flash_crash or is_flash_surge) and ('orderbook' in data):
+                                actual_vol_multi = current_vol / (avg_vol + 1e-8)
+                                if actual_vol_multi >= dyn_vol_multi:
+                                    ob = data['orderbook']
+                                    bid_vol = sum([float(o[0]) * float(o[1]) for o in ob['bids'][:20]])
+                                    ask_vol = sum([float(o[0]) * float(o[1]) for o in ob['asks'][:20]])
+                                    
+                                    obi_thresh = BAILOUT_OBI_THRESH
+                                    
+                                    if pos_side == 'LONG' and is_flash_crash:
+                                        obi = bid_vol / (ask_vol + 1e-8)
+                                        if obi < obi_thresh:
+                                            execute_bailout(bailout_ex, base_sym, p, f"真瀑布崩塌 (量能放大 {actual_vol_multi:.1f}x)", current_close)
+                                            bailout_cooldown_locks[base_sym] = time.time()
+                                            del tracking_mem[base_sym]
+                                            continue
+                                            
+                                    elif pos_side == 'SHORT' and is_flash_surge:
+                                        obi = ask_vol / (bid_vol + 1e-8)
+                                        if obi < obi_thresh:
+                                            execute_bailout(bailout_ex, base_sym, p, f"真逼空爆发 (量能放大 {actual_vol_multi:.1f}x)", current_close)
+                                            bailout_cooldown_locks[base_sym] = time.time()
+                                            del tracking_mem[base_sym]
+                                            continue
+                except Exception as pos_e:
+                    msg = f"[{base_sym}] 右脑处理单仓位失败: {pos_e}"
+                    print(f"⚠️ {msg}")
+                    log_system_alert("⚠️ 右脑单仓异常", base_sym, msg)
 
             # 🔄 同步写入文件，供前端 UI 读取展示虚线保底
             try:
@@ -387,5 +511,10 @@ def bailout_worker():
                 os.replace(tmp_path, os.path.join(LIVE_DATA_DIR, "chandelier_state.json"))
             except: pass
                 
-        except Exception: pass
+        except Exception as loop_e:
+            if time.time() - last_worker_error_ts >= 30.0:
+                msg = f"右脑主循环异常: {loop_e}"
+                print(f"⚠️ {msg}")
+                log_system_alert("⚠️ 右脑线程异常", "SYSTEM", msg)
+                last_worker_error_ts = time.time()
         time.sleep(1)

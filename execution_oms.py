@@ -247,6 +247,112 @@ def log_system_alert(level, symbol, message):
     except Exception:
         pass
 
+
+def _normalize_symbol_key(raw_symbol):
+    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def is_gate_close_position_stop(stop_order):
+    """识别 Gate 的“平全仓”条件单。"""
+    initial = (stop_order.get("info", {}) or {}).get("initial", {}) or {}
+    auto_size = str(initial.get("auto_size", "") or "").lower()
+    close_flag = initial.get("close")
+    if close_flag is None:
+        close_flag = initial.get("is_close")
+    return bool(close_flag) or auto_size in {"close_long", "close_short"}
+
+
+def get_gate_stop_coverage_size(stop_order, expected_contracts):
+    """
+    统一解析止损单覆盖张数。
+    Gate 的平仓条件单要求 size=0，此时用 expected_contracts 代表其覆盖全仓。
+    """
+    if is_gate_close_position_stop(stop_order):
+        return float(expected_contracts or 0.0)
+
+    initial = (stop_order.get("info", {}) or {}).get("initial", {}) or {}
+    raw_size = initial.get("size", stop_order.get("amount", 0.0))
+    try:
+        return abs(float(raw_size or 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_gate_close_stop_initial(native_symbol, text_label, close_side):
+    """构造 Gate 平全仓条件止损单的 initial 字段。"""
+    normalized_side = str(close_side or "").upper()
+    auto_size = "close_long" if normalized_side == "LONG" else "close_short"
+    return {
+        "contract": native_symbol,
+        "size": 0,
+        "close": False,
+        "price": "0",
+        "tif": "ioc",
+        "text": text_label,
+        "reduce_only": True,
+        "auto_size": auto_size,
+    }
+
+
+def _inspect_stop_order_coverage(position, stop_orders):
+    """核对交易所止损挂单是否覆盖了当前整笔仓位。"""
+    if not position:
+        return {
+            "status": "no_position",
+            "expected_contracts": 0.0,
+            "max_stop_size": 0.0,
+            "coverage_ratio": 1.0
+        }
+
+    info = position.get("info", {}) or {}
+    try:
+        expected_contracts = abs(float(info.get("size", position.get("contracts", 0)) or 0.0))
+    except (TypeError, ValueError):
+        expected_contracts = 0.0
+
+    if expected_contracts <= 0:
+        return {
+            "status": "no_position",
+            "expected_contracts": 0.0,
+            "max_stop_size": 0.0,
+            "coverage_ratio": 1.0
+        }
+
+    parsed_sizes = []
+    pos_key = _normalize_symbol_key(position.get("symbol"))
+    for stop_order in stop_orders:
+        if _normalize_symbol_key(stop_order.get("symbol")) != pos_key:
+            continue
+
+        parsed_size = get_gate_stop_coverage_size(stop_order, expected_contracts)
+        if parsed_size is not None:
+            parsed_sizes.append(parsed_size)
+
+    if not parsed_sizes:
+        return {
+            "status": "missing_stop",
+            "expected_contracts": expected_contracts,
+            "max_stop_size": 0.0,
+            "coverage_ratio": 0.0
+        }
+
+    max_stop_size = max(parsed_sizes)
+    coverage_ratio = max_stop_size / (expected_contracts + 1e-9)
+    if coverage_ratio < 0.9:
+        status = "undercovered_stop"
+    elif coverage_ratio > 1.1:
+        status = "oversized_stop"
+    else:
+        status = "ok"
+
+    return {
+        "status": status,
+        "expected_contracts": expected_contracts,
+        "max_stop_size": max_stop_size,
+        "coverage_ratio": coverage_ratio
+    }
+
 def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, risk_margin_usd):
     """
     工业级 API 下单器 (异构版)：执行下单、计算滑点并落库
@@ -370,7 +476,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         native_symbol = exchange_private.market_id(gate_symbol)
 
         # 🚨 修复 1：安全的四舍五入防截断 + close=True 防止仓位翻倍
-        def safe_post_condition(rule, price, text_label, stop_size):
+        def safe_post_condition(rule, price, text_label, stop_size, close_side):
             exact_size = int(round(float(stop_size)))
             if exact_size <= 0:
                 msg_err = f"⚠️ 计算所得止损张数 ({exact_size}) <= 0，放弃挂载止损单。"
@@ -382,14 +488,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                 try:
                     exchange_private.private_futures_post_settle_price_orders({
                         "settle": "usdt",
-                        "initial": {
-                            "contract": native_symbol, 
-                            "size": exact_size, 
-                            "close": True,       # 极其关键：标记为平仓专属，防止反向开仓
-                            "price": "0", 
-                            "tif": "ioc", 
-                            "text": text_label
-                        },
+                        "initial": build_gate_close_stop_initial(native_symbol, text_label, close_side),
                         "trigger": {
                             "strategy_type": 0, 
                             "price_type": 1, 
@@ -433,7 +532,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         # 【修改点2：移除硬止盈，只挂兜底硬止损 (给追踪止盈让路)】
         # ---------------------------------------------------------
         # 挂载精确定量硬止损
-        sl_success = safe_post_condition(sl_rule, sl_price, "sl_tier", order_amount)
+        close_side = "LONG" if side == "buy" else "SHORT"
+        sl_success = safe_post_condition(sl_rule, sl_price, "sl_tier", order_amount, close_side)
         
         # 终极物理校验
         time.sleep(1.5) 
@@ -448,6 +548,22 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                 msg_oco_fail = f"物理兜底止损单校验未完全通过 (现存: {len(verify_stops)}个)，可能存在遗漏，交由右脑兜底。"
                 print(f"❌ 警告：{gate_symbol} {msg_oco_fail}")
                 log_system_alert("⚠️ 挂单残缺", symbol, msg_oco_fail)
+
+            verify_positions = exchange_private.fetch_positions([gate_symbol])
+            active_position = next(
+                (p for p in verify_positions if abs(float(p.get('contracts', 0) or 0)) > 1e-8),
+                None
+            )
+            coverage_check = _inspect_stop_order_coverage(active_position, verify_stops)
+            if coverage_check["status"] != "ok":
+                msg_cov = (
+                    f"{gate_symbol} 止损覆盖异常: status={coverage_check['status']} | "
+                    f"stop_size={coverage_check['max_stop_size']:.4f} | "
+                    f"position_size={coverage_check['expected_contracts']:.4f} | "
+                    f"coverage={coverage_check['coverage_ratio']:.2%}"
+                )
+                print(f"⚠️ {msg_cov}")
+                log_system_alert("⚠️ 止损覆盖异常", symbol, msg_cov)
         except Exception as e:
              print(f"⚠️ 校验请求被限流，假定止损挂单成功: {e}")
 
@@ -543,7 +659,8 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
                     
                     # 立刻挂载条件单，堵住超时裸奔漏洞
-                    safe_post_condition(sl_rule, fallback_sl_price, "sl_tier", order_amount)
+                    close_side = "LONG" if side == 'buy' else "SHORT"
+                    safe_post_condition(sl_rule, fallback_sl_price, "sl_tier", order_amount, close_side)
                     
                     # 超时抢救成功后兜底落库
                     db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")
