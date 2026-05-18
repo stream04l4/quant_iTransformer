@@ -140,15 +140,45 @@ def portfolio_sync_worker():
                         # 👇 [新增：被动平仓推送逻辑]
                         # 如果该币种在 10 秒内没有触发过主动熔断推送，说明是交易所 OCO 触发的被动平仓
                         last_push_ts = state.recent_pushes.get(k, 0)
-                        if time.time() - last_push_ts > 10 and PUSHPLUS_TOKEN:
+                        is_passive_close = time.time() - last_push_ts > 10
+                        if is_passive_close:
+                            try:
+                                _record_passive_close_to_db(k, old_p, close_side="exchange_close")
+                            except Exception as e:
+                                print(f"   ⚠️ 被动平仓流水补记失败: {e}")
+
+                        if is_passive_close and PUSHPLUS_TOKEN:
                             try:
                                 dir_str = "多单 🟢" if str(old_p.get('side', '')).lower() == 'long' else "空单 🔴"
                                 contracts = old_p.get('contracts', 0)
+                                abs_profit, realized_roe = _estimate_close_pnl_from_position(old_p)
+                                if abs_profit is None and realized_roe is None:
+                                    pnl_line = "<b>💰 结算盈亏：</b>快照不足，暂无法估算<br>"
+                                else:
+                                    if abs_profit is not None and abs_profit > 0:
+                                        pnl_icon = "🟢 盈利"
+                                    elif abs_profit is not None and abs_profit < 0:
+                                        pnl_icon = "🔴 亏损"
+                                    elif realized_roe is not None and realized_roe > 0:
+                                        pnl_icon = "🟢 盈利"
+                                    elif realized_roe is not None and realized_roe < 0:
+                                        pnl_icon = "🔴 亏损"
+                                    else:
+                                        pnl_icon = "🟡 保本"
+
+                                    pnl_parts = []
+                                    if abs_profit is not None:
+                                        pnl_parts.append(f"{abs_profit:+.2f} USDT")
+                                    if realized_roe is not None:
+                                        pnl_parts.append(f"{realized_roe:+.2%}")
+                                    pnl_line = f"<b>{pnl_icon}：</b>{' '.join(pnl_parts)}<br>"
+
                                 push_title = f"🏁 [Gate实盘] {k} 仓位已平仓"
                                 push_content = (
                                     f"<b>🔹 交易标的：</b>{k} ({dir_str})<br>"
                                     f"<b>🔸 平仓类型：</b>交易所系统结算 (止盈/止损/手动)<br>"
                                     f"<b>📦 结算数量：</b>{contracts} 张<br>"
+                                    f"{pnl_line}"
                                     f"<b>⏰ 时间：</b>{datetime.now().strftime('%H:%M:%S')}"
                                 )
                                 state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
@@ -251,6 +281,118 @@ def log_system_alert(level, symbol, message):
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _safe_float(value, default=0.0):
+    """容错解析数值，避免快照字段为空或格式异常。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _estimate_close_pnl_from_position(position, exit_price=None):
+    """基于最近一帧仓位快照，估算平仓盈亏与 ROE。"""
+    if not position:
+        return None, None
+
+    info = position.get("info", {}) or {}
+    pos_side = str(position.get("side", info.get("side", "")) or "").upper()
+    contracts = abs(_safe_float(position.get("contracts", info.get("size", info.get("contracts", 0))), 0.0))
+    entry_px = _safe_float(position.get("entryPrice", info.get("entry_price", info.get("avgPx", 0))), 0.0)
+    mark_px = _safe_float(
+        exit_price if exit_price is not None else position.get("markPrice", info.get("mark_price", info.get("markPx", 0))),
+        0.0,
+    )
+    leverage = _safe_float(position.get("leverage", info.get("leverage", info.get("lever", 1))), 1.0)
+    contract_size = _safe_float(position.get("contractSize", info.get("contract_size", 1)), 1.0)
+    if leverage <= 0:
+        leverage = 1.0
+
+    raw_pnl = None
+    if entry_px > 0 and mark_px > 0 and contracts > 0:
+        if pos_side == "LONG":
+            raw_pnl = (mark_px - entry_px) / entry_px
+        elif pos_side == "SHORT":
+            raw_pnl = (entry_px - mark_px) / entry_px
+
+    if raw_pnl is not None:
+        abs_profit = raw_pnl * (contracts * contract_size * entry_px)
+        realized_roe = raw_pnl * leverage
+        return abs_profit, realized_roe
+
+    upl_raw = info.get("unrealised_pnl", info.get("unrealized_pnl"))
+    abs_profit = _safe_float(upl_raw, None) if upl_raw is not None else None
+
+    pct_raw = position.get("percentage")
+    if pct_raw is None:
+        pct_raw = info.get("uplRatio")
+    realized_roe = _safe_float(pct_raw, None) if pct_raw is not None else None
+    if realized_roe is not None and -1.0 < realized_roe < 1.0 and realized_roe != 0.0:
+        realized_roe *= 100.0
+    if realized_roe is not None:
+        realized_roe /= 100.0
+
+    return abs_profit, realized_roe
+
+
+def _record_passive_close_to_db(symbol_key, position, close_side="exchange_close"):
+    """为交易所被动平仓补记一笔 close 流水，供历史本纪识别。"""
+    if not symbol_key or not position:
+        return
+
+    info = position.get("info", {}) or {}
+    contracts = abs(_safe_float(position.get("contracts", info.get("size", info.get("contracts", 0))), 0.0))
+    contract_size = _safe_float(position.get("contractSize", info.get("contract_size", 1)), 1.0)
+    exit_price = _safe_float(
+        position.get("markPrice", info.get("mark_price", info.get("markPx", 0))),
+        0.0,
+    )
+    leverage = _safe_float(position.get("leverage", info.get("leverage", info.get("lever", 1))), 1.0)
+    if leverage <= 0:
+        leverage = 1.0
+
+    notional = _safe_float(position.get("notional", info.get("value", 0)), 0.0)
+    if notional <= 0 and contracts > 0 and contract_size > 0 and exit_price > 0:
+        notional = contracts * contract_size * exit_price
+    margin_used = (notional / leverage) if leverage > 0 and notional > 0 else 0.0
+
+    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol_key}.db")
+    with sqlite3.connect(db_name, timeout=20.0, check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''CREATE TABLE IF NOT EXISTS live_trades
+               (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
+                amount REAL, fill_price REAL, slippage REAL,
+                tp_price REAL, sl_price REAL, margin_used REAL, leverage REAL)'''
+        )
+        try:
+            cursor.execute("ALTER TABLE live_trades ADD COLUMN margin_used REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE live_trades ADD COLUMN leverage REAL")
+        except sqlite3.OperationalError:
+            pass
+
+        cursor.execute(
+            '''INSERT INTO live_trades
+               (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
+                'passive_close_sync',
+                close_side,
+                float(contracts),
+                float(exit_price),
+                0.0,
+                0.0,
+                0.0,
+                float(margin_used),
+                float(leverage),
+            ),
+        )
+        conn.commit()
 
 
 def is_gate_close_position_stop(stop_order):

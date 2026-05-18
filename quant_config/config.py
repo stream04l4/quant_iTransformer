@@ -67,12 +67,12 @@ LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 3.0))
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.05))           
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.015))           
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
-MACRO_ALPHA_TOP_10 = 1.20            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
+MACRO_ALPHA_TOP_10 = 0.80            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
 MACRO_ALPHA_TOP_5 = 0.50             # Tier 2 (波段加仓): 宏观权重中等
 MACRO_ALPHA_TOP_1 = 0.15             # Tier 3 (激进杠杆): 宏观权重极低，尊重微观量价动能
 

@@ -324,22 +324,17 @@ class DeepSeekMacroAgent:
         2. 权重 30%：Crypto 核心基本面与机构资金 (Institutional Crypto Fundamentals)
            - 数据源：`hot_news`。
            - ⚠️ 时效逻辑：阅读新闻发布时间，距离当前时间越久，情绪影响越弱。
+           - ⚠️ 合规约束：本任务禁止把 BTC 现价/点位 作为打分依据。若新闻标题中的 BTC 价格数字被脱敏，不得自行脑补具体点位。
+           - ⚠️ 输出约束：`marquee_text` 禁止出现 BTC 的具体价格、点位、支撑阻力位、百分位报价描述，只能描述方向和宏观事件，例如“BTC承压”“市场风险偏好下降”。
 
-        3. 权重 20%：衍生品盘面与散户博弈 (Derivatives & Retail Sentiment)
-           - 数据源：`market_position` 中的多空比 (long_short_ratio)。
-           - ⚠️ 量化反向指标指南 (极度重要)：币安的多空比代表散户账户比例，必须作为【反向指标】使用！
-             * 大于 1.5：散户极度贪婪看多，暗示主力在做空，应计为【负面情绪】。
-             * 小于 0.8：散户极度恐慌看空，暗示底部可能形成，应计为【正面情绪】。
-             * 0.8 到 1.5：中性博弈状态。
-
-        4. 权重 10%：大盘基础情绪 (Fear & Greed)
+        3. 权重 30%：大盘基础情绪 (Fear & Greed)
            - 数据源：`fear_and_greed`。
 
         【打分情景锚点（请严格参考此标尺校准你的输出分数，防止分数漂移）】
-        +0.80 ~ +1.00：纳指暴涨 + 10年期美债收益率与美元指数大跌 + 散户极度看空（多空比<0.8）+ 极度贪婪。
-        +0.30 ~ +0.50：美股温和上涨，无重大新闻，多空比处于中性健康水平。
-        -0.10 ~ +0.10：周末休市期，或者多空数据互相矛盾，缺乏明确宏观方向。
-        -0.50 ~ -0.80：纳指大跌 + 10年期美债收益率与美元指数飙升 + 散户极度看多（多空比>1.5）。
+        +0.80 ~ +1.00：纳指暴涨 + 10年期美债收益率与美元指数大跌 + 宏观与行业消息共振利好 + 极度贪婪。
+        +0.30 ~ +0.50：美股温和上涨，无重大新闻，风险偏好稳定修复。
+        -0.10 ~ +0.10：周末休市期，或者宏观与消息面互相矛盾，缺乏明确方向。
+        -0.50 ~ -0.80：纳指大跌 + 10年期美债收益率与美元指数飙升 + 风险事件扩散。
         -0.80 ~ -1.00：发生黑天鹅事件（如顶级交易所被盗、监管毁灭性打击、宏观流动性极度枯竭）。
 
         【物理限速锁与历史多重锚点防漂移机制 (State Drift Prevention)】：
@@ -357,7 +352,8 @@ class DeepSeekMacroAgent:
         }}
         """
 
-        user_content = f"【当前市场最新切片数据】\n{json.dumps(current_context, ensure_ascii=False, indent=2)}"
+        llm_context = build_llm_ready_context(current_context)
+        user_content = f"【当前市场最新切片数据】\n{json.dumps(llm_context, ensure_ascii=False, indent=2)}"
         
         # 动态拼接历史锚点数据
         historical_context_added = False
@@ -445,7 +441,7 @@ class DeepSeekMacroAgent:
                 
                 return {
                     "score": round(float(decision.get("score", 0.00)), 2), 
-                    "marquee_text": str(decision.get("marquee_text", "API 返回解析异常，使用默认兜底。")),
+                    "marquee_text": sanitize_marquee_text(str(decision.get("marquee_text", "API 返回解析异常，使用默认兜底。"))),
                     "urgency": str(decision.get("urgency", "low")).lower()
                 }
                 
@@ -471,17 +467,11 @@ def compress_historical_context(raw_json_str):
                 asset_data = macro.get(asset, {})
                 if asset_data:
                     compressed[asset] = {
-                        "price": asset_data.get("current_price"),
                         "z_score": asset_data.get("price_z_score"),
                         "daily_delta": asset_data.get("daily_24h_delta_pct"),
                         "is_fresh": asset_data.get("is_fresh"),
                         "hours_since_update": asset_data.get("hours_since_update")
                     }   
-        # 2. 提取多空比和贪婪指数
-        pos = data.get("market_position", {})
-        if pos:
-            compressed["Long_Short_Ratio"] = pos.get("long_short_ratio")
-            
         fng = data.get("fear_and_greed", {})
         if fng:
             compressed["Fear_Greed_Value"] = fng.get("value")
@@ -492,29 +482,72 @@ def compress_historical_context(raw_json_str):
         return {}
 
 
+def _redact_btc_price_mentions(text):
+    """去掉 BTC/Bitcoin 标题里的价格数字，防止把现价泄漏给情绪裁判。"""
+    if not text:
+        return text
+
+    if not re.search(r"(?i)(?:BTC|Bitcoin|比特币)", text):
+        return text
+
+    redacted = re.sub(
+        r"(?i)(?:[$€¥£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*[kmb])?|\b\d[\d,]*(?:\.\d+)?\s*(?:usd|usdt|dollars?|k|m|b|万|亿)\b)",
+        "[PRICE_REDACTED]",
+        text,
+    )
+    redacted = re.sub(r"(?i)\bprice\b", "price[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)\b(?:to|at|near|below|above|under|over)\s+\[PRICE_REDACTED\]", "", redacted)
+    redacted = re.sub(r"(?i)(?:跌至|升至|涨至|降至|触及|站上|跌破|突破)\s*\[PRICE_REDACTED\]", "走势变化", redacted)
+    redacted = re.sub(r"\s+", " ", redacted).strip()
+    return redacted
+
+
+def _sanitize_hot_news_for_btc_prediction(news_items):
+    """保留新闻事件本身，但移除 BTC 现价/点位描述。"""
+    sanitized_items = []
+    for item in news_items or []:
+        sanitized_items.append({
+            "title": _redact_btc_price_mentions(item.get("title", "")),
+            "source": item.get("source", ""),
+            "time": item.get("time", ""),
+        })
+    return sanitized_items
+
+
+def sanitize_marquee_text(text):
+    """兜底清洗模型输出，禁止播报 BTC 价格与点位。"""
+    text = _redact_btc_price_mentions(text or "")
+    text = re.sub(
+        r"(?i)(?:多空比|巨鲸|散户|订单流|资金费率|持仓量|whale|retail|order flow|funding rate|open interest|long[-\s]?short ratio)[^，。,；;]*",
+        "市场微观噪声已过滤",
+        text,
+    )
+    text = re.sub(r"(?i)\b(?:support|resistance)\b", "level", text)
+    text = re.sub(r"(?i)(?:BTC|Bitcoin|比特币)[^，。,；;]*\[PRICE_REDACTED\][^，。,；;]*", "BTC走势承压", text)
+    text = re.sub(r"(?:市场微观噪声已过滤[，。,；;\s]*)+", "市场微观噪声已过滤，", text)
+    text = re.sub(r"\s+", " ", text).strip(" ，。,；;")
+    return text or "宏观情绪中性，未见可广播的价格无关结论。"
+
+
 def build_llm_ready_context(current_context):
-    """压缩当前切片，减少 LLM 超时概率，同时保留真正有判别力的字段。"""
+    """压缩当前切片，明确排除 BTC 现价与任何绝对价格轨迹。"""
     compact = {
         "timestamp": current_context.get("timestamp"),
         "fear_and_greed": current_context.get("fear_and_greed"),
-        "market_position": current_context.get("market_position"),
-        "hot_news": (current_context.get("hot_news", []) or [])[:5],
+        "hot_news": _sanitize_hot_news_for_btc_prediction((current_context.get("hot_news", []) or [])[:5]),
         "us_macro_equities": {},
     }
 
     macro = current_context.get("us_macro_equities", {}) or {}
     for asset, asset_data in macro.items():
-        recent_k_lines = (asset_data.get("recent_k_lines", []) or [])[-4:]
         compact["us_macro_equities"][asset] = {
             "latest_update_time": asset_data.get("latest_update_time"),
             "hours_since_update": asset_data.get("hours_since_update"),
             "is_fresh": asset_data.get("is_fresh"),
             "market_status": asset_data.get("market_status"),
-            "current_price": asset_data.get("current_price"),
             "daily_24h_delta_pct": asset_data.get("daily_24h_delta_pct"),
             "delta_window_hours": asset_data.get("delta_window_hours"),
             "price_z_score": asset_data.get("price_z_score"),
-            "recent_k_lines": recent_k_lines,
         }
     return compact
 # ==========================================
@@ -525,14 +558,12 @@ def run_sentinel_pipeline():
     
     news_scraper = NewsScraper()
     fng_scraper = SentimentIndexScraper()
-    pos_scraper = MarketPositionScraper()
     tradfi_scraper = TradFiScraper() # 👈 实例化美股刮削器
     
     current_context = {
         "timestamp": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
         "us_macro_equities": tradfi_scraper.fetch(), # 👈 将美股真实数据喂入大模型嘴里
         "fear_and_greed": fng_scraper.fetch(),
-        "market_position": pos_scraper.fetch(),
         "hot_news": news_scraper.fetch()
     }
     context_json_str = json.dumps(current_context, ensure_ascii=False)
@@ -562,7 +593,7 @@ def run_sentinel_pipeline():
                 """组装包含底层数据的锚点对象"""
                 anchor = {
                     "score": row[0],
-                    "marquee_text": row[1],
+                    "marquee_text": sanitize_marquee_text(row[1]),
                     "urgency": row[2]
                 }
                 # 将当时的环境变量压缩后塞入参考系中
