@@ -97,7 +97,101 @@ def _inspect_snapshot_stop_coverage(position):
     }
 
 
-def execute_bailout(ex, base_sym, p, reason, current_price):
+def _safe_parse_epoch(raw_value):
+    """兼容秒/毫秒时间戳，解析失败返回 None。"""
+    try:
+        ts = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+    if ts <= 0:
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    return ts
+
+
+def _resolve_position_entry_time(position, base_sym):
+    """
+    优先使用交易所仓位对象里的 open_time/timestamp，避免新仓尚未写库时误拿到上一笔老仓时间。
+    仅当交易所字段缺失时，才退回本地最新同向开仓流水。
+    """
+    info = position.get("info", {}) or {}
+    candidates = [
+        info.get("open_time"),
+        position.get("timestamp"),
+        position.get("lastUpdateTimestamp"),
+        info.get("update_time"),
+    ]
+    for raw_ts in candidates:
+        parsed_ts = _safe_parse_epoch(raw_ts)
+        if parsed_ts is not None:
+            return parsed_ts
+
+    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
+    pos_side = str(position.get("side", "")).upper()
+    local_open_side = "buy" if pos_side == "LONG" else "sell"
+    try:
+        with sqlite3.connect(db_name, timeout=1.0) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT exec_ts
+                FROM live_trades
+                WHERE side = ?
+                ORDER BY exec_ts DESC
+                LIMIT 1
+                """,
+                (local_open_side,),
+            )
+            row = cur.fetchone()
+            if row:
+                return datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f').timestamp()
+    except Exception:
+        pass
+
+    return time.time()
+
+
+def _read_last_inferred_hour():
+    """读取主引擎最近一次使用的闭合 1h K 线时间戳，供强制退出后做本K线冷却。"""
+    status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
+    if not os.path.exists(status_path):
+        return 0
+
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return int(payload.get("execution_state", {}).get("last_inferred_hour", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=None):
+    """
+    强制退出后锁住当前这根已闭合 1h K 线。
+    只有等到下一根新 K 线闭合，主引擎才允许再次入场。
+    """
+    if anchor_closed_ts is None:
+        anchor_closed_ts = _read_last_inferred_hour()
+    try:
+        anchor_closed_ts = int(anchor_closed_ts or 0)
+    except (TypeError, ValueError):
+        anchor_closed_ts = 0
+
+    if anchor_closed_ts <= 0:
+        current_closed_hour = max(int(time.time() // 3600) - 1, 0)
+        anchor_closed_ts = current_closed_hour * 3600000
+
+    with state.event_lock:
+        state.forced_exit_locks[base_sym] = {
+            "anchor_closed_ts": anchor_closed_ts,
+            "trigger_ts": time.time(),
+            "reason": str(reason),
+        }
+
+
+def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=None):
     """右脑专用：执行紧急市价逃生"""
     gate_sym = p['symbol']
     pos_side = str(p.get('side', '')).upper()
@@ -137,6 +231,8 @@ def execute_bailout(ex, base_sym, p, reason, current_price):
                             float(contracts), current_price, 0.0, 0.0, 0.0, 0.0, 0.0))
             conn_log.commit()
             print(f"   💾 平仓记录已同步至本地数据库: {db_name}")
+
+        _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=anchor_closed_ts)
                     
         # 5. 警报与推送
         log_system_alert("🆘 熔断跳伞", base_sym, f"微观崩塌 ({reason})，已市价斩仓逃生。")
@@ -302,15 +398,7 @@ def bailout_worker():
 
                     # 初始化该币种的内存追踪器
                     if base_sym not in tracking_mem:
-                        db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
-                        entry_time = time.time()
-                        try:
-                            with sqlite3.connect(db_name, timeout=1.0) as conn:
-                                cur = conn.cursor()
-                                cur.execute("SELECT exec_ts FROM live_trades WHERE side IN ('buy', 'sell') ORDER BY exec_ts DESC LIMIT 1")
-                                row = cur.fetchone()
-                                if row: entry_time = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f').timestamp()
-                        except: pass
+                        entry_time = _resolve_position_entry_time(p, base_sym)
                         
                         tracking_mem[base_sym] = {
                             'max_phys_pnl': 0.0,
@@ -360,11 +448,11 @@ def bailout_worker():
                     need_market_close = False
                     close_reason = ""
                     
-                    # 触发器 1 & 3：反转 或 超过 24 小时
+                    # 触发器 1 & 3：反转 或 超过配置中的持仓时长上限
                     if is_reversal or hold_hours >= HOLD_PERIOD:
                         if current_phys_pnl < 0.005 and not mem['trailing_active']:
                             need_market_close = True
-                            close_reason = "AI反转" if is_reversal else "24小时持仓超时"
+                            close_reason = "AI反转" if is_reversal else f"{HOLD_PERIOD}小时持仓超时"
                             close_reason += " (利润不足0.5%立即斩仓)"
                         else:
                             mem['trailing_active'] = True

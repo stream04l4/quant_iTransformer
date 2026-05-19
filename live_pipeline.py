@@ -478,6 +478,34 @@ def _load_recent_local_open_trades(limit=20):
     return records
 
 
+def _get_forced_exit_lock(symbol, latest_closed_ts):
+    """
+    若本小时内发生过强制退出，则锁住当前这根已闭合 K 线，直到下一根 K 线闭合后才允许重新评估入场。
+    """
+    sym_key = _normalize_symbol_key(symbol)
+    try:
+        current_closed_ts = int(latest_closed_ts or 0)
+    except (TypeError, ValueError):
+        current_closed_ts = 0
+
+    with state.event_lock:
+        lock_info = dict(state.forced_exit_locks.get(sym_key, {}) or {})
+        if not lock_info:
+            return {"active": False}
+
+        anchor_closed_ts = int(lock_info.get("anchor_closed_ts", 0) or 0)
+        if current_closed_ts > 0 and current_closed_ts > anchor_closed_ts:
+            state.forced_exit_locks.pop(sym_key, None)
+            return {
+                "active": False,
+                "released": True,
+                "released_anchor_closed_ts": anchor_closed_ts,
+            }
+
+    lock_info["active"] = True
+    return lock_info
+
+
 def _inspect_live_stop_coverage(position):
     """
     校验当前持仓是否被交易所止损单完整覆盖。
@@ -692,6 +720,7 @@ def run_live():
     last_trade_signal = 0
     latest_closed_ts = 0
     last_inventory_guard_mode = "flat"
+    last_forced_exit_anchor_ts = 0
     
     # 🎯 仓位阶梯状态机：重启时从交易所/磁盘双轨恢复，防止重复开仓
     # portfolio_sync_worker 在后台独立线程中运行，动态等待其完成首次同步
@@ -825,6 +854,23 @@ def run_live():
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧯 {guard_msg}")
                 log_system_alert("🧯 库存守卫", SYMBOL, guard_msg)
                 last_inventory_guard_mode = inventory_guard["mode"]
+            forced_exit_lock = _get_forced_exit_lock(SYMBOL, latest_closed_ts)
+            if forced_exit_lock.get("released"):
+                released_anchor = forced_exit_lock.get("released_anchor_closed_ts", 0)
+                print(
+                    f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🔓 "
+                    f"强制退出冷却解除，检测到新闭合K线 (prev_ts: {released_anchor} -> now: {latest_closed_ts})"
+                )
+                last_forced_exit_anchor_ts = 0
+            elif forced_exit_lock.get("active"):
+                anchor_closed_ts = int(forced_exit_lock.get("anchor_closed_ts", 0) or 0)
+                if anchor_closed_ts != last_forced_exit_anchor_ts:
+                    reason = forced_exit_lock.get("reason", "强制退出")
+                    print(
+                        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧊 "
+                        f"强制退出冷却生效：{reason} | 当前闭合K线TS={latest_closed_ts} | 锁定基准TS={anchor_closed_ts}"
+                    )
+                    last_forced_exit_anchor_ts = anchor_closed_ts
             target_signal = 0
             target_tier = 0
             dynamic_leverage = 0.0
@@ -839,7 +885,9 @@ def run_live():
 
             # 阶梯过滤器核心逻辑
             actual_signal = 0
-            if inventory_guard["block_new_orders"]:
+            if forced_exit_lock.get("active"):
+                actual_signal = 0
+            elif inventory_guard["block_new_orders"]:
                 actual_signal = 0
             elif target_signal != 0:
                 if position_tier_state["side"] == 0:
@@ -852,7 +900,9 @@ def run_live():
 
             if needs_evaluation_log:
                 action_str = "按兵不动"
-                if inventory_guard["block_new_orders"]:
+                if forced_exit_lock.get("active"):
+                    action_str = "🧊 强制退出冷却中，等待下一根1h K线闭合后再评估"
+                elif inventory_guard["block_new_orders"]:
                     action_str = "🧯 异常库存隔离中，主引擎禁止继续下单"
                 elif actual_signal == 1: 
                     action_str = f"🚀 触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
@@ -860,6 +910,12 @@ def run_live():
                     action_str = f"🩸 触发做空 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
 
                 inventory_reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
+                forced_exit_text = "无"
+                if forced_exit_lock.get("active"):
+                    forced_exit_text = (
+                        f"{forced_exit_lock.get('reason', '强制退出')} | "
+                        f"锁定至下一根闭合K线 (> {forced_exit_lock.get('anchor_closed_ts', 0)})"
+                    )
                 eval_log = (
                     f"【触发原因】{trigger_reason}\n"
                     f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
@@ -868,6 +924,7 @@ def run_live():
                     f"仓位同步新鲜: {'是' if position_state_meta['sync_fresh'] else '否'}\n"
                     f"【库存守卫】模式: {inventory_guard['mode']} | 当前杠杆: {inventory_guard['current_leverage']:.2f}x | "
                     f"止损覆盖: {inventory_guard['stop_coverage']['status']} | 原因: {inventory_reason_text}"
+                    f"\n【强制退出冷却】{forced_exit_text}"
                 )
                 print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
                 log_system_alert("🧠 决策评估", SYMBOL, eval_log)
@@ -944,6 +1001,12 @@ def run_live():
                         "coverage_ratio": float(inventory_guard["stop_coverage"]["coverage_ratio"]),
                         "reason": inventory_guard["stop_coverage"]["reason"]
                     }
+                },
+                "forced_exit_lock": {
+                    "active": bool(forced_exit_lock.get("active", False)),
+                    "anchor_closed_ts": int(forced_exit_lock.get("anchor_closed_ts", 0) or 0),
+                    "reason": forced_exit_lock.get("reason", ""),
+                    "trigger_ts": float(forced_exit_lock.get("trigger_ts", 0.0) or 0.0)
                 }
             }
 
