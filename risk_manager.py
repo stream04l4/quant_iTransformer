@@ -1,6 +1,7 @@
 import os
 import time
 import sqlite3
+import math
 import pandas as pd
 import requests
 import json
@@ -12,7 +13,8 @@ from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, MODEL_DIR,
     HARD_TP, HARD_SL, HOLD_PERIOD, 
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
-    BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID
+    BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID,
+    MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -151,6 +153,82 @@ def _resolve_position_entry_time(position, base_sym):
         pass
 
     return time.time()
+
+
+def _apply_logit_fusion(base_prob, macro_score, alpha):
+    """复刻主引擎的概率融合逻辑，供右脑识别同向信号刷新持仓计时。"""
+    epsilon = 1e-7
+    p_safe = min(max(float(base_prob or 0.0), epsilon), 1.0 - epsilon)
+    logit = math.log(p_safe / (1.0 - p_safe))
+    adjusted_logit = logit + (float(alpha) * float(macro_score or 0.0))
+    return 1.0 / (1.0 + math.exp(-adjusted_logit))
+
+
+def _resolve_target_signal_from_status(live_status, thresholds, base_sym):
+    """
+    基于 live_status 里的最新模型输出，复算主引擎本小时的目标信号方向。
+    这里返回 target_signal，而不是 actual_signal，因为同向仓位下被 OMS 放弃的信号
+    仍然应该刷新 12 小时持仓计时。
+    """
+    if _normalize_symbol_key(live_status.get("symbol")) != base_sym:
+        return 0
+
+    inference_data = live_status.get("model_inference", {}) or {}
+    raw_p_up = float(inference_data.get("raw_prob_up", 0.0) or 0.0)
+    raw_p_down = float(inference_data.get("raw_prob_down", 0.0) or 0.0)
+    macro_score = float(
+        inference_data.get("macro_score", live_status.get("macro_score", 0.0)) or 0.0
+    )
+
+    adj_up_top1 = _apply_logit_fusion(raw_p_up, macro_score, MACRO_ALPHA_TOP_1)
+    adj_up_top5 = _apply_logit_fusion(raw_p_up, macro_score, MACRO_ALPHA_TOP_5)
+    adj_up_top10 = _apply_logit_fusion(raw_p_up, macro_score, MACRO_ALPHA_TOP_10)
+    adj_down_top1 = _apply_logit_fusion(raw_p_down, -macro_score, MACRO_ALPHA_TOP_1)
+    adj_down_top5 = _apply_logit_fusion(raw_p_down, -macro_score, MACRO_ALPHA_TOP_5)
+    adj_down_top10 = _apply_logit_fusion(raw_p_down, -macro_score, MACRO_ALPHA_TOP_10)
+
+    if adj_up_top1 > thresholds.get('up_top_1', 1.0):
+        return 1
+    if adj_up_top5 > thresholds.get('up_top_5', 1.0):
+        return 1
+    if adj_up_top10 > thresholds.get('up_top_10', 1.0):
+        return 1
+    if adj_down_top1 > thresholds.get('down_top_1', 1.0):
+        return -1
+    if adj_down_top5 > thresholds.get('down_top_5', 1.0):
+        return -1
+    if adj_down_top10 > thresholds.get('down_top_10', 1.0):
+        return -1
+    return 0
+
+
+def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_status, thresholds):
+    """
+    若本小时出现与当前仓位同向的 target_signal，即使 OMS 因已有仓位未再次下单，
+    也把 entry_time 锚点刷新到该小时，避免 HOLD_PERIOD 仍从最初建仓时刻累计。
+    """
+    execution_state = live_status.get("execution_state", {}) or {}
+    inferred_hour_ts = _safe_parse_epoch(execution_state.get("last_inferred_hour"))
+    if inferred_hour_ts is None:
+        return
+
+    target_signal = _resolve_target_signal_from_status(live_status, thresholds, base_sym)
+    current_side = 1 if str(pos_side).upper() == "LONG" else -1
+    if target_signal != current_side:
+        return
+
+    last_refresh_ts = float(mem.get('last_same_signal_refresh_ts', 0.0) or 0.0)
+    if inferred_hour_ts <= last_refresh_ts:
+        return
+    if inferred_hour_ts <= float(mem.get('entry_time', 0.0) or 0.0):
+        return
+
+    mem['entry_time'] = inferred_hour_ts
+    mem['last_same_signal_refresh_ts'] = inferred_hour_ts
+    print(
+        f"🕒 [{base_sym}] 侦测到同向信号延续，持仓计时已刷新至 "
+        f"{datetime.fromtimestamp(inferred_hour_ts).strftime('%Y-%m-%d %H:%M:%S')}。"
+    )
 
 
 def _read_last_inferred_hour():
@@ -405,6 +483,7 @@ def bailout_worker():
                             'dynamic_sl_phys': -abs(hard_sl),
                             'trailing_active': False,
                             'entry_time': entry_time,
+                            'last_same_signal_refresh_ts': 0.0,
                             'last_sl_update_px': 0.0,
                             'last_entry_px': entry_px,  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
                             'last_stop_repair_ts': 0.0,
@@ -437,6 +516,7 @@ def bailout_worker():
                     # ---------------------------------------------------------
                     current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
+                    _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_status, th)
                     hold_hours = (time.time() - mem['entry_time']) / 3600.0
                     
                     # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
