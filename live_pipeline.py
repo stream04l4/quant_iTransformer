@@ -67,7 +67,7 @@ def fetch_gateway_snapshot(sym):
     except Exception:
         return None
 
-def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
+def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None):
     """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
     # 1. 基础 K 线体系
@@ -83,9 +83,24 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
 
-    # 2. 横截面辅助缝合
-    df_ethbtc = pd.DataFrame(eth_btc_snap['ohlcv_1h'], columns=['timestamp', 'open_eb', 'high_eb', 'low_eb', 'eth_btc_close', 'volume_eb'])
-    df = df.merge(df_ethbtc[['timestamp', 'eth_btc_close']], on='timestamp', how='left')
+    # 2. 横截面辅助缝合：优先使用直接交叉对，否则回退到“辅助现货/主币”合成。
+    if aux_reference_snap and aux_reference_snap.get('ohlcv_1h'):
+        df_aux = pd.DataFrame(
+            aux_reference_snap['ohlcv_1h'],
+            columns=['timestamp', 'open_aux', 'high_aux', 'low_aux', 'aux_reference_close', 'volume_aux']
+        )
+        df = df.merge(df_aux[['timestamp', 'aux_reference_close']], on='timestamp', how='left')
+    else:
+        df['aux_reference_close'] = np.nan
+
+    if direct_cross_snap and direct_cross_snap.get('ohlcv_1h'):
+        df_cross = pd.DataFrame(
+            direct_cross_snap['ohlcv_1h'],
+            columns=['timestamp', 'open_cross', 'high_cross', 'low_cross', 'cross_pair_close', 'volume_cross']
+        )
+        df = df.merge(df_cross[['timestamp', 'cross_pair_close']], on='timestamp', how='left')
+    else:
+        df['cross_pair_close'] = np.nan
 
     # 3. 衍生品历史缝合
     if main_snap.get('premium_history'):
@@ -108,12 +123,13 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
 
     # 🚨 修复 1：严格限制填充范围，杜绝无限回填。对齐离线 limit=8 与 limit=3 的物理设定
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
-    state_cols = ['eth_btc_close', 'premium_close', 'sum_open_interest']
+    state_cols = ['aux_reference_close', 'cross_pair_close', 'premium_close', 'sum_open_interest']
     df[state_cols] = df[state_cols].ffill(limit=3)
     
     # 🚨 实盘补丁：币安 API 仅提供 30 天 (720小时) 历史，引擎预热需要 840 小时。采用向后兜底填充防止开头熔断
     df[state_cols] = df[state_cols].bfill()
     df['funding_rate'] = df['funding_rate'].bfill()
+    df['cross_asset_close'] = df['cross_pair_close'].combine_first(df['aux_reference_close'] / (df['close'] + 1e-9))
 
     # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的 35000 根纯净 1m K线
     if 'ohlcv_1m' in main_snap and len(main_snap['ohlcv_1m']) > 0:
@@ -210,7 +226,7 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     # 🚨 新增：基于 Z-Score 计算的高阶背离特征
     df['cvd_oi_divergence'] = df['cvd_zscore'] - df['oi_delta_pct_zscore']
 
-    df['eth_btc_return'] = np.log(df['eth_btc_close'] / df['eth_btc_close'].shift(1))
+    df['cross_asset_return'] = np.log(df['cross_asset_close'] / df['cross_asset_close'].shift(1))
     df['premium_delta'] = df['premium_close'].diff()
     df['hour_sin'] = np.sin(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['hour_cos'] = np.cos(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
@@ -226,7 +242,7 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         "oi_delta_pct",
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 
         "rv_term_structure", 
-        "funding_rate_momentum", "premium_delta", "eth_btc_return", 
+        "funding_rate_momentum", "premium_delta", "cross_asset_return",
         "hour_sin", "hour_cos", "week_sin", "week_cos", 
         "cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence",
         "is_synthetic"
@@ -777,10 +793,10 @@ def run_live():
 
                     print(f"\n🔄 [时钟对齐] 进入整点第{current_minute}分钟，开始执行单模型推理 (TS: {latest_closed_ts})...")
                     
-                    eth_usdt_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[0]}").json()
-                    eth_btc_snap = requests.get(f"{GATEWAY_URL}/{AUX_SYMBOLS[1]}").json()
-                    
-                    features_df = compute_features(snapshot, eth_usdt_snap, eth_btc_snap)
+                    aux_reference_snap = fetch_gateway_snapshot(AUX_SYMBOLS[0]) if len(AUX_SYMBOLS) >= 1 else None
+                    direct_cross_snap = fetch_gateway_snapshot(AUX_SYMBOLS[1]) if len(AUX_SYMBOLS) >= 2 else None
+
+                    features_df = compute_features(snapshot, aux_reference_snap, direct_cross_snap)
                     
                     # 提取喂给模型的那个精确窗口
                     inference_window = features_df[feature_cols].iloc[-ACTUAL_SEQ_LEN:]

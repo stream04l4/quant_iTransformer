@@ -238,36 +238,38 @@ def build_features(horizon):
     print(f"\n🚀 [第一阶段] 正在拉取并拼接主维度数据 (预测窗口: {horizon}h)...")
     
     # 1. 拉取 1h K线，并顺手保存一份未被对数和归一化污染的 raw_1h.parquet 给回测用
-    btc_klines = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1h", save_raw_parquet=True)
+    main_klines = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1h", save_raw_parquet=True)
     
     # 2. 独家补充：拉取 1m K线，只保存 raw_1m.parquet 给回测用，随后丢弃，不干扰训练特征
     print(f"\n🔬 [特殊补充] 正在拉取 1m K线，专供回测显微镜碰撞使用 (单线程下载可能会花 1-3 分钟)...")
     _ = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1m", save_raw_parquet=True)
-    btc_funding = load_and_concat_months("futures", "fundingRate", SYMBOL)
-    btc_premium = load_and_concat_months("futures", "premiumIndexKlines", SYMBOL)
+    main_funding = load_and_concat_months("futures", "fundingRate", SYMBOL)
+    main_premium = load_and_concat_months("futures", "premiumIndexKlines", SYMBOL)
     
-    if btc_klines is None:
+    if main_klines is None:
         print("❌ 核心 K 线数据为空，程序中止。")
         return
 
     print(f"\n🚀 [第二阶段] 正在拉取横截面辅助数据...")
-    # 🚨 改为拉取数据极度完整的 ETHUSDT 合约，用于数学合成
-    eth_usdt = load_and_concat_months("futures", "klines", AUX_SYMBOLS[0])
+    aux_reference = load_and_concat_months("spot", "klines", AUX_SYMBOLS[0]) if len(AUX_SYMBOLS) >= 1 else None
+    direct_cross = load_and_concat_months("spot", "klines", AUX_SYMBOLS[1]) if len(AUX_SYMBOLS) >= 2 else None
 
     # 🚨 [新增拉取] 获取 Metrics (Open Interest)
-    btc_metrics = fetch_daily_metrics_concurrent(SYMBOL, DATA_START_MONTH, DATA_END_MONTH)
+    main_metrics = fetch_daily_metrics_concurrent(SYMBOL, DATA_START_MONTH, DATA_END_MONTH)
 
     print("\n🧩 [第三阶段] 执行全局时间轴对齐 (Join)...")
-    btc_premium = btc_premium.select(["hour_timestamp", pl.col("close").alias("premium_close")]) if btc_premium is not None else None
-    btc_funding = btc_funding.select(["hour_timestamp", "last_funding_rate"]) if btc_funding is not None else None
-    eth_usdt = eth_usdt.select(["hour_timestamp", pl.col("close").alias("eth_usdt_close")]) if eth_usdt is not None else None
+    main_premium = main_premium.select(["hour_timestamp", pl.col("close").alias("premium_close")]) if main_premium is not None else None
+    main_funding = main_funding.select(["hour_timestamp", "last_funding_rate"]) if main_funding is not None else None
+    aux_reference = aux_reference.select(["hour_timestamp", pl.col("close").alias("aux_reference_close")]) if aux_reference is not None else None
+    direct_cross = direct_cross.select(["hour_timestamp", pl.col("close").alias("cross_pair_close")]) if direct_cross is not None else None
 
     # 动态 Join 机制：哪怕某个外围数据挂了，也不影响主 K 线对齐
-    master_df = btc_klines
-    if btc_funding is not None: master_df = master_df.join(btc_funding, on="hour_timestamp", how="left")
-    if btc_premium is not None: master_df = master_df.join(btc_premium, on="hour_timestamp", how="left")
-    if eth_usdt is not None: master_df = master_df.join(eth_usdt, on="hour_timestamp", how="left")
-    if btc_metrics is not None: master_df = master_df.join(btc_metrics, on="hour_timestamp", how="left")
+    master_df = main_klines
+    if main_funding is not None: master_df = master_df.join(main_funding, on="hour_timestamp", how="left")
+    if main_premium is not None: master_df = master_df.join(main_premium, on="hour_timestamp", how="left")
+    if aux_reference is not None: master_df = master_df.join(aux_reference, on="hour_timestamp", how="left")
+    if direct_cross is not None: master_df = master_df.join(direct_cross, on="hour_timestamp", how="left")
+    if main_metrics is not None: master_df = master_df.join(main_metrics, on="hour_timestamp", how="left")
 
     # ==========================================
     # 🚨 核心修复：强制时间轴连续化，消除断网/维护造成的 shift/rolling 未来信息错位
@@ -285,7 +287,8 @@ def build_features(horizon):
     ]).with_columns([
         # 第一步：只对 close 和其他宏观状态类特征做前向填充
         pl.col("close").fill_null(strategy="forward"),
-        pl.col("eth_usdt_close").fill_null(strategy="forward"),
+        pl.col("aux_reference_close").fill_null(strategy="forward"),
+        pl.col("cross_pair_close").fill_null(strategy="forward"),
         pl.col("last_funding_rate").fill_null(strategy="forward"),
         pl.col("premium_close").fill_null(strategy="forward"),
         pl.col("sum_open_interest").fill_null(strategy="forward")
@@ -301,11 +304,15 @@ def build_features(horizon):
         pl.col("taker_buy_volume").fill_null(0.0)
     ])
 
-    # 🚨 产业界三角合成法：用 ETH/USDT 除以 BTC/USDT (即当前的 close) 生成 ETH/BTC
-    if "eth_usdt_close" in master_df.columns:
-        master_df = master_df.with_columns(
-            (pl.col("eth_usdt_close") / pl.col("close")).alias("eth_btc_close")
-        )
+    # 优先使用直接交叉对；若缺失，则回退到“辅助现货/主币”合成比值。
+    master_df = master_df.with_columns(
+        pl.coalesce([
+            pl.col("cross_pair_close"),
+            pl.when(pl.col("aux_reference_close").is_not_null())
+              .then(pl.col("aux_reference_close") / (pl.col("close") + 1e-9))
+              .otherwise(None)
+        ]).alias("cross_asset_close")
+    )
     
     # 🚨 [新增高频 Alpha] 计算 1 小时级别 Realized Volatility (RV)
     print("🔬 正在基于 1m 数据计算每小时高频已实现波动率 (RV)...")
@@ -343,7 +350,7 @@ def build_features(horizon):
     print("⚙️ [第四阶段] 计算 31 维特征矩阵...")
     master_df = master_df.cast({col: pl.Float64 for col in ["open", "high", "low", "close", "volume"]})
 
-    required_cols = ["last_funding_rate", "premium_close", "eth_btc_close"]
+    required_cols = ["last_funding_rate", "premium_close", "cross_asset_close"]
     for col in required_cols:
         if col not in master_df.columns:
             print(f"⚠️ 缺失辅助列 {col}，正在进行安全占位。")
@@ -352,8 +359,9 @@ def build_features(horizon):
             master_df = master_df.with_columns(pl.lit(fallback_val).alias(col))
             
     # 合成完毕后，物理销毁用于计算的冗余母体数据
-    if "eth_usdt_close" in master_df.columns:
-        master_df = master_df.drop("eth_usdt_close")
+    drop_aux_cols = [c for c in ["aux_reference_close", "cross_pair_close"] if c in master_df.columns]
+    if drop_aux_cols:
+        master_df = master_df.drop(drop_aux_cols)
     
     # 🚨 兼容性降维打击：通过前3阶原生中心矩手动展开计算滚动偏度 (Skewness)
     m1 = pl.col("log_return").rolling_mean(window_size=24)
@@ -418,7 +426,7 @@ def build_features(horizon):
         # 🚨 [修改] FRM: 资金费率动量 (24h均线 - 72h均线)，过滤长期极化噪音
         (pl.col("last_funding_rate").rolling_mean(window_size=24) - pl.col("last_funding_rate").rolling_mean(window_size=72)).alias("funding_rate_momentum"),
         (pl.col("premium_close") - pl.col("premium_close").shift(1)).alias("premium_delta"),
-        (pl.col("eth_btc_close").log() - pl.col("eth_btc_close").shift(1).log()).alias("eth_btc_return"),
+        (pl.col("cross_asset_close").log() - pl.col("cross_asset_close").shift(1).log()).alias("cross_asset_return"),
         (pl.col("hour_timestamp").dt.hour() * (2 * np.pi / 24)).sin().alias("hour_sin"),
         (pl.col("hour_timestamp").dt.hour() * (2 * np.pi / 24)).cos().alias("hour_cos"),
         (pl.col("hour_timestamp").dt.weekday() * (2 * np.pi / 7)).sin().alias("week_sin"),
@@ -497,7 +505,7 @@ def build_features(horizon):
         "oi_delta_pct",
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 
         "rv_term_structure", 
-        "funding_rate_momentum", "premium_delta", "eth_btc_return", 
+        "funding_rate_momentum", "premium_delta", "cross_asset_return",
         "hour_sin", "hour_cos", "week_sin", "week_cos", f"target_{horizon}h_return"
     ]
     # 🌟 新增: COID 被放进含有深度订单流的分支中
