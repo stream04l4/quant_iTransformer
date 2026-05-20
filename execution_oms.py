@@ -511,13 +511,16 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         exchange_private = global_gate
 
         # ---------------------------------------------------------
-        # 1. 仓位互斥锁与反转引擎：支持同向阶梯加仓，拦截反向信号交由右脑
+        # 1. 仓位互斥锁与反转引擎：支持同向升档到目标绝对杠杆，拦截反向信号交由右脑
         # ---------------------------------------------------------
         order_sent = False 
         has_existing_same_side = False
+        existing_contracts = 0.0
+        current_exchange_leverage = 0.0
         positions = exchange_private.fetch_positions([gate_symbol])
         for pos in positions:
-            if abs(float(pos.get('contracts', 0) or 0)) > 1e-8:
+            pos_contracts = abs(float(pos.get('contracts', 0) or 0))
+            if pos_contracts > 1e-8:
                 current_pos_side = str(pos.get('side', '')).lower()
                 
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
@@ -533,7 +536,15 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     return False, 0.0 # 平仓后依然返回 False，防止在本轮循环立即反向开仓（符合回测冷却逻辑）
                 else:
                     has_existing_same_side = True
-                    msg = f"📈 侦测到 {gate_symbol} 同向存续仓位，允许金字塔阶梯加仓。"
+                    existing_contracts = pos_contracts
+                    info = pos.get("info", {}) or {}
+                    try:
+                        current_exchange_leverage = float(
+                            pos.get("leverage", info.get("lever", info.get("leverage", 0))) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        current_exchange_leverage = 0.0
+                    msg = f"📈 侦测到 {gate_symbol} 同向存续仓位，准备升档到目标绝对杠杆 {leverage}x。"
                     print("ℹ️", msg)
 
         # ---------------------------------------------------------
@@ -575,8 +586,19 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             msg_limit = f"⚠️ 触发风控红线，名义价值已自动压降至 {safe_notional_limit} USDT"
             print(f"   {msg_limit}")
             log_system_alert("📉 仓位降级", symbol, msg_limit)
-        
-        raw_amount = target_notional / (current_price * contract_size)
+
+        existing_notional = existing_contracts * contract_size * current_price if has_existing_same_side else 0.0
+        order_notional = max(0.0, target_notional - existing_notional)
+        if has_existing_same_side and order_notional <= max(target_notional * 1e-6, 1e-8):
+            msg = (
+                f"ℹ️ {gate_symbol} 当前同向仓位已达到或超过目标杠杆 {leverage}x，"
+                f"无需继续补仓 (existing={existing_notional:.2f} / target={target_notional:.2f} USDT)。"
+            )
+            print(msg)
+            log_system_alert("ℹ️ 升档跳过", symbol, msg)
+            return False, 0.0
+
+        raw_amount = order_notional / (current_price * contract_size)
         order_amount = float(exchange_private.amount_to_precision(gate_symbol, raw_amount))
 
         # 👇 【智能修复 2：市价单防滑点极限截断 (Market Order Size Capping)】
@@ -588,8 +610,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             print(f"   {msg_size}")
             log_system_alert("🔪 张数截断", symbol, msg_size)
             
-        # 👇 【极其重要的账本修复】：反向重算真实的保证金占用！
-        # 因为我们的订单规模被强制缩小了，如果还按原来的 margin_usd 记账，后期的 PnL 计算会严重失真。
+        # 👇 【极其重要的账本修复】：按本次补单的真实目标杠杆反推增量保证金占用。
         risk_margin_usd = (order_amount * contract_size * current_price) / leverage
 
         if order_amount < float(market['limits']['amount']['min']):
@@ -598,12 +619,16 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             log_system_alert("❌ 资金不足", symbol, msg)
             return False, 0.0
 
-        # 智能杠杆防护：如果有同向仓位，禁止调用修改杠杆接口，防止保证金剧烈跳动
-        if not has_existing_same_side:
+        # 统一绝对杠杆语义：无论首次开仓还是同向升档，都先把交易所杠杆对齐到 Tier 目标值。
+        if abs(current_exchange_leverage - leverage) > 0.05:
             try:
                 exchange_private.set_leverage(leverage, gate_symbol)
+                time.sleep(0.5)
             except Exception as e:
-                print(f"⚠️ 设置初始杠杆失败: {e}")
+                msg = f"⚠️ 无法将 {gate_symbol} 杠杆对齐到目标值 {leverage}x: {e}"
+                print(msg)
+                log_system_alert("⚠️ 杠杆对齐失败", symbol, msg)
+                return False, 0.0
 
         # ---------------------------------------------------------
         # 3. 核心市价开仓 (增强参数传递)
@@ -711,6 +736,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
 
         print(
             f"✅ ⚡ [Gate实盘] 下单成功！方向：{side.upper()} | 数量：{order_amount} 张 {gate_symbol}。\n"
+            f"🎛️ 目标总杠杆: {leverage:.2f}x | 本次补仓名义价值: ${order_amount * contract_size * actual_fill_price:,.2f}\n"
             f"🎯 进场均价: ${actual_fill_price:.4f} (滑点 {slippage:.3%})\n"
             f"🛡️ 兜底止损 (SL): ${sl_price:.4f} (极限亏损 -{abs(sl_pct):.2%})\n"
             f"🚀 追踪止盈: 已移交右脑状态机动态接管"

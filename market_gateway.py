@@ -450,6 +450,15 @@ def init_sqlite_db():
             )
         """)
 init_sqlite_db()
+
+
+def build_exchange(is_spot):
+    """按 symbol 隔离 exchange，避免一个交易对断线时把同引擎下其他 symbol 一起清掉。"""
+    exchange_cls = ccxtpro.binance if is_spot else ccxtpro.binanceusdm
+    return exchange_cls({
+        "enableRateLimit": True,
+    })
+
 # ==========================================
 # 🛰️ WebSocket 搬运工：死循环监听流
 # ==========================================
@@ -1075,17 +1084,11 @@ async def health_monitor_loop(all_symbols):
 # 🚀 网关初始化与多任务编排
 # ==========================================
 async def start_gateways():
-    futures_ex = ccxtpro.binanceusdm()
-    spot_ex = ccxtpro.binance()
-    
+    exchange_registry = {}
+
     try:
         print_gateway_data_chain()
-        print("⏳ 正在拉取 Binance 市场列表，进行合约与现货合法性校验...")
-        try:
-            await asyncio.gather(futures_ex.load_markets(), spot_ex.load_markets())
-        except Exception as e:
-            print(f"🛑 无法连接到交易所获取市场列表: {e}")
-            return
+        print("⏳ 正在按交易对拉起独立 Binance 连接，并进行市场合法性校验...")
             
         tasks = []
         tasks.append(db_persist_loop())
@@ -1104,16 +1107,26 @@ async def start_gateways():
 
             # 自动分配引擎
             is_spot = (sym in AUX_SYMBOLS)
-            ex = spot_ex if is_spot else futures_ex
+            ex = build_exchange(is_spot)
+            exchange_registry[sym] = ex
             
             # --- 核心修改：定义并传递引擎类型用于日志打印 ---
             engine_type = "现货" if is_spot else "合约"
             swap_sym = f"{sym_standard}:{sym_standard.split('/')[1]}" if not is_spot else sym_standard
+
+            try:
+                await ex.load_markets()
+            except Exception as e:
+                print(f"   🛑 [{sym}] 无法连接交易所获取市场列表: {e}")
+                market_data_store[sym]["status"] = "unsupported"
+                continue
             
             # 市场存在性强校验
             if swap_sym not in ex.markets:
                 print(f"   ⚠️ [物理拦截] 交易所未上架 {swap_sym}，已自动跳过！")
                 market_data_store[sym]["status"] = "unsupported"
+                await ex.close()
+                exchange_registry.pop(sym, None)
                 continue
             await smart_warmup_and_recover(ex, sym, swap_sym, is_spot)    
             
@@ -1147,7 +1160,11 @@ async def start_gateways():
             
     finally:
         # 全局资源兜底释放，优雅切断 aiohttp 连接
-        await asyncio.gather(futures_ex.close(), spot_ex.close())
+        if exchange_registry:
+            await asyncio.gather(
+                *(ex.close() for ex in exchange_registry.values()),
+                return_exceptions=True
+            )
 
 # ==========================================
 # 🔌 本地微服务接口：供 live_pipeline.py 秒级调用

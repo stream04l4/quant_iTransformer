@@ -197,7 +197,7 @@ def run_backtest():
             break
 
         # ------------------------------------------
-        # 1. 寻找开仓与【阶梯加仓】机会 (1h 级别)
+        # 1. 寻找开仓与【阶梯升档】机会 (1h 级别)
         # ------------------------------------------
         target_pos = 0
         target_tier = 0
@@ -235,7 +235,7 @@ def run_backtest():
                 trailing_active = False         
                 dynamic_sl_phys = -abs(HARD_SL) 
 
-            # 💡 情景 B: 同向持仓，且触发了更高的 Tier (执行金字塔加仓)
+            # 💡 情景 B: 同向持仓，且触发了更高的 Tier (补到目标绝对杠杆)
             elif current_pos == target_pos and target_tier > current_tier:
                 # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
                 if current_pos == 1:
@@ -243,26 +243,29 @@ def run_backtest():
                 else:
                     absolute_sl_price = entry_price * (1 - dynamic_sl_phys)
                     
-                # 【对齐 OMS 物理逻辑】：直接累加新杠杆
-                added_leverage = target_leverage
+                # 【对齐实盘 OMS】：Tier 杠杆表示目标总杠杆，仅补足当前仓位与目标仓位之间的差额
                 old_notional = trade_start_equity * current_leverage
-                new_notional = trade_start_equity * added_leverage
+                target_notional = trade_start_equity * target_leverage
+                added_notional = max(0.0, target_notional - old_notional)
+                if added_notional <= 1e-12:
+                    current_tier = target_tier
+                    continue
                 
                 old_size = old_notional / entry_price
-                new_size = new_notional / current_hour_open
+                new_size = added_notional / current_hour_open
                 total_size = old_size + new_size
                 
                 # 重新计算加仓后的加权持仓均价
-                avg_entry_price = (old_notional + new_notional) / total_size
+                avg_entry_price = target_notional / total_size
                 
                 # 扣除新增仓位的摩擦成本
-                added_open_cost = trade_start_equity * added_leverage * (FEE_RATE + SLIPPAGE)
+                added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
                 open_cost += added_open_cost
                 equity -= added_open_cost 
                 
                 # 更新全局状态机
                 entry_price = avg_entry_price
-                current_leverage += added_leverage
+                current_leverage = target_leverage
                 current_tier = target_tier
                 
                 # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离

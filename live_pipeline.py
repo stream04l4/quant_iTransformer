@@ -842,7 +842,7 @@ def run_live():
             adj_down_top5 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_5)
             adj_down_top10 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_10)
 
-            # --- 🎯 阶梯加仓信号决策 ---
+            # --- 🎯 阶梯升档信号决策（Tier 对应目标总杠杆） ---
             position_tier_state, position_state_meta = _reconcile_position_tier_state(position_tier_state)
             inventory_guard = _build_inventory_guard(position_tier_state, position_state_meta)
             if inventory_guard["mode"] != last_inventory_guard_mode:
@@ -933,7 +933,7 @@ def run_live():
             if actual_signal != 0:
                 print(f"\n[{snapshot['server_time']}] 🔥 突破阶梯红线！最新价: {current_price} | 发送 OMS 指令 (Tier-{target_tier})...")
                 log_system_alert("🔥 下单触发", SYMBOL,
-                    f"信号: {'做多' if actual_signal==1 else '做空'} | Tier: {target_tier} | 杠杆变量: {dynamic_leverage}x | 价格: {current_price:.4f}")
+                    f"信号: {'做多' if actual_signal==1 else '做空'} | Tier: {target_tier} | 目标杠杆: {dynamic_leverage}x | 价格: {current_price:.4f}")
                 success, actual_margin = execute_gate_trade(
                     symbol=SYMBOL,
                     signal=actual_signal,
