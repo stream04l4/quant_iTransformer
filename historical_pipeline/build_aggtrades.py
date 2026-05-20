@@ -15,8 +15,8 @@ sys.path.append(str(PROJECT_ROOT))
 
 # 导入公共配置
 from quant_config.config import (
-    TEMP_DIR, PROCESSED_AGGTRADES_DIR, SYMBOL, WHALE_THRESHOLD, 
-    RETAIL_THRESHOLD, DATA_START_MONTH, DATA_END_MONTH, 
+    TEMP_DIR, PROCESSED_AGGTRADES_DIR, SYMBOL, WHALE_NOTIONAL_THRESHOLD_USDT,
+    RETAIL_NOTIONAL_THRESHOLD_USDT, DATA_START_MONTH, DATA_END_MONTH,
     BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_FUTURES_DAILY, AGGTRADE_COLS
 )
 
@@ -57,17 +57,19 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
         pl.from_epoch(pl.col("transact_time"), time_unit="ms").dt.truncate("1h").alias("hour_timestamp"),
         pl.when(pl.col("is_buyer_maker") == False).then(pl.col("quantity")).otherwise(0).alias("buy_vol"),
         pl.when(pl.col("is_buyer_maker") == True).then(pl.col("quantity")).otherwise(0).alias("sell_vol"),
+        (pl.col("price") * pl.col("quantity")).alias("notional_usdt"),
     ])
 
     # 按小时聚合计算
     hourly_features = df.group_by("hour_timestamp").agg([
         pl.col("quantity").sum().alias("total_volume"),
         (pl.col("buy_vol").sum() - pl.col("sell_vol").sum()).alias("cvd"),
-        pl.col("buy_vol").filter(pl.col("quantity") >= WHALE_THRESHOLD).sum().alias("whale_buy"),
-        pl.col("sell_vol").filter(pl.col("quantity") >= WHALE_THRESHOLD).sum().alias("whale_sell"),
-        pl.col("quantity").filter(pl.col("quantity") <= RETAIL_THRESHOLD).sum().alias("retail_vol"),
+        pl.col("buy_vol").filter(pl.col("notional_usdt") >= WHALE_NOTIONAL_THRESHOLD_USDT).sum().alias("whale_buy"),
+        pl.col("sell_vol").filter(pl.col("notional_usdt") >= WHALE_NOTIONAL_THRESHOLD_USDT).sum().alias("whale_sell"),
+        pl.col("quantity").filter(pl.col("notional_usdt") <= RETAIL_NOTIONAL_THRESHOLD_USDT).sum().alias("retail_vol"),
     ]).with_columns([
         (pl.col("whale_buy") - pl.col("whale_sell")).alias("whale_net_flow"),
+        ((pl.col("whale_buy") + 1e-9) / (pl.col("whale_sell") + 1e-9)).alias("whale_ls_ratio"),
         pl.when(pl.col("total_volume") > 0)
             .then(pl.col("retail_vol") / pl.col("total_volume"))
             .otherwise(None)
@@ -75,8 +77,7 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
     ]).sort("hour_timestamp")
 
     final_df = hourly_features.select([
-        "hour_timestamp", "cvd", "whale_buy", "whale_sell", 
-        "whale_net_flow", "retail_vol", "retail_ratio"
+        "hour_timestamp", "cvd", "whale_net_flow", "retail_vol", "retail_ratio", "whale_ls_ratio"
     ])
 
     final_df.write_parquet(output_parquet_path)

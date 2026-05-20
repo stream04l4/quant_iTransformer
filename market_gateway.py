@@ -11,7 +11,7 @@ import time
 import sqlite3
 import polars as pl
 from quant_config.config import (
-    SYMBOL, AUX_SYMBOLS, WHALE_THRESHOLD, RETAIL_THRESHOLD,
+    SYMBOL, AUX_SYMBOLS, WHALE_NOTIONAL_THRESHOLD_USDT, RETAIL_NOTIONAL_THRESHOLD_USDT,
     LIVE_DATA_DIR, TEMP_DIR, PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR,
     KLINE_COLS, FUNDING_COLS
 )
@@ -268,11 +268,10 @@ def load_tempdir_derivative_history(symbol, cutoff_ts_ms):
         for file_path in metrics_files:
             try:
                 df = pl.read_csv(file_path, has_header=True, infer_schema_length=0).select([
-                    "create_time", "sum_open_interest", "sum_toptrader_long_short_ratio"
+                    "create_time", "sum_open_interest"
                 ]).with_columns([
                     pl.col("create_time").str.slice(0, 19).str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False).alias("exact_timestamp"),
                     pl.col("sum_open_interest").cast(pl.Float64, strict=False),
-                    pl.col("sum_toptrader_long_short_ratio").cast(pl.Float64, strict=False),
                 ])
                 frames.append(df)
             except Exception:
@@ -283,16 +282,10 @@ def load_tempdir_derivative_history(symbol, cutoff_ts_ms):
             ).filter(pl.col("hour_timestamp") >= cutoff_dt).sort("exact_timestamp").group_by("hour_timestamp").last().sort("hour_timestamp")
             if not merged.is_empty():
                 oi_df = merged.select(["hour_timestamp", "sum_open_interest"]).drop_nulls()
-                ls_df = merged.select(["hour_timestamp", "sum_toptrader_long_short_ratio"]).drop_nulls()
                 if not oi_df.is_empty():
                     result["oi_history"] = [
                         [int(row["hour_timestamp"].timestamp() * 1000), float(row["sum_open_interest"])]
                         for row in oi_df.iter_rows(named=True)
-                    ]
-                if not ls_df.is_empty():
-                    result["ls_history"] = [
-                        [int(row["hour_timestamp"].timestamp() * 1000), float(row["sum_toptrader_long_short_ratio"])]
-                        for row in ls_df.iter_rows(named=True)
                     ]
 
     if result:
@@ -324,7 +317,6 @@ def _load_single_offline_derivative_file(file_path):
         "premium_close": ["premium_close", "premium_index", "premium_index_close"],
         "funding_rate": ["last_funding_rate", "funding_rate"],
         "sum_open_interest": ["sum_open_interest", "open_interest"],
-        "ls_ratio": ["ls_ratio", "sum_toptrader_long_short_ratio", "longShortRatio"],
     }.items():
         match = next((alias for alias in aliases if alias in col_names), None)
         if match:
@@ -386,7 +378,7 @@ def load_processed_derivative_history(symbol, cutoff_ts_ms):
     if merged.is_empty():
         return {}
 
-    value_cols = [c for c in ["premium_close", "funding_rate", "sum_open_interest", "ls_ratio"] if c in merged.columns]
+    value_cols = [c for c in ["premium_close", "funding_rate", "sum_open_interest"] if c in merged.columns]
     agg_exprs = [pl.col(c).drop_nulls().last().alias(c) for c in value_cols]
     if not agg_exprs:
         return {}
@@ -400,7 +392,6 @@ def load_processed_derivative_history(symbol, cutoff_ts_ms):
         "premium_close": "premium_history",
         "funding_rate": "funding_history",
         "sum_open_interest": "oi_history",
-        "ls_ratio": "ls_history",
     }.items():
         if source_col not in merged.columns:
             continue
@@ -671,14 +662,14 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
                 is_buy = t['side'] == 'buy'
                 if is_buy:
                     stats["taker_buy_volume"] += amount
-                    if amount >= WHALE_THRESHOLD:
+                    if cost >= WHALE_NOTIONAL_THRESHOLD_USDT:
                         stats["whale_buy"] += amount
                 else:
                     stats["taker_sell_volume"] += amount
-                    if amount >= WHALE_THRESHOLD:
+                    if cost >= WHALE_NOTIONAL_THRESHOLD_USDT:
                         stats["whale_sell"] += amount
                         
-                if amount <= RETAIL_THRESHOLD:
+                if cost <= RETAIL_NOTIONAL_THRESHOLD_USDT:
                     stats["retail_vol"] += amount
             
             # 定期垃圾回收：配合 1250 小时的回溯需求，延长保留期
@@ -750,21 +741,7 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
                     elif ts == hist[-1][0]:
                         hist[-1] = [ts, val]
 
-            # 3. 维护 1h 大户多空比时序 (Long/Short Ratio)
-            async with rest_semaphore:
-                ls_hist_data = await exchange.fapiDataGetTopLongShortPositionRatio({
-                    'symbol': raw_sym, 'period': '1h', 'limit': 2
-                })
-            if ls_hist_data:
-                hist = market_data_store[symbol].setdefault("ls_history", [])
-                for x in ls_hist_data:
-                    ts, val = int(x['timestamp']), float(x['longShortRatio'])
-                    if not hist or ts > hist[-1][0]:
-                        hist.append([ts, val])
-                    elif ts == hist[-1][0]:
-                        hist[-1] = [ts, val]
-
-            # 4. 维护资金费率时序 (Funding Rate)
+            # 3. 维护资金费率时序 (Funding Rate)
             async with rest_semaphore:
                 fr_hist_data = await exchange.fapiPublicGetFundingRate({
                     'symbol': raw_sym, 'limit': 2
@@ -781,7 +758,7 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
             # ==========================================
             # 🧹 内存泄露防护：控制历史数组的最大长度，但必须保留完整 1250h 推理窗口
             # ==========================================
-            for key in ["premium_history", "oi_history", "ls_history", "funding_history"]:
+            for key in ["premium_history", "oi_history", "funding_history"]:
                 if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > DERIVATIVE_LOOKBACK_HOURS + 64:
                     market_data_store[symbol][key] = market_data_store[symbol][key][-(DERIVATIVE_LOOKBACK_HOURS + 64):]
 
@@ -918,27 +895,13 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
             except Exception as e:
                 print(f"   ⚠️ {symbol} open interest 历史拉取失败: {e}")
 
-            try:
-                ls_hist = []
-                curr_end = end_time
-                while len(ls_hist) < DERIVATIVE_LOOKBACK_HOURS:
-                    batch = await exchange.fapiDataGetTopLongShortPositionRatio({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
-                    if not batch:
-                        break
-                    ls_hist = batch + ls_hist
-                    curr_end = int(batch[0]['timestamp']) - 1
-                    await asyncio.sleep(0.2)
-                market_data_store[symbol]["ls_history"] = [[int(x['timestamp']), float(x['longShortRatio'])] for x in ls_hist]
-            except Exception as e:
-                print(f"   ⚠️ {symbol} 大户多空比历史拉取失败: {e}")
-
         except Exception as e:
             print(f"⚠️ {symbol} 衍生品/1m 预热阶段异常: {e}")
 
         print(f"🔍 [网关自愈] 衍生品链路: API 最新值 -> TEMP_DIR 原始缓存 -> processed 兜底...")
         temp_derivatives = await asyncio.to_thread(load_tempdir_derivative_history, symbol, cutoff_ts_ms)
         processed_derivatives = await asyncio.to_thread(load_processed_derivative_history, symbol, cutoff_ts_ms)
-        for hist_key in ["premium_history", "funding_history", "oi_history", "ls_history"]:
+        for hist_key in ["premium_history", "funding_history", "oi_history"]:
             api_hist = market_data_store[symbol].get(hist_key, [])
             temp_hist = temp_derivatives.get(hist_key, [])
             processed_hist = processed_derivatives.get(hist_key, [])
@@ -1214,8 +1177,7 @@ async def get_market_snapshot(symbol: str):
             "ohlcv_1m": safe_1m,
             "premium_history": data.get("premium_history", []),
             "funding_history": data.get("funding_history", []),
-            "oi_history": data.get("oi_history", []),
-            "ls_history": data.get("ls_history", [])
+            "oi_history": data.get("oi_history", [])
         })
 
     return response

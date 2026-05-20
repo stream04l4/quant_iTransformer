@@ -106,15 +106,9 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df = df.merge(df_oi[['hour_timestamp', 'sum_open_interest']], on='hour_timestamp', how='left')
     else: df['sum_open_interest'] = np.nan
 
-    if main_snap.get('ls_history'):
-        df_ls = pd.DataFrame(main_snap['ls_history'], columns=['ts', 'ls_ratio'])
-        df_ls['hour_timestamp'] = pd.to_datetime(df_ls['ts'], unit='ms')
-        df = df.merge(df_ls[['hour_timestamp', 'ls_ratio']], on='hour_timestamp', how='left')
-    else: df['ls_ratio'] = np.nan
-
     # 🚨 修复 1：严格限制填充范围，杜绝无限回填。对齐离线 limit=8 与 limit=3 的物理设定
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
-    state_cols = ['eth_btc_close', 'premium_close', 'sum_open_interest', 'ls_ratio']
+    state_cols = ['eth_btc_close', 'premium_close', 'sum_open_interest']
     df[state_cols] = df[state_cols].ffill(limit=3)
     
     # 🚨 实盘补丁：币安 API 仅提供 30 天 (720小时) 历史，引擎预热需要 840 小时。采用向后兜底填充防止开头熔断
@@ -145,10 +139,11 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         df['taker_ratio_delta'] = (df['taker_buy_volume'] / (df['volume'] + 1e-9)).diff()
         df['cvd'] = (df['taker_buy_volume'] - df['taker_sell_volume']).fillna(0)
         df['whale_net_flow'] = (df['whale_buy'] - df['whale_sell']).fillna(0)
+        df['whale_ls_ratio'] = (df['whale_buy'] + 1e-9) / (df['whale_sell'] + 1e-9)
         df['retail_ratio'] = (df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)).ffill().fillna(0.1)
         df['amihud_illiquidity'] = np.log((df['log_return'].abs() / (df['quote_volume'] + 1e-9)) + 1e-12)
     else:
-        for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'retail_ratio', 'amihud_illiquidity']:
+        for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'whale_ls_ratio', 'retail_ratio', 'amihud_illiquidity']:
             df[col] = np.nan
 
     # 6. 基础技术与 MTF
@@ -202,7 +197,7 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
     df['funding_rate_momentum'] = df['funding_rate'].rolling(window=24).mean() - df['funding_rate'].rolling(window=72).mean()
 
     # 7. 免疫断层的 Z-Score (🚨 修正：剔除 vpt，加入 oi_delta_pct)
-    rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct", "cvd", "whale_net_flow"]
+    rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct", "cvd", "whale_net_flow", "whale_ls_ratio"]
     for c in rolling_cols:
         if c in df.columns:
             # 与离线训练完全对齐：环境基准必须只使用 t-1 以前的数据。
@@ -228,12 +223,12 @@ def compute_features(main_snap, eth_usdt_snap, eth_btc_snap):
         "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
         "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
         "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
-        "oi_delta_pct", "ls_ratio",
+        "oi_delta_pct",
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 
         "rv_term_structure", 
         "funding_rate_momentum", "premium_delta", "eth_btc_return", 
         "hour_sin", "hour_cos", "week_sin", "week_cos", 
-        "cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence",
+        "cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence",
         "is_synthetic"
     ]
     

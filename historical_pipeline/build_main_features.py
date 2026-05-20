@@ -202,10 +202,9 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
         try:
             # 宽容读取并强制转换为 Float64，遇到无法解析的乱码字符串 (strict=False) 自动转为空值
             df = pl.read_csv(p, has_header=True, infer_schema_length=0).select([
-                "create_time", "sum_open_interest", "sum_toptrader_long_short_ratio"
+                "create_time", "sum_open_interest"
             ]).with_columns([
-                pl.col("sum_open_interest").cast(pl.Float64, strict=False),
-                pl.col("sum_toptrader_long_short_ratio").cast(pl.Float64, strict=False)
+                pl.col("sum_open_interest").cast(pl.Float64, strict=False)
             ])
             dfs.append(df)
         except Exception as e:
@@ -223,7 +222,7 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
     
     # 按小时聚合，提取最末状态
     metrics_hourly = metrics_df.sort("exact_timestamp").group_by("hour_timestamp").last()
-    return metrics_hourly.select(["hour_timestamp", "sum_open_interest", "sum_toptrader_long_short_ratio"])
+    return metrics_hourly.select(["hour_timestamp", "sum_open_interest"])
 
 def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
     delta = pl.col(price_col).diff()
@@ -289,8 +288,7 @@ def build_features(horizon):
         pl.col("eth_usdt_close").fill_null(strategy="forward"),
         pl.col("last_funding_rate").fill_null(strategy="forward"),
         pl.col("premium_close").fill_null(strategy="forward"),
-        pl.col("sum_open_interest").fill_null(strategy="forward"),
-        pl.col("sum_toptrader_long_short_ratio").fill_null(strategy="forward")
+        pl.col("sum_open_interest").fill_null(strategy="forward")
     ]).with_columns([
         # 第二步：缺失的 open, high, low 必须对齐已经被填补的 close，表示这段时间价格彻底冻结，防止制造幽灵波动率
         pl.col("open").fill_null(pl.col("close")),
@@ -405,8 +403,6 @@ def build_features(horizon):
           .otherwise(None)
           .alias("oi_delta_pct"),
           
-        pl.col("sum_toptrader_long_short_ratio").alias("ls_ratio"),
-        
         # 🚨 Alpha 3: Amihud 流动性消耗率 (增加 clip 保护，防止极端缩量暴涨)
         (
             (pl.col("log_return").abs() / (pl.col("quote_volume") + 1e-9)) + 1e-12
@@ -452,10 +448,13 @@ def build_features(horizon):
             .sort("hour_timestamp")
             .unique(subset=["hour_timestamp"], keep="last")
         )
+        if "whale_ls_ratio" not in df_agg.columns:
+            df_agg = df_agg.with_columns(pl.lit(1.0).alias("whale_ls_ratio"))
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
             pl.col("cvd").fill_nan(0).fill_null(0),
             pl.col("whale_net_flow").fill_nan(0).fill_null(0),
-            pl.col("retail_ratio").fill_nan(None).fill_null(strategy="forward").fill_null(0.1)
+            pl.col("retail_ratio").fill_nan(None).fill_null(strategy="forward").fill_null(0.1),
+            pl.col("whale_ls_ratio").fill_nan(None).fill_null(1.0)
         ])
     else:
         print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")
@@ -465,7 +464,7 @@ def build_features(horizon):
     # 🚨 [剔除] vpt，因其逻辑已被更敏锐的 cvd_zscore 覆盖
     rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct"]
     if "cvd" in features.columns:
-        rolling_cols.extend(["cvd", "whale_net_flow"])
+        rolling_cols.extend(["cvd", "whale_net_flow", "whale_ls_ratio"])
 
     # 步骤 1: 计算 rolling median (严格事前：使用 t-1 往前的 168 个窗口作为环境基准)
     features = features.with_columns([
@@ -495,7 +494,7 @@ def build_features(horizon):
         "hour_timestamp", "is_synthetic", "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
         "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta",
         "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
-        "oi_delta_pct", "ls_ratio",
+        "oi_delta_pct",
         "price_pos_24h", "price_pos_72h", "price_pos_168h", 
         "rv_term_structure", 
         "funding_rate_momentum", "premium_delta", "eth_btc_return", 
@@ -503,7 +502,7 @@ def build_features(horizon):
     ]
     # 🌟 新增: COID 被放进含有深度订单流的分支中
     if "cvd" in features.columns:
-        final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "retail_ratio", "cvd_oi_divergence"])
+        final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence"])
 
     features = features.select(final_cols)
 

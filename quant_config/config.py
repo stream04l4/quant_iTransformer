@@ -30,15 +30,15 @@ MODEL_DIR = PROJECT_ROOT / "model"
 SYMBOL = "BTCUSDT"
 AUX_SYMBOLS = ["ETHUSDT", "ETHBTC"]  
 
-WHALE_THRESHOLD = 5.0    
-RETAIL_THRESHOLD = 0.1   
+WHALE_NOTIONAL_THRESHOLD_USDT = 200000.0
+RETAIL_NOTIONAL_THRESHOLD_USDT = 4000.0
 # 👇 改为动态获取，供 Mode 1 寻优
 FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
-DATA_START_MONTH = (2023, 1)   
+DATA_START_MONTH = (2022, 1)   
 DATA_END_MONTH = (2026, 5)     
 
 # ==========================================
