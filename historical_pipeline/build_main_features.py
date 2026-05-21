@@ -38,6 +38,19 @@ def generate_month_range(start_ym, end_ym):
             curr_m = 1
             curr_y += 1
 
+def timestamp_ms_expr(time_col: str) -> pl.Expr:
+    raw_ts = pl.col(time_col).cast(pl.Int64, strict=False)
+    return pl.when(raw_ts > 10_000_000_000_000).then(raw_ts // 1000).otherwise(raw_ts)
+
+def csv_has_header(csv_path: Path) -> bool:
+    with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        first_token = f.readline().split(",", 1)[0].strip()
+    try:
+        float(first_token)
+        return False
+    except ValueError:
+        return True
+
 def fetch_binance_data(market, data_type, symbol, year, month, timeframe="1h"):
     month_str = f"{month:02d}"
     base = BINANCE_BASE_URL_FUTURES if market == "futures" else BINANCE_BASE_URL_SPOT
@@ -48,11 +61,18 @@ def fetch_binance_data(market, data_type, symbol, year, month, timeframe="1h"):
     else: return None
 
     # 🚨 核心修复 1：线程绝对隔离！为每个年月创建独立的沙盒文件夹
-    sandbox_dir = TEMP_DIR / data_type / symbol / f"{year}_{month_str}"
+    if data_type == "klines":
+        sandbox_dir = TEMP_DIR / data_type / symbol / timeframe / f"{year}_{month_str}"
+        legacy_sandbox_dir = TEMP_DIR / data_type / symbol / f"{year}_{month_str}"
+    else:
+        sandbox_dir = TEMP_DIR / data_type / symbol / f"{year}_{month_str}"
+        legacy_sandbox_dir = None
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     zip_path = sandbox_dir / "temp.zip"
 
     existing_csvs = [p for p in sandbox_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+    if not existing_csvs and timeframe == "1h" and legacy_sandbox_dir and legacy_sandbox_dir.exists():
+        existing_csvs = [p for p in legacy_sandbox_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
     if existing_csvs:
         print(f"♻️ 复用本地缓存: {data_type} ({timeframe}) | {symbol} | {year}-{month_str}")
         return existing_csvs[0]
@@ -94,7 +114,7 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
         csv_path = fetch_binance_data(market, data_type, symbol, year, month, timeframe)
         if csv_path and csv_path.exists():
             cols = FUNDING_COLS if data_type == "fundingRate" else KLINE_COLS
-            df = pl.read_csv(csv_path, has_header=(market=="futures"), new_columns=cols)
+            df = pl.read_csv(csv_path, has_header=csv_has_header(csv_path), new_columns=cols)
             time_col = "calc_time" if data_type == "fundingRate" else "open_time"
             df = df.cast({col: pl.Float64 for col in cols if col != time_col})
             return df
@@ -120,7 +140,7 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
     
     # 提取极其精确的毫秒时间戳
     full_df = full_df.with_columns(
-        pl.from_epoch(pl.col(time_col), time_unit="ms").alias("exact_timestamp")
+        pl.from_epoch(timestamp_ms_expr(time_col), time_unit="ms").alias("exact_timestamp")
     ).sort("exact_timestamp")
 
     if save_raw_parquet:
@@ -209,6 +229,10 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
             dfs.append(df)
         except Exception as e:
             print(f"   ⚠️ 跳过异常 Metrics 文件 {p.name}: {e}")
+
+    if not dfs:
+        print("   ⚠️ 所有 Metrics 文件均读取失败，将保留缺失并在最终清洗阶段剔除。")
+        return None
     
     metrics_df = pl.concat(dfs)
     
@@ -242,7 +266,7 @@ def build_features(horizon):
     
     # 2. 独家补充：拉取 1m K线，只保存 raw_1m.parquet 给回测用，随后丢弃，不干扰训练特征
     print(f"\n🔬 [特殊补充] 正在拉取 1m K线，专供回测显微镜碰撞使用 (单线程下载可能会花 1-3 分钟)...")
-    _ = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1m", save_raw_parquet=True)
+    raw_1m_loaded = load_and_concat_months("futures", "klines", SYMBOL, timeframe="1m", save_raw_parquet=True) is not None
     main_funding = load_and_concat_months("futures", "fundingRate", SYMBOL)
     main_premium = load_and_concat_months("futures", "premiumIndexKlines", SYMBOL)
     
@@ -271,6 +295,22 @@ def build_features(horizon):
     if direct_cross is not None: master_df = master_df.join(direct_cross, on="hour_timestamp", how="left")
     if main_metrics is not None: master_df = master_df.join(main_metrics, on="hour_timestamp", how="left")
 
+    # 训练集不使用中性值伪造缺失信号；可选数据源缺席时只补 Null 列，后续统一 drop_nulls 剔除。
+    optional_null_cols = {
+        "last_funding_rate": pl.Float64,
+        "premium_close": pl.Float64,
+        "aux_reference_close": pl.Float64,
+        "cross_pair_close": pl.Float64,
+        "sum_open_interest": pl.Float64,
+    }
+    missing_optional_cols = [
+        pl.lit(None).cast(dtype).alias(col)
+        for col, dtype in optional_null_cols.items()
+        if col not in master_df.columns
+    ]
+    if missing_optional_cols:
+        master_df = master_df.with_columns(missing_optional_cols)
+
     # ==========================================
     # 🚨 核心修复：强制时间轴连续化，消除断网/维护造成的 shift/rolling 未来信息错位
     # ==========================================
@@ -284,24 +324,6 @@ def build_features(horizon):
             pl.col("sum_open_interest").is_null(),
             pl.col("premium_close").is_null()
         ]).cast(pl.Int8).alias("is_synthetic")
-    ]).with_columns([
-        # 第一步：只对 close 和其他宏观状态类特征做前向填充
-        pl.col("close").fill_null(strategy="forward"),
-        pl.col("aux_reference_close").fill_null(strategy="forward"),
-        pl.col("cross_pair_close").fill_null(strategy="forward"),
-        pl.col("last_funding_rate").fill_null(strategy="forward"),
-        pl.col("premium_close").fill_null(strategy="forward"),
-        pl.col("sum_open_interest").fill_null(strategy="forward")
-    ]).with_columns([
-        # 第二步：缺失的 open, high, low 必须对齐已经被填补的 close，表示这段时间价格彻底冻结，防止制造幽灵波动率
-        pl.col("open").fill_null(pl.col("close")),
-        pl.col("high").fill_null(pl.col("close")),
-        pl.col("low").fill_null(pl.col("close")),
-        # 交易量维度数据若缺失，视为该小时 0 成交，绝不能 forward fill
-        pl.col("volume").fill_null(0.0),
-        pl.col("quote_volume").fill_null(0.0),
-        pl.col("count").fill_null(0),
-        pl.col("taker_buy_volume").fill_null(0.0)
     ])
 
     # 优先使用直接交叉对；若缺失，则回退到“辅助现货/主币”合成比值。
@@ -317,7 +339,7 @@ def build_features(horizon):
     # 🚨 [新增高频 Alpha] 计算 1 小时级别 Realized Volatility (RV)
     print("🔬 正在基于 1m 数据计算每小时高频已实现波动率 (RV)...")
     raw_1m_path = TEMP_DIR / "klines" / SYMBOL / f"{SYMBOL}_raw_1m.parquet"
-    if raw_1m_path.exists():
+    if raw_1m_loaded and raw_1m_path.exists():
         df_1m = pl.read_parquet(raw_1m_path)
         rv_df = df_1m.with_columns([
             (pl.col("close").log() - pl.col("close").shift(1).log()).alias("ret_1m"),
@@ -327,7 +349,7 @@ def build_features(horizon):
         )
         master_df = master_df.join(rv_df, on="hour_timestamp", how="left")
     else:
-        master_df = master_df.with_columns(pl.lit(0.0).alias("realized_vol_1h"))
+        master_df = master_df.with_columns(pl.lit(None).cast(pl.Float64).alias("realized_vol_1h"))
 
     # 🚨 [核心修复] 分级前向填充：依据各个特征在物理世界的更新频率
     fill_exprs = []
@@ -339,24 +361,8 @@ def build_features(horizon):
     if fill_exprs:
         master_df = master_df.with_columns(fill_exprs)
 
-    # 3. 对于其他基础微观 K 线衍生的特征，依然保持 limit=3 防死水
-    # 必须排除已经具有专属限流规则的列，防止二次溢出
-    exclude_fill_cols = ["last_funding_rate"]
-    target_fill_cols = [c for c in master_df.columns if c not in exclude_fill_cols]
-    master_df = master_df.with_columns([
-        pl.col(c).fill_null(strategy="forward", limit=3) for c in target_fill_cols
-    ])
-
     print("⚙️ [第四阶段] 计算 31 维特征矩阵...")
     master_df = master_df.cast({col: pl.Float64 for col in ["open", "high", "low", "close", "volume"]})
-
-    required_cols = ["last_funding_rate", "premium_close", "cross_asset_close"]
-    for col in required_cols:
-        if col not in master_df.columns:
-            print(f"⚠️ 缺失辅助列 {col}，正在进行安全占位。")
-            # 价格类数据必须使用 1.0 占位以防止 log(0) 产生负无穷，其它指标用 0.0
-            fallback_val = 1.0 if "close" in col else 0.0
-            master_df = master_df.with_columns(pl.lit(fallback_val).alias(col))
             
     # 合成完毕后，物理销毁用于计算的冗余母体数据
     drop_aux_cols = [c for c in ["aux_reference_close", "cross_pair_close"] if c in master_df.columns]
@@ -372,7 +378,7 @@ def build_features(horizon):
     var = (m2 - m1.pow(2)).abs() 
     
     # 偏度标准公式: E[(X-mu)^3] / sigma^3 = (m3 - 3*m1*m2 + 2*m1^3) / sigma^3
-    skew_expr = ((m3 - 3 * m1 * m2 + 2 * m1.pow(3)) / (var.pow(1.5) + 1e-15)).fill_null(0).alias("vol_skew_24h")
+    skew_expr = ((m3 - 3 * m1 * m2 + 2 * m1.pow(3)) / (var.pow(1.5) + 1e-15)).alias("vol_skew_24h")
 
     # 🚨 [核心修正] 在计算任何位移特征之前，先计算核心对数收益率
     master_df = master_df.with_columns([
@@ -450,19 +456,39 @@ def build_features(horizon):
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
     if list(PROCESSED_AGGTRADES_DIR.glob("*.parquet")):
         # 🚨 致命缺陷修复：强行按时间去重，防范月度包与日线增量包交叉覆盖导致的行数爆炸
+        # 日线增量通常比月度包更新，显式排序与优先级保证同一小时保留结果可复现。
+        parquet_files = sorted(PROCESSED_AGGTRADES_DIR.glob("*.parquet"))
+        required_agg_cols = {"hour_timestamp", "cvd", "whale_net_flow", "retail_ratio", "whale_ls_ratio"}
+        invalid_agg_files = []
+        for f in parquet_files:
+            missing_cols = required_agg_cols - set(pl.read_parquet_schema(f).keys())
+            if missing_cols:
+                invalid_agg_files.append(f"{f.name} 缺少 {sorted(missing_cols)}")
+        if invalid_agg_files:
+            preview = "\n".join(f"   - {item}" for item in invalid_agg_files[:10])
+            extra = f"\n   ... 另有 {len(invalid_agg_files) - 10} 个文件" if len(invalid_agg_files) > 10 else ""
+            raise ValueError(
+                "aggTrades 特征文件 schema 已过期，请先删除/重建这些 parquet 后再构建主特征：\n"
+                f"{preview}{extra}"
+            )
+
+        dfs_agg = [
+            pl.read_parquet(f).with_columns(
+                pl.lit(1 if "_daily_" in f.name else 0).alias("_source_priority")
+            )
+            for f in parquet_files
+        ]
         df_agg = (
-            pl.scan_parquet(PROCESSED_AGGTRADES_DIR / "*.parquet")
-            .collect()
-            .sort("hour_timestamp")
+            pl.concat(dfs_agg, how="diagonal")
+            .sort(["hour_timestamp", "_source_priority"])
             .unique(subset=["hour_timestamp"], keep="last")
+            .drop("_source_priority")
         )
-        if "whale_ls_ratio" not in df_agg.columns:
-            df_agg = df_agg.with_columns(pl.lit(1.0).alias("whale_ls_ratio"))
         features = features.join(df_agg, on="hour_timestamp", how="left").with_columns([
-            pl.col("cvd").fill_nan(0).fill_null(0),
-            pl.col("whale_net_flow").fill_nan(0).fill_null(0),
-            pl.col("retail_ratio").fill_nan(None).fill_null(strategy="forward").fill_null(0.1),
-            pl.col("whale_ls_ratio").fill_nan(None).fill_null(1.0)
+            pl.col("cvd").fill_nan(None),
+            pl.col("whale_net_flow").fill_nan(None),
+            pl.col("retail_ratio").fill_nan(None),
+            pl.col("whale_ls_ratio").fill_nan(None)
         ])
     else:
         print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")
@@ -476,11 +502,11 @@ def build_features(horizon):
 
     # 步骤 1: 计算 rolling median (严格事前：使用 t-1 往前的 168 个窗口作为环境基准)
     features = features.with_columns([
-        pl.col(c).rolling_median(window_size=168).shift(1).alias(f"{c}_median") for c in rolling_cols
+        pl.col(c).rolling_median(window_size=168, min_samples=120).shift(1).alias(f"{c}_median") for c in rolling_cols
     ])
     # 步骤 2: 计算 rolling MAD (Median Absolute Deviation)，同样 shift(1)
     features = features.with_columns([
-        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168).shift(1).alias(f"{c}_mad") for c in rolling_cols
+        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168, min_samples=120).shift(1).alias(f"{c}_mad") for c in rolling_cols
     ])
     # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4]
     zscore_exprs = [
@@ -538,7 +564,10 @@ def build_features(horizon):
     before_rows = features.height
     features = features.drop_nulls()
     after_rows = features.height
-    print(f"🧹 drop_nulls 清洗完成: 删除 {before_rows - after_rows} 行，剩余 {after_rows} 行")
+    drop_ratio = ((before_rows - after_rows) / before_rows) if before_rows else 1.0
+    print(f"🧹 drop_nulls 清洗完成: 删除 {before_rows - after_rows} 行，剩余 {after_rows} 行，删除比例 {drop_ratio:.2%}")
+    if drop_ratio > 0.2:
+        print("⚠️ 警告：缺失清洗删除比例超过 20%，建议检查数据源完整性后再训练。")
     
     current_date = datetime.now().strftime("%Y%m%d")
     # 👇 文件名加上了 {horizon}h 的标志

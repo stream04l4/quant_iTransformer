@@ -217,8 +217,8 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     for c in rolling_cols:
         if c in df.columns:
             # 与离线训练完全对齐：环境基准必须只使用 t-1 以前的数据。
-            median = df[c].rolling(window=168, min_periods=168).median().shift(1)
-            mad = (df[c] - median).abs().rolling(window=168, min_periods=168).median().shift(1)
+            median = df[c].rolling(window=168, min_periods=120).median().shift(1)
+            mad = (df[c] - median).abs().rolling(window=168, min_periods=120).median().shift(1)
             df[f"{c}_zscore"] = (0.6745 * (df[c] - median) / (mad + 1e-9)).clip(-4.0, 4.0)
         else:
             df[f"{c}_zscore"] = np.nan

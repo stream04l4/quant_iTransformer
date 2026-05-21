@@ -38,7 +38,7 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
-DATA_START_MONTH = (2022, 1)   
+DATA_START_MONTH = (2020, 1)   
 DATA_END_MONTH = (2026, 5)     
 
 # ==========================================

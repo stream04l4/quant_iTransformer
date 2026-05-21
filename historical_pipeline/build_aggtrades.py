@@ -24,6 +24,10 @@ from quant_config.config import (
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_AGGTRADES_DIR.mkdir(parents=True, exist_ok=True)
 
+REQUIRED_AGGTRADE_FEATURE_COLS = {
+    "hour_timestamp", "cvd", "whale_net_flow", "retail_vol", "retail_ratio", "whale_ls_ratio"
+}
+
 def generate_month_range(start_ym, end_ym):
     """
     输入起止年月元组，生成连续的年月。
@@ -87,6 +91,18 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
 # ==========================================
 # 2. 下载与文件管理逻辑
 # ==========================================
+def is_valid_feature_parquet(path: Path) -> bool:
+    try:
+        schema = pl.read_parquet_schema(path)
+    except Exception as e:
+        print(f"⚠️ {path.name} 读取失败，将重新生成: {e}")
+        return False
+    missing_cols = REQUIRED_AGGTRADE_FEATURE_COLS - set(schema.keys())
+    if missing_cols:
+        print(f"♻️ {path.name} schema 过期，缺少 {sorted(missing_cols)}，将重新生成。")
+        return False
+    return True
+
 def download_file(url: str, dest_path: Path) -> bool:
     print(f"⬇️ 开始下载: {url}")
     try:
@@ -111,7 +127,7 @@ def pipeline_for_month(year: int, month: int):
     csv_path = TEMP_DIR / csv_name
     output_parquet = PROCESSED_AGGTRADES_DIR / f"{SYMBOL}_aggTrades_features_{year}_{month_str}.parquet"
 
-    if output_parquet.exists():
+    if output_parquet.exists() and is_valid_feature_parquet(output_parquet):
         print(f"⏭️ {output_parquet.name} 已存在，跳过处理。")
         return
 
@@ -148,7 +164,7 @@ def pipeline_for_day(d: date):
     csv_path = TEMP_DIR / csv_name
     output_parquet = PROCESSED_AGGTRADES_DIR / f"{SYMBOL}_aggTrades_daily_{date_str}.parquet"
 
-    if output_parquet.exists():
+    if output_parquet.exists() and is_valid_feature_parquet(output_parquet):
         return
     if not download_file(download_url, zip_path):
         return
