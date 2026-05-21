@@ -458,7 +458,10 @@ def build_features(horizon):
         # 🚨 致命缺陷修复：强行按时间去重，防范月度包与日线增量包交叉覆盖导致的行数爆炸
         # 日线增量通常比月度包更新，显式排序与优先级保证同一小时保留结果可复现。
         parquet_files = sorted(PROCESSED_AGGTRADES_DIR.glob("*.parquet"))
-        required_agg_cols = {"hour_timestamp", "cvd", "whale_net_flow", "retail_ratio", "whale_ls_ratio"}
+        required_agg_cols = {
+            "hour_timestamp", "cvd", "whale_buy", "whale_sell",
+            "whale_net_flow", "retail_ratio", "whale_ls_ratio"
+        }
         invalid_agg_files = []
         for f in parquet_files:
             missing_cols = required_agg_cols - set(pl.read_parquet_schema(f).keys())

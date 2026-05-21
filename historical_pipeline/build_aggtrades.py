@@ -25,7 +25,8 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_AGGTRADES_DIR.mkdir(parents=True, exist_ok=True)
 
 REQUIRED_AGGTRADE_FEATURE_COLS = {
-    "hour_timestamp", "cvd", "whale_net_flow", "retail_vol", "retail_ratio", "whale_ls_ratio"
+    "hour_timestamp", "cvd", "whale_buy", "whale_sell", "whale_net_flow",
+    "retail_vol", "retail_ratio", "whale_ls_ratio"
 }
 
 def generate_month_range(start_ym, end_ym):
@@ -81,7 +82,8 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
     ]).sort("hour_timestamp")
 
     final_df = hourly_features.select([
-        "hour_timestamp", "cvd", "whale_net_flow", "retail_vol", "retail_ratio", "whale_ls_ratio"
+        "hour_timestamp", "cvd", "whale_buy", "whale_sell", "whale_net_flow",
+        "retail_vol", "retail_ratio", "whale_ls_ratio"
     ])
 
     final_df.write_parquet(output_parquet_path)

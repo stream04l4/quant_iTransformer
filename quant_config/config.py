@@ -104,4 +104,4 @@ D_MODEL = int(os.environ.get("OPT_D_MODEL", 128))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.2))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.02))

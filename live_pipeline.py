@@ -71,7 +71,12 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
     # 1. 基础 K 线体系
-    df = pd.DataFrame(main_snap['ohlcv_1h'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    ohlcv_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    df = pd.DataFrame(main_snap['ohlcv_1h'])
+    if df.shape[1] < len(ohlcv_cols):
+        raise ValueError(f"主K线字段不足，至少需要 {len(ohlcv_cols)} 列，当前 {df.shape[1]} 列")
+    df = df.iloc[:, :len(ohlcv_cols)]
+    df.columns = ohlcv_cols
     current_hour_ts = int(datetime.utcnow().timestamp() / 3600) * 3600000
     if df['timestamp'].iloc[-1] >= current_hour_ts:
         df = df.iloc[:-1]
@@ -121,14 +126,8 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         df = df.merge(df_oi[['hour_timestamp', 'sum_open_interest']], on='hour_timestamp', how='left')
     else: df['sum_open_interest'] = np.nan
 
-    # 🚨 修复 1：严格限制填充范围，杜绝无限回填。对齐离线 limit=8 与 limit=3 的物理设定
+    # 训练端只允许资金费率按物理周期有限延续；其它缺口保留 NaN，交给最终熔断处理。
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
-    state_cols = ['aux_reference_close', 'cross_pair_close', 'premium_close', 'sum_open_interest']
-    df[state_cols] = df[state_cols].ffill(limit=3)
-    
-    # 🚨 实盘补丁：币安 API 仅提供 30 天 (720小时) 历史，引擎预热需要 840 小时。采用向后兜底填充防止开头熔断
-    df[state_cols] = df[state_cols].bfill()
-    df['funding_rate'] = df['funding_rate'].bfill()
     df['cross_asset_close'] = df['cross_pair_close'].combine_first(df['aux_reference_close'] / (df['close'] + 1e-9))
 
     # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的 35000 根纯净 1m K线
@@ -143,8 +142,6 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     else:
         df['realized_vol_1h'] = np.nan
         
-    df['realized_vol_1h'] = df['realized_vol_1h'].bfill().fillna(0.0)
-
     # 5. 订单流特征
     taker_stats = main_snap.get('taker_stats_1h', {})
     if taker_stats:
@@ -153,10 +150,10 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         df = df.merge(taker_df, left_on='hour_timestamp', right_index=True, how='left')
         
         df['taker_ratio_delta'] = (df['taker_buy_volume'] / (df['volume'] + 1e-9)).diff()
-        df['cvd'] = (df['taker_buy_volume'] - df['taker_sell_volume']).fillna(0)
-        df['whale_net_flow'] = (df['whale_buy'] - df['whale_sell']).fillna(0)
+        df['cvd'] = df['taker_buy_volume'] - df['taker_sell_volume']
+        df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
         df['whale_ls_ratio'] = (df['whale_buy'] + 1e-9) / (df['whale_sell'] + 1e-9)
-        df['retail_ratio'] = (df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)).ffill().fillna(0.1)
+        df['retail_ratio'] = df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)
         df['amihud_illiquidity'] = np.log((df['log_return'].abs() / (df['quote_volume'] + 1e-9)) + 1e-12)
     else:
         for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'whale_ls_ratio', 'retail_ratio', 'amihud_illiquidity']:
@@ -192,19 +189,18 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         df[f'price_pos_{w}h'] = (df['close'] - low_min) / (high_max - low_min + 1e-9)
 
     # 🚨 修复 4：还原原生三阶中心矩偏度公式，消除 Pandas 样本偏度带来的 6.7% 黑盒误差
-    m1 = df['log_return'].rolling(window=24, min_periods=1).mean()
-    m2 = (df['log_return']**2).rolling(window=24, min_periods=1).mean()
-    m3 = (df['log_return']**3).rolling(window=24, min_periods=1).mean()
+    m1 = df['log_return'].rolling(window=24, min_periods=24).mean()
+    m2 = (df['log_return']**2).rolling(window=24, min_periods=24).mean()
+    m3 = (df['log_return']**3).rolling(window=24, min_periods=24).mean()
     var = (m2 - m1**2).abs()
-    df['vol_skew_24h'] = (m3 - 3 * m1 * m2 + 2 * m1**3) / (var**1.5 + 1e-9)
+    df['vol_skew_24h'] = (m3 - 3 * m1 * m2 + 2 * m1**3) / (var**1.5 + 1e-15)
     
     prev_oi = df['sum_open_interest'].shift(1)
     
-    # 🚨 实盘绝不能返回 NaN，若遇到除零或极端宕机恢复，强制将变化率归 0
     df['oi_delta_pct'] = np.where(
         prev_oi.abs() > 1e-6,
         ((df['sum_open_interest'] - prev_oi) / prev_oi).clip(-1.0, 1.0),
-        0.0  # 实盘保命符：以 0.0 兜底，绕过 NaN 熔断机制
+        np.nan
     )
     
     # 🚨 新增：补齐缺失的高阶特征
@@ -236,7 +232,7 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     final_cols = [
-        "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
+        "is_synthetic", "log_return", "max_ret_24h", "ma_bias", "upper_shadow", "lower_shadow",
         "bb_squeeze", "ppo_hist", "rsi_14", "rsi_48", "taker_ratio_delta", 
         "amihud_illiquidity_zscore", "realized_vol_1h_zscore", "vol_skew_24h",
         "oi_delta_pct",
@@ -244,8 +240,7 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         "rv_term_structure", 
         "funding_rate_momentum", "premium_delta", "cross_asset_return",
         "hour_sin", "hour_cos", "week_sin", "week_cos", 
-        "cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence",
-        "is_synthetic"
+        "cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence"
     ]
     
     for col in final_cols:
