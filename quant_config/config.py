@@ -60,15 +60,15 @@ AGGTRADE_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id",
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
 # 👇 全部改为动态获取，供 Mode 2 寻优
-LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 2.0))
-LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 4.0))
+LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 3.0))
+LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 5.0))
 LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 7.0))
 
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.015))           
-HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.04))           
+HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.04))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
@@ -85,8 +85,8 @@ INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累
 BASE_RISK_BUDGET = 0.2              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
 
 # --- 右脑高频熔断参数 ---
-BAILOUT_ATR_MULTI = 2.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
-BAILOUT_VOL_MULTI = 3.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
+BAILOUT_ATR_MULTI = 3.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
+BAILOUT_VOL_MULTI = 4.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
 BAILOUT_MIN_PHYSICAL_DROP = 0.005    # 熔断最小物理跌幅过滤(0.5%)，防止微小波动误触
 BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确认为真瀑布)
 

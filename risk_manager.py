@@ -607,6 +607,8 @@ def bailout_worker():
                     # ---------------------------------------------------------
                     if data and 'ohlcv_1m' in data and len(data['ohlcv_1m']) >= 14:
                         ohlcv_1m = data['ohlcv_1m']
+                        prev_minute_close = float(ohlcv_1m[-2][4])
+                        current_open = float(ohlcv_1m[-1][1])
                         current_high = max(float(ohlcv_1m[-1][2]), current_close)
                         current_low = min(float(ohlcv_1m[-1][3]), current_close)
                         current_vol = float(ohlcv_1m[-1][5])
@@ -632,14 +634,16 @@ def bailout_worker():
                             is_flash_crash = False
                             is_flash_surge = False
                             min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
+                            adverse_for_long = current_close < min(prev_minute_close, current_open)
+                            adverse_for_short = current_close > max(prev_minute_close, current_open)
                             
                             if pos_side == 'LONG':
                                 drop_amt = current_high - current_close
-                                if drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                if adverse_for_long and drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
                                     is_flash_crash = True
                             elif pos_side == 'SHORT':
                                 surge_amt = current_close - current_low
-                                if surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                if adverse_for_short and surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
                                     is_flash_surge = True
                                     
                             if (is_flash_crash or is_flash_surge) and ('orderbook' in data):
