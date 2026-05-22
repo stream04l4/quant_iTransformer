@@ -80,6 +80,14 @@ def assert_hourly_continuity(df):
             f"实盘拒绝跨断层构建特征: prev={prev_ts}, curr={curr_ts}, gap_ms={int(bad_gaps.iloc[0])}"
         )
 
+def dedupe_hourly_history(df, value_col):
+    """衍生品历史可能来自 API/缓存合并；按小时去重，避免 merge 扩行主时间轴。"""
+    return (
+        df.sort_values('hour_timestamp')
+          .dropna(subset=['hour_timestamp', value_col])
+          .drop_duplicates(subset=['hour_timestamp'], keep='last')
+    )
+
 def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None):
     """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
@@ -126,24 +134,29 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     if main_snap.get('premium_history'):
         df_prem = pd.DataFrame(main_snap['premium_history'], columns=['ts', 'premium_close'])
         df_prem['hour_timestamp'] = pd.to_datetime(df_prem['ts'], unit='ms')
+        df_prem = dedupe_hourly_history(df_prem, 'premium_close')
         df = df.merge(df_prem[['hour_timestamp', 'premium_close']], on='hour_timestamp', how='left')
     else: df['premium_close'] = np.nan
 
     if main_snap.get('funding_history'):
         df_fund = pd.DataFrame(main_snap['funding_history'], columns=['ts', 'funding_rate'])
         df_fund['hour_timestamp'] = pd.to_datetime(df_fund['ts'], unit='ms').dt.floor('h')
+        df_fund = dedupe_hourly_history(df_fund, 'funding_rate')
         df = df.merge(df_fund[['hour_timestamp', 'funding_rate']], on='hour_timestamp', how='left')
     else: df['funding_rate'] = np.nan
 
     if main_snap.get('oi_history'):
         df_oi = pd.DataFrame(main_snap['oi_history'], columns=['ts', 'sum_open_interest'])
         df_oi['hour_timestamp'] = pd.to_datetime(df_oi['ts'], unit='ms')
+        df_oi = dedupe_hourly_history(df_oi, 'sum_open_interest')
         df = df.merge(df_oi[['hour_timestamp', 'sum_open_interest']], on='hour_timestamp', how='left')
     else: df['sum_open_interest'] = np.nan
 
     # 训练端只允许资金费率按物理周期有限延续；其它缺口保留 NaN，交给最终熔断处理。
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
     df['cross_asset_close'] = df['cross_pair_close'].combine_first(df['aux_reference_close'] / (df['close'] + 1e-9))
+    df = df.reset_index(drop=True)
+    assert_hourly_continuity(df)
 
     # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的完整 1m 纯净 K线
     if 'ohlcv_1m' in main_snap and len(main_snap['ohlcv_1m']) > 0:
