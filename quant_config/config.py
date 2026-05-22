@@ -72,9 +72,9 @@ HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
-MACRO_ALPHA_TOP_10 = 0.30            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
-MACRO_ALPHA_TOP_5 = 0.10             # Tier 2 (波段加仓): 宏观权重中等
-MACRO_ALPHA_TOP_1 = 0.05             # Tier 3 (激进杠杆): 宏观权重极低，尊重微观量价动能
+MACRO_ALPHA_TOP_10 = 0.10            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
+MACRO_ALPHA_TOP_5 = 0.05             # Tier 2 (波段加仓): 宏观权重中等
+MACRO_ALPHA_TOP_1 = 0.02             # Tier 3 (激进杠杆): 宏观权重极低，尊重微观量价动能
 
 HEARTBEAT_INTERVAL = 10              # 实盘高频心跳间隔(秒)
 MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC/ETH最大notional(USDT)
@@ -104,4 +104,4 @@ D_MODEL = int(os.environ.get("OPT_D_MODEL", 128))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
 DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.2))
 
-CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.02))
+CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))

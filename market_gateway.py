@@ -29,13 +29,16 @@ rest_semaphore = asyncio.Semaphore(3)
 # ==========================================
 # 替换原有的 market_data_store 初始化逻辑
 market_data_store = {}
+DERIVATIVE_LOOKBACK_HOURS = 1250
+ONE_MINUTE_HISTORY_LIMIT = DERIVATIVE_LOOKBACK_HOURS * 60 + 120
+RECENT_AGGTRADE_REST_BACKFILL_HOURS = 48
 
 # 将主币种和辅助币种合并初始化
 all_symbols = [SYMBOL] + AUX_SYMBOLS
 
 for sym in all_symbols:
     market_data_store[sym] = {
-        "1m": deque(maxlen=35000), # 增加长度以支撑 1m RV 计算
+        "1m": deque(maxlen=ONE_MINUTE_HISTORY_LIMIT), # 覆盖完整 1h 推理窗口的 RV 预热
         "1h": deque(maxlen=1250), # 从 500 提升到 1000，确保满足 504 需求
         "orderbook": {"bids": [], "asks": []},
         "ticker": {"last": None},
@@ -57,10 +60,8 @@ for sym in all_symbols:
 # ==========================================
 LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = LIVE_DATA_DIR / "gateway_state.db"
-DERIVATIVE_LOOKBACK_HOURS = 1250
 DERIVATIVE_HISTORY_WINDOW_MS = DERIVATIVE_LOOKBACK_HOURS * 3600000
 PROCESSED_DERIVATIVE_CANDIDATE_DIRS = [PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR]
-ONE_MINUTE_HISTORY_LIMIT = 35000
 
 
 def print_gateway_data_chain():
@@ -622,6 +623,22 @@ async def liquidation_loop(exchange, symbol, swap_symbol, engine_type, startup_d
             )
             await asyncio.sleep(sleep_time)
 
+def normalize_live_taker_stats(stats):
+    """实时逐笔成交桶允许从 SQLite 的 NULL 底座恢复成可累加状态。"""
+    numeric_defaults = {
+        "taker_buy_volume": 0.0,
+        "taker_sell_volume": 0.0,
+        "quote_volume": 0.0,
+        "count": 0,
+        "whale_buy": 0.0,
+        "whale_sell": 0.0,
+        "retail_vol": 0.0,
+    }
+    for key, default in numeric_defaults.items():
+        if stats.get(key) is None:
+            stats[key] = default
+    return stats
+
 async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
     """ 监听逐笔成交流，降维聚合为 1h 级别的高级量价与订单流特征 """
     await asyncio.sleep(startup_delay)
@@ -655,7 +672,7 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
                         "whale_buy": 0.0, "whale_sell": 0.0, "retail_vol": 0.0
                     }
                 
-                stats = bucket[hour_ts]
+                stats = normalize_live_taker_stats(bucket[hour_ts])
                 stats["quote_volume"] += cost
                 stats["count"] += 1
                 
@@ -818,6 +835,7 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
     # 🚨 触发一次性回填
     if not is_spot:
         await sync_local_aggtrades_to_db(symbol)
+        await backfill_recent_aggtrades_from_rest(exchange, symbol, swap_symbol)
 
     # 🚨 在所有回填结束后，重新从数据库加载完整无缝的底座特征到内存
     with sqlite3.connect(DB_PATH) as conn:
@@ -981,6 +999,126 @@ async def sync_local_aggtrades_to_db(symbol):
         print(f"   ✅ 历史订单流特征已成功挂载入网关底座，当前命中 {updated_rows} 个小时桶。")
     except Exception as e:
         print(f"   ❌ 回填订单流特征异常: {e}")
+
+async def backfill_recent_aggtrades_from_rest(exchange, symbol, swap_symbol):
+    """用 Binance aggTrades REST 补齐本地日包尚未覆盖的近期 whale/retail 缺口。"""
+    current_hour = int(time.time() / 3600) * 3600000
+    cutoff_ts = current_hour - RECENT_AGGTRADE_REST_BACKFILL_HOURS * 3600000
+
+    def _find_missing_hours():
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT timestamp FROM memory_1h
+                WHERE symbol=?
+                  AND timestamp>=?
+                  AND timestamp<?
+                  AND (whale_buy IS NULL OR whale_sell IS NULL OR retail_vol IS NULL)
+                ORDER BY timestamp ASC
+                """,
+                (symbol, cutoff_ts, current_hour),
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+
+    missing_hours = await asyncio.to_thread(_find_missing_hours)
+    if not missing_hours:
+        print(f"   ✅ [近期订单流补洞] {symbol} 最近 {RECENT_AGGTRADE_REST_BACKFILL_HOURS}h whale/retail 已完整。")
+        return
+
+    start_time = min(missing_hours)
+    end_time = current_hour - 1
+    raw_sym = exchange.market_id(swap_symbol)
+    buckets = {}
+    cursor_time = start_time
+    request_count = 0
+
+    print(
+        f"   🔎 [近期订单流补洞] {symbol} 发现 {len(missing_hours)} 个小时缺少 whale/retail，"
+        f"正在拉取 aggTrades: {datetime.utcfromtimestamp(start_time / 1000):%Y-%m-%d %H:%M} -> "
+        f"{datetime.utcfromtimestamp(end_time / 1000):%Y-%m-%d %H:%M} UTC"
+    )
+
+    try:
+        while cursor_time <= end_time:
+            async with rest_semaphore:
+                batch = await exchange.fapiPublicGetAggTrades({
+                    "symbol": raw_sym,
+                    "startTime": cursor_time,
+                    "endTime": end_time,
+                    "limit": 1000,
+                })
+            request_count += 1
+            if not batch:
+                break
+
+            last_trade_ts = cursor_time
+            for trade in batch:
+                trade_ts = int(trade.get("T") or trade.get("time") or 0)
+                if trade_ts <= 0:
+                    continue
+                last_trade_ts = max(last_trade_ts, trade_ts)
+                hour_ts = int(trade_ts / 3600000) * 3600000
+                if hour_ts not in buckets:
+                    buckets[hour_ts] = {"whale_buy": 0.0, "whale_sell": 0.0, "retail_vol": 0.0}
+
+                price = float(trade.get("p") or trade.get("price") or 0.0)
+                qty = float(trade.get("q") or trade.get("amount") or 0.0)
+                notional = price * qty
+                raw_buyer_maker = trade.get("m", trade.get("isBuyerMaker", False))
+                is_buyer_maker = (
+                    raw_buyer_maker
+                    if isinstance(raw_buyer_maker, bool)
+                    else str(raw_buyer_maker).lower() == "true"
+                )
+
+                if notional >= WHALE_NOTIONAL_THRESHOLD_USDT:
+                    if is_buyer_maker:
+                        buckets[hour_ts]["whale_sell"] += qty
+                    else:
+                        buckets[hour_ts]["whale_buy"] += qty
+                if notional <= RETAIL_NOTIONAL_THRESHOLD_USDT:
+                    buckets[hour_ts]["retail_vol"] += qty
+
+            if len(batch) < 1000:
+                break
+            next_cursor = last_trade_ts + 1
+            if next_cursor <= cursor_time:
+                break
+            cursor_time = next_cursor
+            await asyncio.sleep(0.08)
+
+        update_rows = [
+            (
+                buckets[ts]["whale_buy"],
+                buckets[ts]["whale_sell"],
+                buckets[ts]["retail_vol"],
+                symbol,
+                ts,
+            )
+            for ts in missing_hours
+            if ts in buckets
+        ]
+
+        if not update_rows:
+            print(f"   ⚠️ [近期订单流补洞] {symbol} REST 未取得可覆盖的 aggTrades，保留 NULL 让推理端熔断。")
+            return
+
+        def _write_updates():
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executemany(
+                    "UPDATE memory_1h SET whale_buy=?, whale_sell=?, retail_vol=? WHERE symbol=? AND timestamp=?",
+                    update_rows,
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_write_updates)
+        print(
+            f"   ✅ [近期订单流补洞] {symbol} 已用 aggTrades REST 补齐 {len(update_rows)}/{len(missing_hours)} 个小时桶 "
+            f"(REST请求 {request_count} 次)。"
+        )
+    except Exception as e:
+        print(f"   ❌ [近期订单流补洞] {symbol} aggTrades REST 回填失败: {type(e).__name__} -> {e}")
 
 async def db_persist_loop():
     """ 自动存档守护进程：将 WebSocket 即时揉出的微观流，每分钟刷入硬盘 """

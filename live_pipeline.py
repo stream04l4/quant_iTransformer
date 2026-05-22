@@ -67,6 +67,19 @@ def fetch_gateway_snapshot(sym):
     except Exception:
         return None
 
+def assert_hourly_continuity(df):
+    """离线端会 upsample 到连续 1h 轴；实盘端遇到断档直接熔断，避免跨空洞 rolling。"""
+    gaps = df['timestamp'].diff().dropna()
+    bad_gaps = gaps[gaps != 3600000]
+    if not bad_gaps.empty:
+        gap_idx = int(bad_gaps.index[0])
+        prev_ts = int(df.loc[gap_idx - 1, 'timestamp']) if gap_idx - 1 in df.index else None
+        curr_ts = int(df.loc[gap_idx, 'timestamp'])
+        raise ValueError(
+            "🚨 引擎熔断！主K线时间轴存在断层，离线训练端会将其标记为 synthetic 并剔除，"
+            f"实盘拒绝跨断层构建特征: prev={prev_ts}, curr={curr_ts}, gap_ms={int(bad_gaps.iloc[0])}"
+        )
+
 def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None):
     """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
@@ -80,6 +93,8 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     current_hour_ts = int(datetime.utcnow().timestamp() / 3600) * 3600000
     if df['timestamp'].iloc[-1] >= current_hour_ts:
         df = df.iloc[:-1]
+    df = df.reset_index(drop=True)
+    assert_hourly_continuity(df)
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
     required_history = ACTUAL_SEQ_LEN + 336
@@ -130,7 +145,7 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     df['funding_rate'] = df['funding_rate'].ffill(limit=8)
     df['cross_asset_close'] = df['cross_pair_close'].combine_first(df['aux_reference_close'] / (df['close'] + 1e-9))
 
-    # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的 35000 根纯净 1m K线
+    # 🚨 修复 2：彻底斩断 Parquet 依赖，全量使用网关推来的完整 1m 纯净 K线
     if 'ohlcv_1m' in main_snap and len(main_snap['ohlcv_1m']) > 0:
         live_1m = pd.DataFrame(main_snap['ohlcv_1m'], columns=['ts', 'o', 'h', 'l', 'close', 'v'])
         live_1m['timestamp'] = pd.to_datetime(live_1m['ts'], unit='ms')
@@ -139,6 +154,14 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         
         rv_df = live_1m.groupby('hour_timestamp')['log_ret'].apply(lambda x: np.sqrt((x**2).sum())).reset_index(name='realized_vol_1h')
         df = df.merge(rv_df, on='hour_timestamp', how='left')
+        rv_missing = df['realized_vol_1h'].isna().sum()
+        if rv_missing:
+            first_rv = rv_df['hour_timestamp'].min() if not rv_df.empty else None
+            last_rv = rv_df['hour_timestamp'].max() if not rv_df.empty else None
+            print(
+                f"   ⚠️ [RV诊断] 1m覆盖 {len(live_1m)} 根/{rv_df.shape[0]} 小时，"
+                f"RV范围 {first_rv} -> {last_rv}，主窗口缺失 {rv_missing} 小时。"
+            )
     else:
         df['realized_vol_1h'] = np.nan
         
@@ -154,7 +177,7 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         df['whale_net_flow'] = df['whale_buy'] - df['whale_sell']
         df['whale_ls_ratio'] = (df['whale_buy'] + 1e-9) / (df['whale_sell'] + 1e-9)
         df['retail_ratio'] = df['retail_vol'] / (df['taker_buy_volume'] + df['taker_sell_volume'] + 1e-9)
-        df['amihud_illiquidity'] = np.log((df['log_return'].abs() / (df['quote_volume'] + 1e-9)) + 1e-12)
+        df['amihud_illiquidity'] = np.log((df['log_return'].abs() / (df['quote_volume'] + 1e-9)) + 1e-12).clip(-50.0, 50.0)
     else:
         for col in ['taker_ratio_delta', 'cvd', 'whale_net_flow', 'whale_ls_ratio', 'retail_ratio', 'amihud_illiquidity']:
             df[col] = np.nan
@@ -180,8 +203,10 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
         loss = (-delta.clip(upper=0)).ewm(alpha=1.0/p, adjust=False).mean()
         df[f'rsi_{p}'] = ((100 - (100 / (1 + gain / (loss + 1e-9)))) - 50) / 50.0
 
-    # 🚨 修复 2：补齐缺漏的掩码特征。实盘数据均为物理真实发生，不存在断网填充，恒为 0
-    df['is_synthetic'] = 0.0
+    # 与离线 upsample 后的 synthetic 规则保持一致；若进入推理窗口，后续空值检查会熔断。
+    df['is_synthetic'] = (
+        df['close'].isna() | df['sum_open_interest'].isna() | df['premium_close'].isna()
+    ).astype(float)
 
     for w in [24, 72, 168]:
         low_min = df['low'].rolling(window=w).min()
@@ -205,7 +230,9 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     
     # 🚨 新增：补齐缺失的高阶特征
     df['max_ret_24h'] = df['log_return'].rolling(window=24).max()
-    df['rv_term_structure'] = df['realized_vol_1h'] / (df['realized_vol_1h'].rolling(window=24).mean() + 1e-9)
+    df['rv_term_structure'] = (
+        df['realized_vol_1h'] / (df['realized_vol_1h'].rolling(window=24).mean() + 1e-9)
+    ).clip(0.0, 50.0)
     df['funding_rate_momentum'] = df['funding_rate'].rolling(window=24).mean() - df['funding_rate'].rolling(window=72).mean()
 
     # 7. 免疫断层的 Z-Score (🚨 修正：剔除 vpt，加入 oi_delta_pct)
@@ -226,8 +253,10 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     df['premium_delta'] = df['premium_close'].diff()
     df['hour_sin'] = np.sin(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
     df['hour_cos'] = np.cos(df['hour_timestamp'].dt.hour * (2 * np.pi / 24))
-    df['week_sin'] = np.sin(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
-    df['week_cos'] = np.cos(df['hour_timestamp'].dt.weekday * (2 * np.pi / 7))
+    # Polars dt.weekday() 是 ISO weekday: Monday=1..Sunday=7；Pandas weekday 是 0..6。
+    iso_weekday = df['hour_timestamp'].dt.weekday + 1
+    df['week_sin'] = np.sin(iso_weekday * (2 * np.pi / 7))
+    df['week_cos'] = np.cos(iso_weekday * (2 * np.pi / 7))
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
