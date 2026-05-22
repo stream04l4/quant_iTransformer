@@ -18,13 +18,13 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
-    'SEQ_LEN': [336, 672, 1008],
-    'CLASS_THRESHOLD': [0.015, 0.02, 0.025],
+    'SEQ_LEN': [672],
+    'CLASS_THRESHOLD': [0.015],
     'E_LAYERS': [2],
-    'D_MODEL': [128, 256],
-    'DROPOUT': [0.2, 0.3],
-    'BATCH_SIZE': [128, 256],
-    'LEARNING_RATE': [5e-6, 1e-5],
+    'D_MODEL': [128],
+    'DROPOUT': [0.2],
+    'BATCH_SIZE': [128],
+    'LEARNING_RATE': [5e-6],
     'EPOCHS': [50]
 }
 

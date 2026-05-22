@@ -249,36 +249,35 @@ def run_backtest():
                 added_notional = max(0.0, target_notional - old_notional)
                 if added_notional <= 1e-12:
                     current_tier = target_tier
-                    continue
-                
-                old_size = old_notional / entry_price
-                new_size = added_notional / current_hour_open
-                total_size = old_size + new_size
-                
-                # 重新计算加仓后的加权持仓均价
-                avg_entry_price = target_notional / total_size
-                
-                # 扣除新增仓位的摩擦成本
-                added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
-                open_cost += added_open_cost
-                equity -= added_open_cost 
-                
-                # 更新全局状态机
-                entry_price = avg_entry_price
-                current_leverage = target_leverage
-                current_tier = target_tier
-                
-                # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
-                if current_pos == 1:
-                    new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
-                    max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
                 else:
-                    new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
-                    max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
+                    old_size = old_notional / entry_price
+                    new_size = added_notional / current_hour_open
+                    total_size = old_size + new_size
                     
-                # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
-                dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
-
+                    # 重新计算加仓后的加权持仓均价
+                    avg_entry_price = target_notional / total_size
+                    
+                    # 扣除新增仓位的摩擦成本
+                    added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
+                    open_cost += added_open_cost
+                    equity -= added_open_cost 
+                    
+                    # 更新全局状态机
+                    entry_price = avg_entry_price
+                    current_leverage = target_leverage
+                    current_tier = target_tier
+                    
+                    # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
+                    if current_pos == 1:
+                        new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
+                        max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
+                    else:
+                        new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
+                        max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
+                        
+                    # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
+                    dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
+                    
         # ------------------------------------------
         # 2. 1分钟级别显微镜追踪持仓
         # ------------------------------------------
@@ -409,8 +408,17 @@ def run_backtest():
         equity_curve.append(equity)
 
     equity_curve = np.array(equity_curve)
-    valid_timestamps = valid_timestamps[:len(equity_curve)]
     benchmark_prices = np.array(benchmark_prices)
+
+    # 统一所有逐小时序列长度，避免临近数据尾部或提前终止时绘图/指标错位。
+    curve_len = min(len(equity_curve), len(benchmark_prices), len(valid_timestamps))
+    equity_curve = equity_curve[:curve_len]
+    benchmark_prices = benchmark_prices[:curve_len]
+    valid_timestamps = valid_timestamps[:curve_len]
+
+    if curve_len == 0:
+        print("❌ 没有可用于统计的有效回测样本。")
+        return
 
     rolling_max = np.maximum.accumulate(equity_curve)
     drawdowns = (equity_curve - rolling_max) / rolling_max
@@ -420,12 +428,12 @@ def run_backtest():
     ls_ratio = (long_trades / short_trades) if short_trades > 0 else float('inf')
 
     total_return = equity_curve[-1] - 1.0
-    years = len(predictions_probs) / 8760
+    years = curve_len / 8760
     annualized_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
     calmar = (annualized_return / (abs(max_drawdown)/100)) if max_drawdown < 0 else float('inf')
     
     if len(benchmark_prices) > 0: benchmark_curve = benchmark_prices / benchmark_prices[0]
-    else: benchmark_curve = np.ones(len(predictions_probs))
+    else: benchmark_curve = np.ones(curve_len)
 
     win_rate = (win_count / trade_count) * 100 if trade_count > 0 else 0.0
         
@@ -443,7 +451,7 @@ def run_backtest():
     print("="*50)
     
     print(f"【1. 基础战况】")
-    print(f" ▪ 总回测时长 : {len(predictions_probs)} 小时")
+    print(f" ▪ 总回测时长 : {curve_len} 小时")
     print(f" ▪ 撮合交易数 : {trade_count} 笔 (多:{long_trades} | 空:{short_trades})")
     print(f" ▪ 最终净值   : {equity_curve[-1]:.4f}")
     
