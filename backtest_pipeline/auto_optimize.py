@@ -33,9 +33,9 @@ BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_2': [5.0],
     'LEVERAGE_3': [8.0],
     'HOLD_PERIOD': [12],
-    'HARD_TP': [0.03, 0.04, 0.05],
-    'HARD_SL': [0.015, 0.02, 0.03, 0.04],
-    'TRAILING_ATR_MULTI': [5.0]
+    'HARD_TP': [0.015],
+    'HARD_SL': [0.015],
+    'TRAILING_ATR_MULTI': [3.5]
 }
 
 # 🚨 修复：传入 target_horizon，精准提取目标周期的核心指标
@@ -96,6 +96,32 @@ def extract_backtest_metrics(output):
     except Exception: pass
     return metrics
 
+def prefix_metrics(metrics, prefix):
+    return {f"{prefix}{k}": v for k, v in metrics.items()}
+
+def calculate_hybrid_score(metrics):
+    """
+    给 alpha 模式一个粗排分数，方便大量重复实验后先筛一遍。
+    具体入选仍建议看 bt_final_equity / bt_expectancy_pct / bt_max_drawdown / primary_rank_ic 的组合。
+    """
+    bt_final_equity = float(metrics.get("bt_final_equity", 0.0) or 0.0)
+    bt_expectancy_pct = float(metrics.get("bt_expectancy_pct", 0.0) or 0.0)
+    bt_max_drawdown = float(metrics.get("bt_max_drawdown", 0.0) or 0.0)
+    bt_trades = int(metrics.get("bt_trades", 0) or 0)
+    primary_rank_ic = float(metrics.get("primary_rank_ic", 0.0) or 0.0)
+    primary_ic_ir = float(metrics.get("primary_ic_ir", 0.0) or 0.0)
+
+    trade_count_penalty = 0.0 if bt_trades >= 30 else -1.0
+    drawdown_penalty = abs(min(bt_max_drawdown, 0.0)) / 100.0
+    return (
+        (bt_final_equity - 1.0)
+        + (bt_expectancy_pct / 10.0)
+        + (2.0 * primary_rank_ic)
+        + (0.05 * primary_ic_ir)
+        - (0.25 * drawdown_penalty)
+        + trade_count_penalty
+    )
+
 def run_experiment(params, mode, base_model, save_models):
     exp_id = f"EXP_{uuid.uuid4().hex[:8].upper()}"
     env = os.environ.copy()
@@ -125,6 +151,19 @@ def run_experiment(params, mode, base_model, save_models):
             # 获取当前实验对应的 Horizon
             target_horizon = params.get('FORECAST_HORIZON', 12)
             res = extract_alpha_metrics(stdout_log, target_horizon)
+
+            # 立刻用同一模型和同一动态概率阈值跑完整撮合，补齐“可交易性”维度。
+            backtest_path = BACKTEST_DIR / 'backtest_itransformer.py'
+            bt_result = subprocess.run(['python3', str(backtest_path)], capture_output=True, text=True, env=env)
+            if bt_result.returncode != 0:
+                res.update(prefix_metrics(extract_backtest_metrics(""), "bt_"))
+                res["bt_error"] = bt_result.stderr
+            else:
+                bt_metrics = extract_backtest_metrics(bt_result.stdout)
+                res.update(prefix_metrics(bt_metrics, "bt_"))
+                res["bt_error"] = ""
+
+            res["hybrid_score"] = calculate_hybrid_score(res)
             
         elif mode == 'backtest':
             src_model = MODEL_DIR / f"itransformer_{SYMBOL}_best_{base_model}.pth"
@@ -225,10 +264,18 @@ def main():
                         ic_ir = res.get('primary_ic_ir', 0)
                         ic_win = res.get('primary_ic_win_rate', 0)
                         ic_mdd = res.get('primary_ic_mdd', 0)
+                        bt_equity = res.get('bt_final_equity', 0)
+                        bt_expectancy = res.get('bt_expectancy_pct', 0)
+                        bt_mdd = res.get('bt_max_drawdown', 0)
+                        bt_trades = res.get('bt_trades', 0)
+                        hybrid_score = res.get('hybrid_score', 0)
+                        bt_error_note = " | BT_ERR" if res.get("bt_error") else ""
                         print(
                             f"   {progress_str} 🧠 [Alpha] 核心 {target_hz}h Rank_IC: {rank_ic:>+6.4f} | "
                             f"IC_IR: {ic_ir:>+6.3f} | IC胜率: {ic_win:>5.2f}% | IC_MDD: {ic_mdd:>6.4f} | "
-                            f"胜率: {acc_val:>5.2f}% | ID: {res['exp_id']}"
+                            f"胜率: {acc_val:>5.2f}% || BT净值:{bt_equity:>7.4f} | "
+                            f"BT期望:{bt_expectancy:>+6.3f}% | BT回撤:{bt_mdd:>+7.2f}% | "
+                            f"交易:{bt_trades:>4} | 综合:{hybrid_score:>+7.4f}{bt_error_note} | ID: {res['exp_id']}"
                         )
                     else:
                         print(f"   {progress_str} 🏦 [回测] 期望值: {res['expectancy_pct']:>+6.3f}% | 恢复因子: {res['recovery_factor']:>5.2f} | ID: {res['exp_id']}")

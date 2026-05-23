@@ -60,14 +60,14 @@ AGGTRADE_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id",
 # 5. 回测与实盘交易参数 (Trading Strategy)
 # ==========================================
 # 👇 全部改为动态获取，供 Mode 2 寻优
-LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 3.0))
+LEVERAGE_1 = float(os.environ.get("OPT_LEVERAGE_1", 2.0))
 LEVERAGE_2 = float(os.environ.get("OPT_LEVERAGE_2", 5.0))
-LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 7.0))
+LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 8.0))
 
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.02))           
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.015))           
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 # 追踪止盈回撤宽度：ATR(period) × multi / entry_price，替代固定 1% 回撤。
 TRAILING_ATR_PERIOD = int(os.environ.get("OPT_TRAILING_ATR_PERIOD", 14))
