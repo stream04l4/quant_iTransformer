@@ -15,6 +15,42 @@ sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR, EXPERIMENT_ID
 from historical_pipeline.train_itransformer import InvertedTransformer
 
+
+def calculate_daily_rank_ic_stats(clean_df, fwd_col):
+    """基于每日 Rank IC 序列计算稳定性指标。"""
+    daily_rank_ic = (
+        clean_df
+        .assign(trade_date=clean_df["timestamp"].dt.date)
+        .groupby("trade_date")[["alpha_score", fwd_col]]
+        .apply(lambda x: x["alpha_score"].corr(x[fwd_col], method="spearman") if len(x) >= 3 else np.nan)
+        .dropna()
+    )
+
+    if daily_rank_ic.empty:
+        return {
+            "Rank_IC_IR": 0.0,
+            "Rank_IC_Win_Rate": 0.0,
+            "Rank_IC_MDD": 0.0,
+            "Daily_Rank_IC_Count": 0,
+        }
+
+    ic_mean = daily_rank_ic.mean()
+    ic_std = daily_rank_ic.std(ddof=1)
+    rank_ic_ir = ic_mean / ic_std if ic_std and not np.isnan(ic_std) else 0.0
+    rank_ic_win_rate = (daily_rank_ic > 0).mean()
+
+    cumulative_ic = daily_rank_ic.cumsum()
+    running_peak = cumulative_ic.cummax()
+    rank_ic_mdd = (running_peak - cumulative_ic).max()
+
+    return {
+        "Rank_IC_IR": float(rank_ic_ir),
+        "Rank_IC_Win_Rate": float(rank_ic_win_rate),
+        "Rank_IC_MDD": float(rank_ic_mdd),
+        "Daily_Rank_IC_Count": int(len(daily_rank_ic)),
+    }
+
+
 # ==========================================
 # 1. 模型纯净评估主引擎
 # ==========================================
@@ -139,16 +175,36 @@ def evaluate_pure_alpha():
             
             ic_val = clean_df['alpha_score'].corr(clean_df[fwd_col], method='pearson')
             rank_ic_val = clean_df['alpha_score'].corr(clean_df[fwd_col], method='spearman')
+            daily_rank_ic_stats = calculate_daily_rank_ic_stats(clean_df, fwd_col)
             
-            metrics[N] = {'Acc': accuracy, 'Mean_Ret': mean_return, 'IC': ic_val, 'Rank_IC': rank_ic_val}
+            metrics[N] = {
+                'Acc': accuracy,
+                'Mean_Ret': mean_return,
+                'IC': ic_val,
+                'Rank_IC': rank_ic_val,
+                **daily_rank_ic_stats,
+            }
             
         print(f"🔬 模型: {model_name}")
         row = {'Model': model_name}
         for N in horizons:
-            res = metrics.get(N, {'Acc':0, 'Mean_Ret':0, 'IC':0, 'Rank_IC':0})
+            res = metrics.get(N, {
+                'Acc': 0, 'Mean_Ret': 0, 'IC': 0, 'Rank_IC': 0,
+                'Rank_IC_IR': 0, 'Rank_IC_Win_Rate': 0, 'Rank_IC_MDD': 0,
+                'Daily_Rank_IC_Count': 0,
+            })
             marker = "🎯" if N == ckpt_horizon else "  " # 高亮主要评估指标
-            print(f" {marker} [N={N:02d}h] 胜率:{res['Acc']*100:5.2f}% | 单笔期望:{res['Mean_Ret']*100:+6.3f}% | IC:{res['IC']:+6.4f} | Rank_IC:{res['Rank_IC']:+6.4f}")
+            print(
+                f" {marker} [N={N:02d}h] 胜率:{res['Acc']*100:5.2f}% | "
+                f"单笔期望:{res['Mean_Ret']*100:+6.3f}% | IC:{res['IC']:+6.4f} | "
+                f"Rank_IC:{res['Rank_IC']:+6.4f} | IC_IR:{res['Rank_IC_IR']:+6.3f} | "
+                f"IC胜率:{res['Rank_IC_Win_Rate']*100:5.2f}% | IC_MDD:{res['Rank_IC_MDD']:.4f}"
+            )
             row[f'Rank_IC_{N}h'] = res['Rank_IC']
+            row[f'Rank_IC_IR_{N}h'] = res['Rank_IC_IR']
+            row[f'Rank_IC_Win_Rate_{N}h'] = res['Rank_IC_Win_Rate']
+            row[f'Rank_IC_MDD_{N}h'] = res['Rank_IC_MDD']
+            row[f'Daily_Rank_IC_Count_{N}h'] = res['Daily_Rank_IC_Count']
             row[f'Acc_{N}h'] = res['Acc']
         print("-" * 60)
         all_reports.append(row)
