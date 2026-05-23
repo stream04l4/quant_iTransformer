@@ -16,6 +16,10 @@ from quant_config.config import (
     D_MODEL, E_LAYERS, DROPOUT, CLASS_THRESHOLD, FORECAST_HORIZON
 )
 
+LABEL_SMOOTHING = 0.03
+CLASS_WEIGHT_POWER = 0.5
+TOP_EVAL_RATIO = 0.10
+
 # ==========================================
 # 0. 安全辅助函数 (防止调参期崩溃)
 # ==========================================
@@ -25,6 +29,58 @@ def get_safe_n_heads(d_model: int) -> int:
         if d_model % h == 0 and h <= d_model:
             return h
     return 1
+
+
+def _ordinal_rank(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64)
+    return ranks
+
+
+def safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+    if len(x) < 3 or len(y) < 3:
+        return 0.0
+    rx = _ordinal_rank(np.asarray(x, dtype=np.float64))
+    ry = _ordinal_rank(np.asarray(y, dtype=np.float64))
+    rx -= rx.mean()
+    ry -= ry.mean()
+    denom = np.sqrt(np.sum(rx * rx) * np.sum(ry * ry))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.sum(rx * ry) / denom)
+
+
+def compute_validation_alpha_metrics(logits: torch.Tensor, labels: torch.Tensor, returns: torch.Tensor) -> dict:
+    probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
+    y_cls = labels.cpu().numpy()
+    y_ret = returns.cpu().numpy()
+
+    alpha_score = probs[:, 2] - probs[:, 0]
+    rank_ic = safe_spearman(alpha_score, y_ret)
+
+    top_n = max(1, int(len(alpha_score) * TOP_EVAL_RATIO))
+    long_idx = np.argsort(alpha_score)[-top_n:]
+    short_idx = np.argsort(alpha_score)[:top_n]
+
+    long_precision = float(np.mean(y_cls[long_idx] == 2))
+    short_precision = float(np.mean(y_cls[short_idx] == 0))
+    top_precision = 0.5 * (long_precision + short_precision)
+
+    baseline_precision = 0.5 * (float(np.mean(y_cls == 2)) + float(np.mean(y_cls == 0)))
+    precision_edge = top_precision - baseline_precision
+    tail_return_spread = float(np.mean(y_ret[long_idx]) - np.mean(y_ret[short_idx]))
+
+    # 交易导向选择分数：排序能力为主，尾部方向命中率和收益差作为约束。
+    selection_score = rank_ic + (0.20 * precision_edge) + (2.0 * tail_return_spread)
+
+    return {
+        "rank_ic": rank_ic,
+        "top_precision": top_precision,
+        "precision_edge": precision_edge,
+        "tail_return_spread": tail_return_spread,
+        "selection_score": selection_score,
+    }
 
 # ==========================================
 # 1. iTransformer 模型核心架构
@@ -67,8 +123,14 @@ class CryptoDatasetGPU(Dataset):
         df = pl.read_parquet(parquet_path)
         
         target_col = f"target_{FORECAST_HORIZON}h_return"
-        exclude_cols = ["hour_timestamp", target_col]
-        self.feature_cols = [c for c in df.columns if c not in exclude_cols]
+        if target_col not in df.columns:
+            raise ValueError(f"找不到目标列 {target_col}，请确认特征宽表与 FORECAST_HORIZON 一致。")
+
+        exclude_cols = {"hour_timestamp", target_col}
+        self.feature_cols = [
+            c for c in df.columns
+            if c not in exclude_cols and not (c.startswith("target_") and c.endswith("h_return"))
+        ]
         
         X = df.select(self.feature_cols).to_numpy().astype('float32')
         Y_raw = df.select(target_col).to_numpy().astype('float32').reshape(-1)
@@ -95,6 +157,8 @@ class CryptoDatasetGPU(Dataset):
         # 核心：使用 unfold 直接在显存中生成滑动窗口视图，完美避开 CPU Dataloader 瓶颈
         self.X = X_tensor.unfold(dimension=0, size=seq_len, step=1).transpose(1, 2).contiguous()
         self.Y = Y_tensor[seq_len - 1:]
+        raw_data = Y_raw[:train_end] if is_train else Y_raw[val_start_idx:]
+        self.Y_raw = torch.tensor(raw_data, dtype=torch.float32, device=device)[seq_len - 1:]
 
     def __len__(self):
         return len(self.X)
@@ -107,9 +171,9 @@ class CryptoDatasetGPU(Dataset):
 # ==========================================
 def train_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"*_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
+    parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"{SYMBOL}_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
     if not parquet_files:
-        print("❌ 未找到特征宽表！")
+        print(f"❌ 未找到 {SYMBOL} / {FORECAST_HORIZON}h 对应的特征宽表！")
         return
     DATA_PATH = parquet_files[-1]
     
@@ -144,14 +208,20 @@ def train_model():
     
     weights = torch.ones(3, dtype=torch.float32, device=DEVICE)
     valid_mask = class_counts > 0
-    # sklearn 'balanced' 逻辑的原生 PyTorch 实现
-    weights[valid_mask] = total_samples / (num_valid_classes * class_counts[valid_mask])
+    # 反频率权重容易把 softmax 概率校准拉歪；sqrt 权重保留稀有类别补偿，但更稳。
+    balanced_weights = total_samples / (num_valid_classes * class_counts[valid_mask])
+    weights[valid_mask] = balanced_weights.pow(CLASS_WEIGHT_POWER)
+    weights = weights / weights[valid_mask].mean().clamp_min(1e-9)
     
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    try:
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=LABEL_SMOOTHING)
+    except TypeError:
+        criterion = nn.CrossEntropyLoss(weight=weights)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-7)
     scaler = torch.amp.GradScaler('cuda')
     
     best_val_loss = float('inf')
+    best_selection_score = -float('inf')
     patience, patience_counter = 16, 0
     
     # 🚨 新增：提取验证集标签分布，防范 Regime Shift (环境突变)
@@ -192,6 +262,7 @@ def train_model():
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         val_preds_list = []
+        val_logits_list = []
         
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
@@ -202,6 +273,7 @@ def train_model():
                 val_loss += v_loss.item()
                 preds = torch.argmax(output, dim=1)
                 val_preds_list.append(preds)
+                val_logits_list.append(output.float().detach())
                 val_correct += (preds == batch_y).sum().item()
                 val_total += batch_y.size(0)
                 
@@ -211,14 +283,21 @@ def train_model():
         
         # 🚨 诊断打印：监控模型是否摆烂（只预测震荡类1）
         all_val_preds = torch.cat(val_preds_list)
+        all_val_logits = torch.cat(val_logits_list)
+        alpha_metrics = compute_validation_alpha_metrics(all_val_logits, val_set.Y, val_set.Y_raw)
         pred_dist = torch.bincount(all_val_preds, minlength=3).cpu().numpy()
         
         print(f"Epoch [{epoch+1:02d}/{EPOCHS}] LR: {optimizer.param_groups[0]['lr']:.2e} | "
               f"T_Loss: {avg_train_loss:.4f} | V_Loss: {avg_val_loss:.4f} (Acc: {val_acc:.2f}%) "
+              f"| RankIC: {alpha_metrics['rank_ic']:+.4f} | Top精度: {alpha_metrics['top_precision']:.2%} "
+              f"| Spread: {alpha_metrics['tail_return_spread']:+.4f} | Score: {alpha_metrics['selection_score']:+.4f} "
               f"| 预测分布[空, 平, 多]: {pred_dist}")
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+
+        if alpha_metrics["selection_score"] > best_selection_score:
+            best_selection_score = alpha_metrics["selection_score"]
             patience_counter = 0
             
             # 🚨 修复：保存极其详尽的模型元数据，防止实盘加载时架构碎裂
@@ -239,10 +318,18 @@ def train_model():
                 'model_state_dict': model.state_dict(),
                 'feature_cols': train_set.feature_cols,
                 # 🚨 补回：性能基准元数据，用于后续模型对比与实盘心跳校验
-                'val_loss': best_val_loss,
-                'val_acc': val_acc
+                'val_loss': avg_val_loss,
+                'best_observed_val_loss': best_val_loss,
+                'val_acc': val_acc,
+                'selection_score': best_selection_score,
+                'rank_ic': alpha_metrics["rank_ic"],
+                'top_precision': alpha_metrics["top_precision"],
+                'precision_edge': alpha_metrics["precision_edge"],
+                'tail_return_spread': alpha_metrics["tail_return_spread"],
+                'label_smoothing': LABEL_SMOOTHING,
+                'class_weight_power': CLASS_WEIGHT_POWER,
             }, save_path)
-            print(f"    ⭐ 新权重及完整元数据已保存! (V_Loss: {best_val_loss:.4f})")
+            print(f"    ⭐ 新权重及完整元数据已保存! (Score: {best_selection_score:+.4f} | Best V_Loss: {best_val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:

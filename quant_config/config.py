@@ -67,11 +67,11 @@ LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 7.0))
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.04))           
-HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.04))
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.02))           
+HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.015))
 # 追踪止盈回撤宽度：ATR(period) × multi / entry_price，替代固定 1% 回撤。
 TRAILING_ATR_PERIOD = int(os.environ.get("OPT_TRAILING_ATR_PERIOD", 14))
-TRAILING_ATR_MULTI = float(os.environ.get("OPT_TRAILING_ATR_MULTI", 5.0))
+TRAILING_ATR_MULTI = float(os.environ.get("OPT_TRAILING_ATR_MULTI", 3.5))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
@@ -118,10 +118,10 @@ LIVE_SYMBOL_CONFIGS = {
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-6))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-5))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 128))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
-DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.2))
+DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.3))
 
 CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))
