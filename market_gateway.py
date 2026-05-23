@@ -62,12 +62,16 @@ LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = LIVE_DATA_DIR / "gateway_state.db"
 DERIVATIVE_HISTORY_WINDOW_MS = DERIVATIVE_LOOKBACK_HOURS * 3600000
 PROCESSED_DERIVATIVE_CANDIDATE_DIRS = [PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR]
+DERIVATIVE_METRIC_KEYS = {
+    "premium_history": "premium_close",
+    "funding_history": "funding_rate",
+    "oi_history": "sum_open_interest",
+}
 
 
 def print_gateway_data_chain():
-    print("🧭 [网关链路] 1h K线: TEMP_DIR/raw_1h.parquet -> SQLite 本地底座 -> Binance REST 补洞 -> WS 实时续流")
-    print("🧭 [网关链路] 1m 显微镜: TEMP_DIR/raw_1m.parquet -> Binance REST 差量补齐 -> WS 实时续流")
-    print("🧭 [网关链路] 衍生品: Binance REST 最新时序 -> TEMP_DIR 原始 premium/funding/metrics -> processed 特征文件兜底")
+    print("🧭 [网关链路] 启动恢复顺序: SQLite 自身记忆库 -> 训练集缓存/processed -> Binance API 缺口补齐")
+    print("🧭 [网关链路] 实时落库范围: 1h K线+订单流、1m 显微镜、premium/funding/OI 衍生品时序")
 
 
 def _is_temporal_dtype(dtype):
@@ -122,8 +126,8 @@ def _load_cached_1m_history(symbol, cutoff_ts_ms):
         return []
 
 
-def seed_sqlite_from_cached_1h(symbol):
-    """启动阶段优先用本地 raw_1h.parquet 填充 SQLite 底座。"""
+def seed_sqlite_from_training_1h(symbol):
+    """用训练集 raw_1h.parquet 补 SQLite 缺口，保留自身数据库已有记录。"""
     raw_1h_path = TEMP_DIR / "klines" / symbol / f"{symbol}_raw_1h.parquet"
     if not raw_1h_path.exists():
         return 0
@@ -175,14 +179,12 @@ def seed_sqlite_from_cached_1h(symbol):
                 None,
             ))
 
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
-            conn.commit()
+        insert_ignore_memory_1h_records(records)
 
-        print(f"   ♻️ [1h本地缓存] {symbol} 已从 raw_1h.parquet 注入 SQLite 底座 {len(records)} 根。")
+        print(f"   ♻️ [1h训练集补齐] {symbol} 已扫描 raw_1h.parquet {len(records)} 根，缺口已写入 SQLite。")
         return len(records)
     except Exception as e:
-        print(f"   ⚠️ [1h本地缓存] {symbol} 注入 SQLite 失败: {e}")
+        print(f"   ⚠️ [1h训练集补齐] {symbol} 注入 SQLite 失败: {e}")
         return 0
 
 
@@ -428,6 +430,165 @@ def merge_derivative_history(primary_history, offline_history, cutoff_ts_ms):
 
     return [[ts, merged[ts]] for ts in sorted(merged) if ts >= cutoff_ts_ms]
 
+
+def upsert_memory_1h_records(records):
+    if not records:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT INTO memory_1h (
+                symbol, timestamp, open, high, low, close, volume,
+                quote_volume, count, taker_buy_volume, taker_sell_volume,
+                whale_buy, whale_sell, retail_vol
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, timestamp) DO UPDATE SET
+                open=excluded.open,
+                high=excluded.high,
+                low=excluded.low,
+                close=excluded.close,
+                volume=excluded.volume,
+                quote_volume=COALESCE(excluded.quote_volume, memory_1h.quote_volume),
+                count=COALESCE(excluded.count, memory_1h.count),
+                taker_buy_volume=COALESCE(excluded.taker_buy_volume, memory_1h.taker_buy_volume),
+                taker_sell_volume=COALESCE(excluded.taker_sell_volume, memory_1h.taker_sell_volume),
+                whale_buy=COALESCE(excluded.whale_buy, memory_1h.whale_buy),
+                whale_sell=COALESCE(excluded.whale_sell, memory_1h.whale_sell),
+                retail_vol=COALESCE(excluded.retail_vol, memory_1h.retail_vol)
+            """,
+            records,
+        )
+        conn.commit()
+
+
+def insert_ignore_memory_1h_records(records):
+    if not records:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            records,
+        )
+        conn.commit()
+
+
+def upsert_memory_1m_records(symbol, candles):
+    records = [
+        (symbol, int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
+        for k in (candles or [])
+        if len(k) >= 6
+    ]
+    if not records:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT INTO memory_1m (symbol, timestamp, open, high, low, close, volume)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, timestamp) DO UPDATE SET
+                open=excluded.open,
+                high=excluded.high,
+                low=excluded.low,
+                close=excluded.close,
+                volume=excluded.volume
+            """,
+            records,
+        )
+        conn.commit()
+
+
+def insert_ignore_memory_1m_records(symbol, candles):
+    records = [
+        (symbol, int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
+        for k in (candles or [])
+        if len(k) >= 6
+    ]
+    if not records:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO memory_1m VALUES (?,?,?,?,?,?,?)",
+            records,
+        )
+        conn.commit()
+
+
+def upsert_derivative_history_records(symbol, hist_key, history):
+    metric = DERIVATIVE_METRIC_KEYS.get(hist_key)
+    if not metric:
+        return
+
+    records = [
+        (symbol, metric, int(row[0]), float(row[1]))
+        for row in (history or [])
+        if len(row) == 2 and row[1] is not None
+    ]
+    if not records:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT INTO derivative_history (symbol, metric, timestamp, value)
+            VALUES (?,?,?,?)
+            ON CONFLICT(symbol, metric, timestamp) DO UPDATE SET value=excluded.value
+            """,
+            records,
+        )
+        conn.commit()
+
+
+def load_memory_1h_rows(symbol, limit=DERIVATIVE_LOOKBACK_HOURS):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT ?",
+            (symbol, limit),
+        )
+        rows = cursor.fetchall()
+    rows.reverse()
+    return rows
+
+
+def load_memory_1m_history(symbol, cutoff_ts_ms):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT timestamp, open, high, low, close, volume
+            FROM memory_1m
+            WHERE symbol=? AND timestamp>=?
+            ORDER BY timestamp ASC
+            """,
+            (symbol, cutoff_ts_ms),
+        )
+        return [
+            [int(ts), float(o), float(h), float(l), float(c), float(v)]
+            for ts, o, h, l, c, v in cursor.fetchall()
+        ][-ONE_MINUTE_HISTORY_LIMIT:]
+
+
+def load_derivative_history_from_db(symbol, hist_key, cutoff_ts_ms):
+    metric = DERIVATIVE_METRIC_KEYS[hist_key]
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT timestamp, value
+            FROM derivative_history
+            WHERE symbol=? AND metric=? AND timestamp>=?
+            ORDER BY timestamp ASC
+            """,
+            (symbol, metric, cutoff_ts_ms),
+        )
+        return [[int(ts), float(value)] for ts, value in cursor.fetchall()]
+
+
 def init_sqlite_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -441,6 +602,25 @@ def init_sqlite_db():
                 PRIMARY KEY (symbol, timestamp)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_1m (
+                symbol TEXT,
+                timestamp INTEGER,
+                open REAL, high REAL, low REAL, close REAL, volume REAL,
+                PRIMARY KEY (symbol, timestamp)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS derivative_history (
+                symbol TEXT,
+                metric TEXT,
+                timestamp INTEGER,
+                value REAL,
+                PRIMARY KEY (symbol, metric, timestamp)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_1m_symbol_ts ON memory_1m(symbol, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_derivative_symbol_metric_ts ON derivative_history(symbol, metric, timestamp)")
 init_sqlite_db()
 
 
@@ -450,6 +630,28 @@ def build_exchange(is_spot):
     return exchange_cls({
         "enableRateLimit": True,
     })
+
+
+def should_log_derivative_error(error_state, endpoint, e, throttle_seconds=300):
+    """同类 REST 错误节流，避免地区/网络不可用时每分钟刷屏。"""
+    now = time.time()
+    signature = f"{type(e).__name__}:{str(e)[:180]}"
+    previous = error_state.get(endpoint)
+    if previous and previous["signature"] == signature and now - previous["last_log_ts"] < throttle_seconds:
+        return False
+    error_state[endpoint] = {"signature": signature, "last_log_ts": now}
+    return True
+
+
+async def safe_derivative_request(symbol, endpoint, request_factory, error_state):
+    """单端点容错：一个 Binance 衍生品接口失败时，不阻断其它接口更新。"""
+    try:
+        async with rest_semaphore:
+            return await request_factory()
+    except Exception as e:
+        if should_log_derivative_error(error_state, endpoint, e):
+            print(f"   ⚠️ [REST 衍生品{endpoint}失败] {symbol}: {type(e).__name__} -> {e}；保留上一轮/本地兜底数据。")
+        return None
 
 # ==========================================
 # 🛰️ WebSocket 搬运工：死循环监听流
@@ -513,6 +715,18 @@ async def ohlcv_loop(exchange, symbol, swap_symbol, timeframe, engine_type, star
                     q[-1] = candle
                 else:
                     q.append(candle)
+
+                if timeframe == "1h":
+                    stats = market_data_store[symbol].get("taker_stats_1h", {}).get(int(candle[0]), {})
+                    record = (
+                        symbol, int(candle[0]), float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[5]),
+                        stats.get("quote_volume"), stats.get("count"),
+                        stats.get("taker_buy_volume"), stats.get("taker_sell_volume"),
+                        stats.get("whale_buy"), stats.get("whale_sell"), stats.get("retail_vol"),
+                    )
+                    await asyncio.to_thread(upsert_memory_1h_records, [record])
+                elif timeframe == "1m":
+                    await asyncio.to_thread(upsert_memory_1m_records, symbol, [candle])
                     
         except Exception as e:
             was_dead, retry_delay, sleep_time = await handle_ws_exception(
@@ -688,6 +902,19 @@ async def trade_loop(exchange, symbol, swap_symbol, engine_type, startup_delay):
                         
                 if cost <= RETAIL_NOTIONAL_THRESHOLD_USDT:
                     stats["retail_vol"] += amount
+
+            latest_candle = market_data_store[symbol]["1h"][-1] if market_data_store[symbol]["1h"] else None
+            if latest_candle:
+                ts = int(latest_candle[0])
+                stats = market_data_store[symbol]["taker_stats_1h"].get(ts, {})
+                record = (
+                    symbol, ts,
+                    float(latest_candle[1]), float(latest_candle[2]), float(latest_candle[3]), float(latest_candle[4]), float(latest_candle[5]),
+                    stats.get("quote_volume"), stats.get("count"),
+                    stats.get("taker_buy_volume"), stats.get("taker_sell_volume"),
+                    stats.get("whale_buy"), stats.get("whale_sell"), stats.get("retail_vol"),
+                )
+                await asyncio.to_thread(upsert_memory_1h_records, [record])
             
             # 定期垃圾回收：配合 1250 小时的回溯需求，延长保留期
             current_hour = int(datetime.utcnow().timestamp() / 3600) * 3600000
@@ -727,125 +954,95 @@ async def derivatives_loop(exchange, symbol, swap_symbol, engine_type):
     await asyncio.sleep(random.uniform(5.0, 25.0))
     
     raw_sym = exchange.market_id(swap_symbol)
+    error_state = {}
 
     while True:
-        try:
-            # 1. 维护 1h 溢价指数时序 (Premium Index)
-            async with rest_semaphore:
-                prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({
+        # 1. 维护 1h 溢价指数时序 (Premium Index)
+        prem_klines = await safe_derivative_request(
+            symbol,
+            "PremiumIndexKlines",
+            lambda: exchange.fapiPublicGetPremiumIndexKlines({
                     'symbol': raw_sym, 'interval': '1h', 'limit': 2
-                })
-            if prem_klines:
-                hist = market_data_store[symbol].setdefault("premium_history", [])
-                for k in prem_klines:
-                    ts, val = int(k[0]), float(k[4]) # 4 is close
-                    if not hist or ts > hist[-1][0]:
-                        hist.append([ts, val])
-                    elif ts == hist[-1][0]:
-                        hist[-1] = [ts, val]
+            }),
+            error_state,
+        )
+        if prem_klines:
+            hist = market_data_store[symbol].setdefault("premium_history", [])
+            changed_rows = []
+            for k in prem_klines:
+                ts, val = int(k[0]), float(k[4]) # 4 is close
+                if not hist or ts > hist[-1][0]:
+                    hist.append([ts, val])
+                    changed_rows.append([ts, val])
+                elif ts == hist[-1][0]:
+                    hist[-1] = [ts, val]
+                    changed_rows.append([ts, val])
+            if changed_rows:
+                await asyncio.to_thread(upsert_derivative_history_records, symbol, "premium_history", changed_rows)
 
-            # 2. 维护 1h 未平仓合约量时序 (Open Interest)
-            async with rest_semaphore:
-                oi_hist_data = await exchange.fapiDataGetOpenInterestHist({
+        # 2. 维护 1h 未平仓合约量时序 (Open Interest)
+        oi_hist_data = await safe_derivative_request(
+            symbol,
+            "OpenInterestHist",
+            lambda: exchange.fapiDataGetOpenInterestHist({
                     'symbol': raw_sym, 'period': '1h', 'limit': 2
-                })
-            if oi_hist_data:
-                hist = market_data_store[symbol].setdefault("oi_history", [])
-                for x in oi_hist_data:
-                    ts, val = int(x['timestamp']), float(x['sumOpenInterest'])
-                    if not hist or ts > hist[-1][0]:
-                        hist.append([ts, val])
-                    elif ts == hist[-1][0]:
-                        hist[-1] = [ts, val]
+            }),
+            error_state,
+        )
+        if oi_hist_data:
+            hist = market_data_store[symbol].setdefault("oi_history", [])
+            changed_rows = []
+            for x in oi_hist_data:
+                ts, val = int(x['timestamp']), float(x['sumOpenInterest'])
+                if not hist or ts > hist[-1][0]:
+                    hist.append([ts, val])
+                    changed_rows.append([ts, val])
+                elif ts == hist[-1][0]:
+                    hist[-1] = [ts, val]
+                    changed_rows.append([ts, val])
+            if changed_rows:
+                await asyncio.to_thread(upsert_derivative_history_records, symbol, "oi_history", changed_rows)
 
-            # 3. 维护资金费率时序 (Funding Rate)
-            async with rest_semaphore:
-                fr_hist_data = await exchange.fapiPublicGetFundingRate({
+        # 3. 维护资金费率时序 (Funding Rate)
+        fr_hist_data = await safe_derivative_request(
+            symbol,
+            "FundingRate",
+            lambda: exchange.fapiPublicGetFundingRate({
                     'symbol': raw_sym, 'limit': 2
-                })
-            if fr_hist_data:
-                hist = market_data_store[symbol].setdefault("funding_history", [])
-                for x in fr_hist_data:
-                    ts, val = int(x['fundingTime']), float(x['fundingRate'])
-                    if not hist or ts > hist[-1][0]:
-                        hist.append([ts, val])
-                    elif ts == hist[-1][0]:
-                        hist[-1] = [ts, val]
+            }),
+            error_state,
+        )
+        if fr_hist_data:
+            hist = market_data_store[symbol].setdefault("funding_history", [])
+            changed_rows = []
+            for x in fr_hist_data:
+                ts, val = int(x['fundingTime']), float(x['fundingRate'])
+                if not hist or ts > hist[-1][0]:
+                    hist.append([ts, val])
+                    changed_rows.append([ts, val])
+                elif ts == hist[-1][0]:
+                    hist[-1] = [ts, val]
+                    changed_rows.append([ts, val])
+            if changed_rows:
+                await asyncio.to_thread(upsert_derivative_history_records, symbol, "funding_history", changed_rows)
 
-            # ==========================================
-            # 🧹 内存泄露防护：控制历史数组的最大长度，但必须保留完整 1250h 推理窗口
-            # ==========================================
-            for key in ["premium_history", "oi_history", "funding_history"]:
-                if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > DERIVATIVE_LOOKBACK_HOURS + 64:
-                    market_data_store[symbol][key] = market_data_store[symbol][key][-(DERIVATIVE_LOOKBACK_HOURS + 64):]
-
-        except Exception as e:
-            # 去除之前的 pass，将网络抖动和底层 API 拒载显式抛出
-            print(f"   ⚠️ [REST 衍生品轮询异常] {symbol} 发生级联错误: {type(e).__name__} -> {e}")
+        # ==========================================
+        # 🧹 内存泄露防护：控制历史数组的最大长度，但必须保留完整 1250h 推理窗口
+        # ==========================================
+        for key in ["premium_history", "oi_history", "funding_history"]:
+            if key in market_data_store[symbol] and len(market_data_store[symbol][key]) > DERIVATIVE_LOOKBACK_HOURS + 64:
+                market_data_store[symbol][key] = market_data_store[symbol][key][-(DERIVATIVE_LOOKBACK_HOURS + 64):]
             
         # 轮询抖动设计：防止触发 Binance 每分钟请求权重超限
         await asyncio.sleep(60 + random.uniform(0, 5.0))
 
-async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
-    """
-    自愈式预热：检查本地库是否存在时间空隙 (Gaps)，发现即重拉，绝不补0。
-    """
-    print(f"🔍 [网关自愈] 正在校验 {symbol} 历史数据的连续性...")
 
-    await asyncio.to_thread(seed_sqlite_from_cached_1h, symbol)
-    
-    with sqlite3.connect(DB_PATH) as conn:
-        # 获取最近 1000 根 K 线的时间戳
-        cursor = conn.cursor()
-        cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
-        ts_list = [r[0] for r in cursor.fetchall()]
-
-    if len(ts_list) < 1250:
-        print(f"   ⚠️ {symbol} 历史数据不足 1250 根 (当前 {len(ts_list)} 根)，正在向过去回溯拉取...")
-        oldest_ts = ts_list[-1] if ts_list else int(time.time() * 1000)
-        
-        while len(ts_list) < 1250:
-            missing = 1250 - len(ts_list)
-            batch = min(missing, 1000)
-            target_start = oldest_ts - batch * 3600000
-            await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=target_start, limit=batch)
-            oldest_ts = target_start
-            await asyncio.sleep(0.5)
-            
-            with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT timestamp FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
-                ts_list = [r[0] for r in cursor.fetchall()]
-
-    # 检查时间轴空隙
-    ts_list.reverse()
-    gaps = []
-    for i in range(len(ts_list) - 1):
-        if ts_list[i+1] - ts_list[i] != 3600000: # 1h 差值应为 3600000ms
-            gaps.append((ts_list[i], ts_list[i+1]))
-    
-    if gaps:
-        print(f"   ⚠️ {symbol} 侦测到 {len(gaps)} 处数据空隙，正在强制回填物理数据...")
-        for start, end in gaps:
-            # 针对每一处空隙，精准拉取
-            await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=start+1, limit=500)
-    else:
-        print(f"   ✅ {symbol} 时间轴完美连续。")
-
-    # 🚨 触发一次性回填
-    if not is_spot:
-        await sync_local_aggtrades_to_db(symbol)
-        await backfill_recent_aggtrades_from_rest(exchange, symbol, swap_symbol)
-
-    # 🚨 在所有回填结束后，重新从数据库加载完整无缝的底座特征到内存
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM memory_1h WHERE symbol=? ORDER BY timestamp DESC LIMIT 1250", (symbol,))
-        final_rows = cursor.fetchall()
-        
-    final_rows.reverse()
+def hydrate_1h_memory_from_rows(symbol, rows, is_spot):
     market_data_store[symbol]["1h"].clear()
-    for r in final_rows:
+    if not is_spot:
+        market_data_store[symbol]["taker_stats_1h"].clear()
+
+    for r in rows:
         ts = r[1]
         market_data_store[symbol]["1h"].append([ts, r[2], r[3], r[4], r[5], r[6]])
         if not is_spot:
@@ -856,77 +1053,186 @@ async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
             }
 
 
-    # === 新增：网关包揽 1m K线与所有衍生品的历史时序拉取 ===
+def find_1h_gaps(timestamps):
+    return [
+        (timestamps[i], timestamps[i + 1])
+        for i in range(len(timestamps) - 1)
+        if timestamps[i + 1] - timestamps[i] != 3600000
+    ]
+
+
+async def backfill_1h_from_api(exchange, symbol, swap_symbol, is_spot, start_ts, end_ts):
+    cursor = start_ts
+    while cursor <= end_ts:
+        await fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=cursor, limit=1000)
+        cursor += 1000 * 3600000
+        await asyncio.sleep(0.2)
+
+
+async def load_1m_sqlite_training_api(exchange, symbol, swap_symbol):
+    end_time = int(time.time() * 1000)
+    cutoff_ts_ms = end_time - DERIVATIVE_LOOKBACK_HOURS * 3600000
+
+    print(f"🔍 [网关自愈] 1m 链路: SQLite -> 训练集 raw_1m -> Binance API 缺口补齐...")
+    all_1m = await asyncio.to_thread(load_memory_1m_history, symbol, cutoff_ts_ms)
+    if all_1m:
+        print(f"   ✅ [1m SQLite] {symbol} 已恢复 {len(all_1m)} 根。")
+    else:
+        print(f"   ⏳ [1m SQLite] {symbol} 暂无本地记忆，尝试训练集补齐。")
+
+    training_1m = await asyncio.to_thread(_load_cached_1m_history, symbol, cutoff_ts_ms)
+    if training_1m:
+        await asyncio.to_thread(insert_ignore_memory_1m_records, symbol, training_1m)
+        all_1m = await asyncio.to_thread(load_memory_1m_history, symbol, cutoff_ts_ms)
+
+    curr_ts = all_1m[-1][0] + 60000 if all_1m else cutoff_ts_ms
+    if curr_ts < end_time:
+        print(f"   🔎 [1m API补洞] {symbol} 从 {datetime.utcfromtimestamp(curr_ts / 1000):%Y-%m-%d %H:%M} UTC 补到当前。")
+
+    while curr_ts < end_time:
+        async with rest_semaphore:
+            batch = await exchange.fetch_ohlcv(swap_symbol, '1m', since=curr_ts, limit=1500)
+        if not batch:
+            break
+        await asyncio.to_thread(upsert_memory_1m_records, symbol, batch)
+        curr_ts = int(batch[-1][0]) + 60000
+        await asyncio.sleep(0.1)
+
+    all_1m = await asyncio.to_thread(load_memory_1m_history, symbol, cutoff_ts_ms)
+    market_data_store[symbol]["1m"].clear()
+    market_data_store[symbol]["1m"].extend(all_1m)
+    print(f"   ✅ {symbol} 1m 高频数据装填完毕，共 {len(all_1m)} 根。")
+
+
+async def fetch_derivatives_from_api(exchange, symbol, swap_symbol, cutoff_ts_ms):
+    raw_sym = exchange.market_id(swap_symbol)
+    end_time = int(time.time() * 1000)
+    result = {}
+
+    try:
+        async with rest_semaphore:
+            prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 1500})
+        result["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines if int(k[0]) >= cutoff_ts_ms]
+    except Exception as e:
+        print(f"   ⚠️ {symbol} premium API 补齐失败: {e}")
+
+    try:
+        async with rest_semaphore:
+            fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
+        result["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist if int(x['fundingTime']) >= cutoff_ts_ms]
+    except Exception as e:
+        print(f"   ⚠️ {symbol} funding API 补齐失败: {e}")
+
+    try:
+        oi_hist = []
+        curr_end = end_time
+        while len(oi_hist) < DERIVATIVE_LOOKBACK_HOURS:
+            async with rest_semaphore:
+                batch = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
+            if not batch:
+                break
+            oi_hist = batch + oi_hist
+            curr_end = int(batch[0]['timestamp']) - 1
+            await asyncio.sleep(0.2)
+        result["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist if int(x['timestamp']) >= cutoff_ts_ms]
+    except Exception as e:
+        print(f"   ⚠️ {symbol} open interest API 补齐失败: {e}")
+
+    return result
+
+
+async def smart_warmup_and_recover(exchange, symbol, swap_symbol, is_spot):
+    """
+    自愈式预热：SQLite 自身库优先，训练集补缺，其余缺口再请求 API。
+    """
+    print(f"🔍 [网关自愈] {symbol} 1h 链路: SQLite -> 训练集 raw_1h -> Binance API 缺口补齐...")
+
+    rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+    print(f"   ✅ [1h SQLite] {symbol} 已恢复 {len(rows)} 根。")
+
+    if len(rows) < DERIVATIVE_LOOKBACK_HOURS:
+        print(f"   ⏳ [1h训练集补齐] {symbol} SQLite 不足 {DERIVATIVE_LOOKBACK_HOURS} 根，扫描训练缓存。")
+        await asyncio.to_thread(seed_sqlite_from_training_1h, symbol)
+        rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+
+    timestamps = [int(r[1]) for r in rows]
+    target_latest_hour = int(time.time() / 3600) * 3600000
+
+    if timestamps:
+        newest_ts = timestamps[-1]
+        if newest_ts + 3600000 < target_latest_hour:
+            print(f"   🔎 [1h API补洞] {symbol} 本地最新到 {datetime.utcfromtimestamp(newest_ts / 1000):%Y-%m-%d %H:%M} UTC，补齐到当前小时。")
+            await backfill_1h_from_api(exchange, symbol, swap_symbol, is_spot, newest_ts + 3600000, target_latest_hour)
+            rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+            timestamps = [int(r[1]) for r in rows]
+    else:
+        print(f"   🔎 [1h API补洞] {symbol} SQLite/训练集均无数据，直接从 API 回填最近窗口。")
+        await backfill_1h_from_api(
+            exchange,
+            symbol,
+            swap_symbol,
+            is_spot,
+            target_latest_hour - (DERIVATIVE_LOOKBACK_HOURS - 1) * 3600000,
+            target_latest_hour,
+        )
+        rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+        timestamps = [int(r[1]) for r in rows]
+
+    if len(rows) < DERIVATIVE_LOOKBACK_HOURS and timestamps:
+        missing = DERIVATIVE_LOOKBACK_HOURS - len(rows)
+        oldest_ts = timestamps[0]
+        print(f"   🔎 [1h API回溯] {symbol} 仍缺 {missing} 根，向过去回溯补齐。")
+        await backfill_1h_from_api(
+            exchange,
+            symbol,
+            swap_symbol,
+            is_spot,
+            oldest_ts - missing * 3600000,
+            oldest_ts - 3600000,
+        )
+        rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+        timestamps = [int(r[1]) for r in rows]
+
+    gaps = find_1h_gaps(timestamps)
+    if gaps:
+        print(f"   ⚠️ {symbol} 侦测到 {len(gaps)} 处 1h 空隙，使用 API 精准回填。")
+        for start, end in gaps:
+            await backfill_1h_from_api(exchange, symbol, swap_symbol, is_spot, start + 3600000, end - 3600000)
+        rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
+        timestamps = [int(r[1]) for r in rows]
+
+    if not find_1h_gaps(timestamps):
+        print(f"   ✅ {symbol} 1h 时间轴连续。")
+
+    # 🚨 触发一次性回填
     if not is_spot:
-        print(f"🔍 [网关自愈] 正在拉取 {symbol} 衍生品时序与 1m 显微镜底座...")
-        end_time = int(time.time() * 1000)
-        cutoff_ts_ms = end_time - DERIVATIVE_HISTORY_WINDOW_MS
-        try:
-            print(f"🔍 [网关自愈] 1m 链路: 先读本地 raw_1m 缓存，再用 REST 补最新缺口...")
-            start_time = end_time - 1250 * 3600 * 1000 # 匹配 1250 小时回溯
-            all_1m = _load_cached_1m_history(symbol, start_time)
-            curr_ts = all_1m[-1][0] + 60000 if all_1m else start_time
+        await sync_local_aggtrades_to_db(symbol)
+        await backfill_recent_aggtrades_from_rest(exchange, symbol, swap_symbol)
+        rows = await asyncio.to_thread(load_memory_1h_rows, symbol, DERIVATIVE_LOOKBACK_HOURS)
 
-            if not all_1m:
-                print(f"   ⏳ [1m本地缓存] {symbol} 未命中 raw_1m.parquet，直接走 REST 拉取。")
+    hydrate_1h_memory_from_rows(symbol, rows, is_spot)
 
-            while curr_ts < end_time:
-                batch = await exchange.fetch_ohlcv(swap_symbol, '1m', since=curr_ts, limit=1500)
-                if not batch:
-                    break
-                all_1m.extend(batch)
-                curr_ts = batch[-1][0] + 60000 # 步进 1 分钟
-                await asyncio.sleep(0.1) # 防护 API 速率限制
+    if not is_spot:
+        await load_1m_sqlite_training_api(exchange, symbol, swap_symbol)
 
-            if all_1m:
-                dedup_1m = {int(row[0]): row for row in all_1m if len(row) >= 6}
-                all_1m = [dedup_1m[ts] for ts in sorted(dedup_1m)][-ONE_MINUTE_HISTORY_LIMIT:]
-            market_data_store[symbol]["1m"].clear()
-            market_data_store[symbol]["1m"].extend(all_1m)
-            print(f"   ✅ {symbol} 1m 高频数据装填完毕，共 {len(all_1m)} 根。")
-
-            raw_sym = exchange.market_id(swap_symbol)
-
-            try:
-                prem_klines = await exchange.fapiPublicGetPremiumIndexKlines({'symbol': raw_sym, 'interval': '1h', 'limit': 1500})
-                market_data_store[symbol]["premium_history"] = [[int(k[0]), float(k[4])] for k in prem_klines]
-            except Exception as e:
-                print(f"   ⚠️ {symbol} premium 历史拉取失败: {e}")
-
-            try:
-                fr_hist = await exchange.fapiPublicGetFundingRate({'symbol': raw_sym, 'limit': 500})
-                market_data_store[symbol]["funding_history"] = [[int(x['fundingTime']), float(x['fundingRate'])] for x in fr_hist]
-            except Exception as e:
-                print(f"   ⚠️ {symbol} funding 历史拉取失败: {e}")
-
-            try:
-                oi_hist = []
-                curr_end = end_time
-                while len(oi_hist) < DERIVATIVE_LOOKBACK_HOURS:
-                    batch = await exchange.fapiDataGetOpenInterestHist({'symbol': raw_sym, 'period': '1h', 'limit': 500, 'endTime': curr_end})
-                    if not batch:
-                        break
-                    oi_hist = batch + oi_hist
-                    curr_end = int(batch[0]['timestamp']) - 1
-                    await asyncio.sleep(0.2)
-                market_data_store[symbol]["oi_history"] = [[int(x['timestamp']), float(x['sumOpenInterest'])] for x in oi_hist]
-            except Exception as e:
-                print(f"   ⚠️ {symbol} open interest 历史拉取失败: {e}")
-
-        except Exception as e:
-            print(f"⚠️ {symbol} 衍生品/1m 预热阶段异常: {e}")
-
-        print(f"🔍 [网关自愈] 衍生品链路: API 最新值 -> TEMP_DIR 原始缓存 -> processed 兜底...")
+        print(f"🔍 [网关自愈] 衍生品链路: SQLite -> 训练集缓存/processed -> Binance API 最新补齐...")
+        cutoff_ts_ms = int(time.time() * 1000) - DERIVATIVE_HISTORY_WINDOW_MS
+        db_derivatives = {
+            hist_key: await asyncio.to_thread(load_derivative_history_from_db, symbol, hist_key, cutoff_ts_ms)
+            for hist_key in DERIVATIVE_METRIC_KEYS
+        }
         temp_derivatives = await asyncio.to_thread(load_tempdir_derivative_history, symbol, cutoff_ts_ms)
         processed_derivatives = await asyncio.to_thread(load_processed_derivative_history, symbol, cutoff_ts_ms)
-        for hist_key in ["premium_history", "funding_history", "oi_history"]:
-            api_hist = market_data_store[symbol].get(hist_key, [])
-            temp_hist = temp_derivatives.get(hist_key, [])
-            processed_hist = processed_derivatives.get(hist_key, [])
-            merged_hist = merge_derivative_history(api_hist, temp_hist, cutoff_ts_ms)
-            merged_hist = merge_derivative_history(merged_hist, processed_hist, cutoff_ts_ms)
+        api_derivatives = await fetch_derivatives_from_api(exchange, symbol, swap_symbol, cutoff_ts_ms)
+
+        for hist_key in DERIVATIVE_METRIC_KEYS:
+            merged_hist = merge_derivative_history(db_derivatives.get(hist_key, []), temp_derivatives.get(hist_key, []), cutoff_ts_ms)
+            merged_hist = merge_derivative_history(merged_hist, processed_derivatives.get(hist_key, []), cutoff_ts_ms)
+            merged_hist = merge_derivative_history(api_derivatives.get(hist_key, []), merged_hist, cutoff_ts_ms)
             if merged_hist:
-                market_data_store[symbol][hist_key] = merged_hist
+                market_data_store[symbol][hist_key] = merged_hist[-(DERIVATIVE_LOOKBACK_HOURS + 64):]
+                await asyncio.to_thread(upsert_derivative_history_records, symbol, hist_key, market_data_store[symbol][hist_key])
+                print(f"   ✅ [衍生品装填] {symbol} {hist_key} 共 {len(market_data_store[symbol][hist_key])} 点。")
 async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTime=None, limit=500):
     """通用拉取并落库逻辑，直接从交易所获取物理真实 K 线"""
     params = {'startTime': startTime} if startTime else {}
@@ -951,12 +1257,7 @@ async def fetch_and_store_range(exchange, symbol, swap_symbol, is_spot, startTim
             ))
         
         if new_records:
-            # 🚨 修正：将同步 I/O 踢入后台线程池，释放事件循环
-            def _write_db():
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new_records)
-                    conn.commit()
-            await asyncio.to_thread(_write_db)
+            await asyncio.to_thread(upsert_memory_1h_records, new_records)
             
     except Exception as e:
         print(f"   ❌ {symbol} 物理回填失败: {e}")
@@ -1141,12 +1442,15 @@ async def db_persist_loop():
                     stats.get("whale_buy", None), stats.get("whale_sell", None), stats.get("retail_vol", None)
                 ))
             if records:
-                # 🚨 修正：后台线程落盘防假死
-                def _persist():
-                    with sqlite3.connect(DB_PATH) as conn:
-                        conn.executemany("INSERT OR REPLACE INTO memory_1h VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
-                        conn.commit()
-                await asyncio.to_thread(_persist)
+                await asyncio.to_thread(upsert_memory_1h_records, records)
+
+            main_data = market_data_store.get(SYMBOL, {})
+            if main_data.get("1m"):
+                await asyncio.to_thread(upsert_memory_1m_records, SYMBOL, list(main_data["1m"])[-5:])
+            for hist_key in DERIVATIVE_METRIC_KEYS:
+                hist = main_data.get(hist_key, [])
+                if hist:
+                    await asyncio.to_thread(upsert_derivative_history_records, SYMBOL, hist_key, hist[-5:])
         except Exception:
             pass
 # ==========================================
