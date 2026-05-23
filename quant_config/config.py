@@ -98,6 +98,23 @@ BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确�
 # ==========================================
 EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
+# 实盘组合配置：训练脚本仍使用上面的 SYMBOL/AUX_SYMBOLS 单币种配置；
+# live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
+LIVE_SYMBOL_CONFIGS = {
+    SYMBOL: {
+        "experiment_id": EXPERIMENT_ID,
+        "aux_symbols": AUX_SYMBOLS,
+    },
+    "BTCUSDT": {
+        "experiment_id": "EXP_BTC模型ID",
+        "aux_symbols": ["ETHUSDT", "ETHBTC"],
+    },
+    "SOLUSDT": {
+        "experiment_id": "EXP_SOL模型ID",
+        "aux_symbols": ["BTCUSDT", "SOLBTC"],
+    },
+}
+
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))
 EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))

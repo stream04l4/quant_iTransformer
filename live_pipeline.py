@@ -18,7 +18,8 @@ from quant_config.config import (
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
-    EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
+    EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
+    LIVE_SYMBOL_CONFIGS
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -28,9 +29,34 @@ load_dotenv()
 GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 🚨 修复 1：基于 EXPERIMENT_ID 精准定位，防止加载成别的策略包
-MODEL_PATH = MODEL_DIR / f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth" 
-JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
+def _normalize_symbol_key(raw_symbol):
+    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _normalize_live_configs():
+    raw_configs = LIVE_SYMBOL_CONFIGS if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS else {
+        SYMBOL: {"experiment_id": EXPERIMENT_ID, "aux_symbols": AUX_SYMBOLS}
+    }
+    normalized = {}
+    for raw_symbol, cfg in raw_configs.items():
+        sym_key = _normalize_symbol_key(raw_symbol)
+        cfg = cfg or {}
+        normalized[sym_key] = {
+            "experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID)),
+            "aux_symbols": [_normalize_symbol_key(s) for s in cfg.get("aux_symbols", [])],
+        }
+    return normalized
+
+
+LIVE_CONFIGS = _normalize_live_configs()
+LIVE_MAIN_SYMBOLS = list(LIVE_CONFIGS.keys())
+LIVE_MAIN_SYMBOL_SET = set(LIVE_MAIN_SYMBOLS)
+
+
+def _resolve_aux_request_symbol(sym):
+    sym_key = _normalize_symbol_key(sym)
+    return f"{sym_key}_SPOT" if sym_key in LIVE_MAIN_SYMBOL_SET else sym_key
 
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
@@ -58,7 +84,7 @@ def get_macro_sentiment_info():
 def fetch_gateway_snapshot(sym):
     """从本地网关拉取指定币种快照"""
     # 格式化请求符号，兼容网关的 REST 解析
-    request_sym = sym.replace("/", "") 
+    request_sym = sym.replace("/", "")
     try:
         resp = requests.get(f"{GATEWAY_URL}/{request_sym}", timeout=2)
         if resp.status_code != 200:
@@ -88,7 +114,7 @@ def dedupe_hourly_history(df, value_col):
           .drop_duplicates(subset=['hour_timestamp'], keep='last')
     )
 
-def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None):
+def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None, seq_len=None):
     """纯粹的引擎映射层：100% 像素级复刻离线 Polars 特征构建逻辑，杜绝无限回填"""
     
     # 1. 基础 K 线体系
@@ -105,7 +131,9 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     assert_hourly_continuity(df)
     df['hour_timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    required_history = ACTUAL_SEQ_LEN + 336
+    if seq_len is None:
+        raise ValueError("缺少模型 seq_len，无法构建实盘推理窗口。")
+    required_history = seq_len + 336
     if len(df) < required_history:
         raise ValueError(f"主K线历史长度不足 (需>={required_history}，当前{len(df)})")
 
@@ -288,7 +316,7 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None)
     for col in final_cols:
         if col not in df.columns: df[col] = np.nan
 
-    inference_window = df[final_cols].iloc[-ACTUAL_SEQ_LEN:]
+    inference_window = df[final_cols].iloc[-seq_len:]
     
     if inference_window.isnull().any().any():
         missing_cols = inference_window.columns[inference_window.isnull().any()].tolist()
@@ -345,7 +373,7 @@ def _tier_from_leverage(leverage):
     return 1
 
 
-def _read_persisted_tier_state():
+def _read_persisted_tier_state(symbol):
     """读取上一次落盘的状态机，作为交易所快照未就绪时的兜底。"""
     status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
     if not os.path.exists(status_path):
@@ -354,18 +382,24 @@ def _read_persisted_tier_state():
     try:
         with open(status_path, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        return _sanitize_tier_state(saved.get("position_tier_state", {}))
+        sym_key = _normalize_symbol_key(symbol)
+        symbol_state = (saved.get("symbols", {}) or {}).get(sym_key, {})
+        if symbol_state:
+            return _sanitize_tier_state(symbol_state.get("position_tier_state", {}))
+        if _normalize_symbol_key(saved.get("symbol")) == sym_key:
+            return _sanitize_tier_state(saved.get("position_tier_state", {}))
+        return {"side": 0, "highest_tier": 0}
     except Exception as e:
         print(f"⚠️  [状态恢复] 读取 live_status.json 失败: {e}")
         return {"side": 0, "highest_tier": 0}
 
 
-def _get_exchange_position_state():
+def _get_exchange_position_state(symbol):
     """从供货线程同步过来的真实仓位快照推导当前状态。"""
     with state.pos_lock:
         pos_map = dict(state.active_pos_map)
 
-    sym_key = SYMBOL.replace("/", "")
+    sym_key = _normalize_symbol_key(symbol)
     last_sync_ts = float(state.portfolio_memory.get("last_sync_ts", 0) or 0)
     sync_age = float("inf") if last_sync_ts <= 0 else max(0.0, time.time() - last_sync_ts)
     sync_fresh = sync_age <= max(HEARTBEAT_INTERVAL * 3, 30)
@@ -405,7 +439,7 @@ def _get_exchange_position_state():
     return result
 
 
-def _reconcile_position_tier_state(cached_state):
+def _reconcile_position_tier_state(symbol, cached_state):
     """
     每个 tick 都重新对账：
     1. 真实仓位决定 side。
@@ -413,8 +447,8 @@ def _reconcile_position_tier_state(cached_state):
     3. 若供货线程快照陈旧，则退化到缓存/磁盘兜底，但不会永久锁死。
     """
     cached_state = _sanitize_tier_state(cached_state)
-    persisted_state = _read_persisted_tier_state()
-    exchange_state = _get_exchange_position_state()
+    persisted_state = _read_persisted_tier_state(symbol)
+    exchange_state = _get_exchange_position_state(symbol)
 
     if exchange_state["has_position"]:
         candidates = [exchange_state["exchange_tier"]]
@@ -449,13 +483,14 @@ def _reconcile_position_tier_state(cached_state):
     }
 
 
-def _reconstruct_tier_state():
+def _reconstruct_tier_state(symbol):
     """启动时先做一次对账恢复，后续每个 tick 会继续自动校正。"""
     with state.pos_lock:
         pos_keys = list(state.active_pos_map.keys())
-    print(f"🔍 [状态恢复] 正在校验符号: {SYMBOL.replace('/', '')}，当前已同步仓位列表: {pos_keys}")
+    sym_key = _normalize_symbol_key(symbol)
+    print(f"🔍 [状态恢复] 正在校验符号: {sym_key}，当前已同步仓位列表: {pos_keys}")
 
-    reconstructed, meta = _reconcile_position_tier_state({"side": 0, "highest_tier": 0})
+    reconstructed, meta = _reconcile_position_tier_state(sym_key, {"side": 0, "highest_tier": 0})
     if reconstructed["side"] != 0:
         print(
             f"♻️  [重启恢复] 状态机已恢复: side={reconstructed['side']}, "
@@ -466,14 +501,9 @@ def _reconstruct_tier_state():
     return reconstructed
 
 
-def _normalize_symbol_key(raw_symbol):
-    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
-    return str(raw_symbol or "").split(":")[0].replace("/", "")
-
-
-def _load_recent_local_open_trades(limit=20):
+def _load_recent_local_open_trades(symbol, limit=20):
     """读取本地开仓流水，用于判断当前库存是否仍在策略可解释范围内。"""
-    db_path = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{_normalize_symbol_key(SYMBOL)}.db")
+    db_path = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{_normalize_symbol_key(symbol)}.db")
     if not os.path.exists(db_path):
         return []
 
@@ -554,7 +584,7 @@ def _get_forced_exit_lock(symbol, latest_closed_ts):
     return lock_info
 
 
-def _inspect_live_stop_coverage(position):
+def _inspect_live_stop_coverage(position, symbol=None):
     """
     校验当前持仓是否被交易所止损单完整覆盖。
     这里只做告警与隔离判定，不擅自修改挂单单位口径。
@@ -566,7 +596,7 @@ def _inspect_live_stop_coverage(position):
         expected_contracts = 0.0
 
     snapshot_stops = list(state.portfolio_memory.get("open_stops", []) or [])
-    sym_key = _normalize_symbol_key(position.get("symbol", SYMBOL))
+    sym_key = _normalize_symbol_key(position.get("symbol", symbol or SYMBOL))
     matched_stops = [o for o in snapshot_stops if _normalize_symbol_key(o.get("symbol")) == sym_key]
 
     if expected_contracts <= 0:
@@ -638,12 +668,12 @@ def _inspect_live_stop_coverage(position):
     }
 
 
-def _build_inventory_guard(position_tier_state, position_state_meta):
+def _build_inventory_guard(symbol, position_tier_state, position_state_meta):
     """
     识别“策略自有库存”与“异常外部库存”：
     一旦进入 external_inventory，主引擎停止继续下单，只保留右脑风控托管。
     """
-    sym_key = _normalize_symbol_key(SYMBOL)
+    sym_key = _normalize_symbol_key(symbol)
     with state.pos_lock:
         position = dict(state.active_pos_map).get(sym_key)
 
@@ -685,12 +715,12 @@ def _build_inventory_guard(position_tier_state, position_state_meta):
             f"交易所杠杆 {current_leverage:.2f}x 不在策略分层 {configured_leverages} 内"
         )
 
-    recent_open_trades = _load_recent_local_open_trades(limit=20)
+    recent_open_trades = _load_recent_local_open_trades(sym_key, limit=20)
     matching_open_records = [r for r in recent_open_trades if r["side"] == local_side]
     if not matching_open_records:
         soft_reasons.append("本地成交流水缺少与当前仓位同向的开仓记录")
 
-    stop_coverage = _inspect_live_stop_coverage(position)
+    stop_coverage = _inspect_live_stop_coverage(position, sym_key)
     if stop_coverage["status"] in {"missing_stop", "unparseable_stop", "undercovered_stop"}:
         hard_reasons.append(stop_coverage["reason"])
     elif stop_coverage["status"] == "oversized_stop":
@@ -714,370 +744,384 @@ def _build_inventory_guard(position_tier_state, position_state_meta):
         "state_source": position_state_meta["source"]
     }
 
-def run_live():
-    print(f"🚀 极速实盘预测引擎启动 (单模型模式: {MODEL_PATH.name})...")
-    threading.Thread(target=bailout_worker, daemon=True).start()
-    
-    # --- 1. 加载单一神级模型 ---
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"❌ 找不到模型权重，请检查 EXPERIMENT_ID 是否正确: {MODEL_PATH}")
-        
-    print(f"📥 正在加载模型权重: {MODEL_PATH}")
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    
-    # 🚨 修复 2：彻底丢弃 LIVE_D_MODEL 等伪隔离参数，全量从 Checkpoint 提取拓扑
+def _load_symbol_runtime(symbol, cfg):
+    exp_id = str(cfg.get("experiment_id", EXPERIMENT_ID))
+    model_path = MODEL_DIR / f"itransformer_{symbol}_best_{exp_id}.pth"
+    json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"❌ [{symbol}] 找不到模型权重: {model_path}")
+    if not json_path.exists():
+        raise FileNotFoundError(f"❌ [{symbol}] 找不到动态阈值文件: {json_path}")
+
+    print(f"📥 [{symbol}] 加载模型权重: {model_path.name}")
+    checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     feature_cols = checkpoint['feature_cols']
     ckpt_seq_len = checkpoint.get('seq_len')
-    ckpt_d_model = checkpoint.get('d_model')
-    ckpt_n_heads = checkpoint.get('n_heads')
-    ckpt_d_ff = checkpoint.get('d_ff')
-    ckpt_e_layers = checkpoint.get('e_layers')
-    ckpt_dropout = checkpoint.get('dropout')
-    
-    # 把提取出的动态窗口长度作为全局变量使用，替换掉旧版的 LIVE_SEQ_LEN
-    global ACTUAL_SEQ_LEN
-    ACTUAL_SEQ_LEN = ckpt_seq_len
-    
     model = InvertedTransformer(
-        num_variates=len(feature_cols), 
-        seq_len=ckpt_seq_len, 
-        d_model=ckpt_d_model, 
-        n_heads=ckpt_n_heads, 
-        d_ff=ckpt_d_ff, 
-        e_layers=ckpt_e_layers,
-        dropout=ckpt_dropout
+        num_variates=len(feature_cols),
+        seq_len=ckpt_seq_len,
+        d_model=checkpoint.get('d_model'),
+        n_heads=checkpoint.get('n_heads'),
+        d_ff=checkpoint.get('d_ff'),
+        e_layers=checkpoint.get('e_layers'),
+        dropout=checkpoint.get('dropout')
     ).to(DEVICE)
-    
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    
-    with open(JSON_PATH, 'r') as f:
+
+    with open(json_path, 'r') as f:
         config_data = json.load(f)
-        # 🚨 修复 3：兼容解包 Metadata 格式的 JSON 阈值配置
-        th = config_data.get("thresholds", config_data)
-            
-    print(f"✅ 模型与阈值加载成功。")
-    
-    # 频段隔离器变量
-    last_inferred_hour = 0
-    cached_p_down, cached_p_flat, cached_p_up = 0.0, 0.0, 0.0
-    
-    cached_macro_score = 0.0
-    last_macro_ts = "0" # 👈 新增：用于侦测宏观情报异动
-    last_trade_hour = 0  
-    last_trade_signal = 0
-    latest_closed_ts = 0
-    last_inventory_guard_mode = "flat"
-    last_forced_exit_anchor_ts = 0
-    
-    # 🎯 仓位阶梯状态机：重启时从交易所/磁盘双轨恢复，防止重复开仓
-    # portfolio_sync_worker 在后台独立线程中运行，动态等待其完成首次同步
+        thresholds = config_data.get("thresholds", config_data)
+
+    return {
+        "symbol": symbol,
+        "exp_id": exp_id,
+        "model_path": model_path,
+        "json_path": json_path,
+        "model": model,
+        "feature_cols": feature_cols,
+        "seq_len": ckpt_seq_len,
+        "thresholds": thresholds,
+        "aux_symbols": cfg.get("aux_symbols", []),
+        "last_inferred_hour": 0,
+        "cached_p_down": 0.0,
+        "cached_p_flat": 0.0,
+        "cached_p_up": 0.0,
+        "cached_macro_score": 0.0,
+        "last_macro_ts": "0",
+        "last_trade_hour": 0,
+        "latest_closed_ts": 0,
+        "last_inventory_guard_mode": "flat",
+        "last_forced_exit_anchor_ts": 0,
+        "position_tier_state": {"side": 0, "highest_tier": 0},
+    }
+
+
+def _compact_stop_coverage(stop_coverage):
+    return {
+        "status": stop_coverage["status"],
+        "expected_contracts": float(stop_coverage["expected_contracts"]),
+        "matched_stop_count": int(stop_coverage["matched_stop_count"]),
+        "max_stop_size": float(stop_coverage["max_stop_size"]),
+        "coverage_ratio": float(stop_coverage["coverage_ratio"]),
+        "reason": stop_coverage["reason"]
+    }
+
+
+def run_live():
+    print(f"🚀 极速实盘预测引擎启动 (多模型模式: {', '.join(LIVE_MAIN_SYMBOLS)})...")
+    threading.Thread(target=bailout_worker, daemon=True).start()
+
+    runtimes = {}
+    for symbol, cfg in LIVE_CONFIGS.items():
+        runtimes[symbol] = _load_symbol_runtime(symbol, cfg)
+    print("✅ 多币种模型与阈值加载成功。")
+
     print("⏳ 正在同步交易所账户状态 (资金/仓位/委托)...")
     wait_start = time.time()
     while state.portfolio_memory.get('last_sync_ts', 0) == 0:
-        if time.time() - wait_start > 15: # 增加超时保护
+        if time.time() - wait_start > 15:
             print("⚠️ [启动预警] 供货线程同步超时 (15s)，将尝试从本地缓存恢复状态。")
             break
         time.sleep(1)
-        
-    position_tier_state = _reconstruct_tier_state()
+
+    for symbol, rt in runtimes.items():
+        rt["position_tier_state"] = _reconstruct_tier_state(symbol)
 
     while True:
-        try:
-            # ---------------------------------------------------------
-            # ⚡ [10秒级 Tick] 高频抓取与风控心跳
-            # ---------------------------------------------------------
-            resp = requests.get(f"{GATEWAY_URL}/{SYMBOL}", timeout=2)
-            if resp.status_code != 200:
-                time.sleep(2)
-                continue
-            snapshot = resp.json()
-            current_time = time.time()
-            current_price = snapshot['current_price']
-            
-            # --- 直接使用 config 常量，无需读取 UI JSON ---
-            # 右脑风控熔断器参数（直接来自 config）
-            state.dynamic_settings["bailout_atr_multi"] = BAILOUT_ATR_MULTI
-            state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
-            state.dynamic_settings["trailing_atr_period"] = TRAILING_ATR_PERIOD
-            state.dynamic_settings["trailing_atr_multi"] = TRAILING_ATR_MULTI
-            
-            # 仓位保证金与止盈止损参数（直接来自 config）
-            dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET  # 单笔保证金 = 总资本 × 风险拨备率
-            dynamic_sl = HARD_SL   # K线物理兜底止损幅度
-            dynamic_tp = HARD_TP   # K线物理止盈幅度
+        cycle_start = time.time()
+        symbol_payloads = {}
 
-            # 👇 【关键补充】将最新价格更新到全局状态机，供后端的 bailout_worker (阶梯止损) 随时读取
+        state.dynamic_settings["bailout_atr_multi"] = BAILOUT_ATR_MULTI
+        state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
+        state.dynamic_settings["trailing_atr_period"] = TRAILING_ATR_PERIOD
+        state.dynamic_settings["trailing_atr_multi"] = TRAILING_ATR_MULTI
+
+        dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET
+        dynamic_sl = HARD_SL
+        dynamic_tp = HARD_TP
+
+        for symbol, rt in runtimes.items():
             try:
-                state.update_price(SYMBOL, current_price)
-            except Exception:
-                pass # 兼容你可能的 state_manager 写法
+                resp = requests.get(f"{GATEWAY_URL}/{symbol}", timeout=2)
+                if resp.status_code != 200:
+                    print(f"⚠️ [{symbol}] 行情快照不可用: HTTP {resp.status_code}")
+                    continue
 
-            # ---------------------------------------------------------
-            # ⏳ [1小时级 Tick] 深度学习推理 (单模型)
-            # ---------------------------------------------------------
-            needs_evaluation_log = False
-            trigger_reason = ""
-            if len(snapshot['ohlcv_1h']) >= 2:
-                latest_closed_ts = snapshot['ohlcv_1h'][-2][0] 
-                
-                if latest_closed_ts != last_inferred_hour:
-                    # 💡 策略：整点第1分钟留给 DeepSeek 脚本执行，第2分钟准时开始大模型推理
-                    current_minute = datetime.utcnow().minute
-                    if current_minute < 2:
-                        if int(current_time) % 30 == 0: # 每30秒提醒一次
-                            print(f"⏳ [等待窗口] 检测到新K线，等待进入整点第2分钟以同步宏观分 (当前: {current_minute}分)...")
-                        time.sleep(1) # 稍微睡眠，防止极短时间内的 while 循环空转过快
-                        continue
+                snapshot = resp.json()
+                current_time = time.time()
+                current_price = snapshot['current_price']
+                try:
+                    state.update_price(symbol, current_price)
+                except Exception:
+                    pass
 
-                    print(f"\n🔄 [时钟对齐] 进入整点第{current_minute}分钟，开始执行单模型推理 (TS: {latest_closed_ts})...")
-                    
-                    aux_reference_snap = fetch_gateway_snapshot(AUX_SYMBOLS[0]) if len(AUX_SYMBOLS) >= 1 else None
-                    direct_cross_snap = fetch_gateway_snapshot(AUX_SYMBOLS[1]) if len(AUX_SYMBOLS) >= 2 else None
+                needs_evaluation_log = False
+                trigger_reason = ""
 
-                    features_df = compute_features(snapshot, aux_reference_snap, direct_cross_snap)
-                    
-                    # 提取喂给模型的那个精确窗口
-                    inference_window = features_df[feature_cols].iloc[-ACTUAL_SEQ_LEN:]
-                    input_raw = inference_window.values.astype('float32')
-                    x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-                    
-                    # 🚨 新增：审计外挂，将当前送入模型的 DataFrame 写入 CSV
-                    try:
-                        os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
-                        audit_csv_path = os.path.join(TRAIN_DATA_DIR, f"live_inference_audit_{SYMBOL}.csv")
-                        
-                        # 覆写保存最新的 336 根特征矩阵，保留表头以便核对
-                        inference_window.to_csv(audit_csv_path, index=False)
-                        print(f"   💾 [特征审计] 本次推理输入矩阵 (Shape: {inference_window.shape}) 已输出至: {audit_csv_path}")
-                    except Exception as e:
-                        print(f"   ⚠️ [特征审计] CSV 输出失败: {e}")
-                    
-                    with torch.no_grad():
-                        logits = model(x_tensor)
-                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-                        
-                    cached_p_down, cached_p_flat, cached_p_up = probs[0], probs[1], probs[2]
-                    
-                    # 🎯 [联动触发] 大模型推理完成后，立即调取宏观分进行 Logit 融合调整
-                    cached_macro_score, last_macro_ts = get_macro_sentiment_info()
-                    current_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                    print(f"📡 [{current_time_str} UTC] [宏观雷达] 联动刷新宏观情绪得分: {cached_macro_score:+.2f} (TS: {last_macro_ts})")
-                    
-                    last_inferred_hour = latest_closed_ts
-                    needs_evaluation_log = True
-                    trigger_reason = "新K线闭合推理并联动宏观评分"
+                if len(snapshot['ohlcv_1h']) >= 2:
+                    latest_closed_ts = snapshot['ohlcv_1h'][-2][0]
+                    rt["latest_closed_ts"] = latest_closed_ts
 
-            # ---------------------------------------------------------
-            # 💡 [新增：非整点宏观突袭侦测]
-            # ---------------------------------------------------------
-            if not needs_evaluation_log and cached_p_up + cached_p_down > 0:
-                new_macro_score, new_macro_ts = get_macro_sentiment_info()
-                if new_macro_ts != last_macro_ts:
-                    cached_macro_score = new_macro_score
-                    last_macro_ts = new_macro_ts
-                    needs_evaluation_log = True
-                    trigger_reason = f"🚀 宏观哨兵突击！监测到情报异动 (TS: {new_macro_ts})"
-                    print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🦅 宏观哨兵触发实时重估！新得分: {cached_macro_score:+.2f}")
+                    if latest_closed_ts != rt["last_inferred_hour"]:
+                        current_minute = datetime.utcnow().minute
+                        if current_minute < 2:
+                            if int(current_time) % 30 == 0:
+                                print(f"⏳ [{symbol}] 检测到新K线，等待整点第2分钟同步宏观分 (当前: {current_minute}分)...")
+                        else:
+                            print(f"\n🔄 [{symbol}] 进入整点第{current_minute}分钟，开始模型推理 (TS: {latest_closed_ts})...")
+                            aux_symbols = rt["aux_symbols"]
+                            aux_reference_snap = fetch_gateway_snapshot(_resolve_aux_request_symbol(aux_symbols[0])) if len(aux_symbols) >= 1 else None
+                            direct_cross_snap = fetch_gateway_snapshot(_resolve_aux_request_symbol(aux_symbols[1])) if len(aux_symbols) >= 2 else None
 
-            # ---------------------------------------------------------
-            # ⚔️ [10秒级 Tick] 实时高频信号撮合 (Logit 贝叶斯非线性融合)
-            # ---------------------------------------------------------
-            # 多头宏观得分为正收益，空头宏观得分为负收益 (反向叠加，即做空时宏观得分为负反而加成)
-            adj_up_top1 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_1)
-            adj_up_top5 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_5)
-            adj_up_top10 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_10)
+                            features_df = compute_features(
+                                snapshot,
+                                aux_reference_snap,
+                                direct_cross_snap,
+                                seq_len=rt["seq_len"]
+                            )
+                            inference_window = features_df[rt["feature_cols"]].iloc[-rt["seq_len"]:]
+                            input_raw = inference_window.values.astype('float32')
+                            x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-            adj_down_top1 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_1)
-            adj_down_top5 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_5)
-            adj_down_top10 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_10)
+                            try:
+                                os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
+                                audit_csv_path = os.path.join(TRAIN_DATA_DIR, f"live_inference_audit_{symbol}.csv")
+                                inference_window.to_csv(audit_csv_path, index=False)
+                                print(f"   💾 [{symbol}] 特征审计矩阵 {inference_window.shape} 已输出至: {audit_csv_path}")
+                            except Exception as e:
+                                print(f"   ⚠️ [{symbol}] 特征审计 CSV 输出失败: {e}")
 
-            # --- 🎯 阶梯升档信号决策（Tier 对应目标总杠杆） ---
-            position_tier_state, position_state_meta = _reconcile_position_tier_state(position_tier_state)
-            inventory_guard = _build_inventory_guard(position_tier_state, position_state_meta)
-            if inventory_guard["mode"] != last_inventory_guard_mode:
-                reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
-                guard_msg = (
-                    f"库存守卫模式切换为 {inventory_guard['mode']} | "
-                    f"杠杆 {inventory_guard['current_leverage']:.2f}x | 原因: {reason_text}"
-                )
-                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧯 {guard_msg}")
-                log_system_alert("🧯 库存守卫", SYMBOL, guard_msg)
-                last_inventory_guard_mode = inventory_guard["mode"]
-            forced_exit_lock = _get_forced_exit_lock(SYMBOL, latest_closed_ts)
-            if forced_exit_lock.get("released"):
-                released_anchor = forced_exit_lock.get("released_anchor_closed_ts", 0)
-                print(
-                    f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🔓 "
-                    f"强制退出冷却解除，检测到新闭合K线 (prev_ts: {released_anchor} -> now: {latest_closed_ts})"
-                )
-                last_forced_exit_anchor_ts = 0
-            elif forced_exit_lock.get("active"):
-                anchor_closed_ts = int(forced_exit_lock.get("anchor_closed_ts", 0) or 0)
-                if anchor_closed_ts != last_forced_exit_anchor_ts:
-                    reason = forced_exit_lock.get("reason", "强制退出")
+                            with torch.no_grad():
+                                logits = rt["model"](x_tensor)
+                                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+                            rt["cached_p_down"], rt["cached_p_flat"], rt["cached_p_up"] = probs[0], probs[1], probs[2]
+                            rt["cached_macro_score"], rt["last_macro_ts"] = get_macro_sentiment_info()
+                            print(
+                                f"📡 [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] "
+                                f"[{symbol}] 宏观情绪得分: {rt['cached_macro_score']:+.2f} (TS: {rt['last_macro_ts']})"
+                            )
+
+                            rt["last_inferred_hour"] = latest_closed_ts
+                            needs_evaluation_log = True
+                            trigger_reason = "新K线闭合推理并联动宏观评分"
+
+                if not needs_evaluation_log and rt["cached_p_up"] + rt["cached_p_down"] > 0:
+                    new_macro_score, new_macro_ts = get_macro_sentiment_info()
+                    if new_macro_ts != rt["last_macro_ts"]:
+                        rt["cached_macro_score"] = new_macro_score
+                        rt["last_macro_ts"] = new_macro_ts
+                        needs_evaluation_log = True
+                        trigger_reason = f"宏观哨兵突击，监测到情报异动 (TS: {new_macro_ts})"
+                        print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 宏观突袭重估: {new_macro_score:+.2f}")
+
+                cached_p_up = rt["cached_p_up"]
+                cached_p_down = rt["cached_p_down"]
+                cached_p_flat = rt["cached_p_flat"]
+                cached_macro_score = rt["cached_macro_score"]
+                th = rt["thresholds"]
+
+                adj_up_top1 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_1)
+                adj_up_top5 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_5)
+                adj_up_top10 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_10)
+                adj_down_top1 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_1)
+                adj_down_top5 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_5)
+                adj_down_top10 = apply_logit_fusion(cached_p_down, -cached_macro_score, MACRO_ALPHA_TOP_10)
+
+                rt["position_tier_state"], position_state_meta = _reconcile_position_tier_state(symbol, rt["position_tier_state"])
+                position_tier_state = rt["position_tier_state"]
+                inventory_guard = _build_inventory_guard(symbol, position_tier_state, position_state_meta)
+                if inventory_guard["mode"] != rt["last_inventory_guard_mode"]:
+                    reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
+                    guard_msg = (
+                        f"库存守卫模式切换为 {inventory_guard['mode']} | "
+                        f"杠杆 {inventory_guard['current_leverage']:.2f}x | 原因: {reason_text}"
+                    )
+                    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 🧯 {guard_msg}")
+                    log_system_alert("🧯 库存守卫", symbol, guard_msg)
+                    rt["last_inventory_guard_mode"] = inventory_guard["mode"]
+
+                forced_exit_lock = _get_forced_exit_lock(symbol, rt["latest_closed_ts"])
+                if forced_exit_lock.get("released"):
+                    released_anchor = forced_exit_lock.get("released_anchor_closed_ts", 0)
                     print(
-                        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧊 "
-                        f"强制退出冷却生效：{reason} | 当前闭合K线TS={latest_closed_ts} | 锁定基准TS={anchor_closed_ts}"
+                        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] "
+                        f"强制退出冷却解除 (prev_ts: {released_anchor} -> now: {rt['latest_closed_ts']})"
                     )
-                    last_forced_exit_anchor_ts = anchor_closed_ts
-            target_signal = 0
-            target_tier = 0
-            dynamic_leverage = 0.0
+                    rt["last_forced_exit_anchor_ts"] = 0
+                elif forced_exit_lock.get("active"):
+                    anchor_closed_ts = int(forced_exit_lock.get("anchor_closed_ts", 0) or 0)
+                    if anchor_closed_ts != rt["last_forced_exit_anchor_ts"]:
+                        reason = forced_exit_lock.get("reason", "强制退出")
+                        print(
+                            f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] "
+                            f"强制退出冷却生效：{reason} | 当前闭合K线TS={rt['latest_closed_ts']} | 锁定TS={anchor_closed_ts}"
+                        )
+                        rt["last_forced_exit_anchor_ts"] = anchor_closed_ts
 
-            # 评估是否击穿各层级动态阈值 (用各自阶梯专属的修正概率)
-            if adj_up_top1 > th['up_top_1']:        target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
-            elif adj_up_top5 > th['up_top_5']:      target_signal = 1; target_tier = 2; dynamic_leverage = LEVERAGE_2
-            elif adj_up_top10 > th['up_top_10']:     target_signal = 1; target_tier = 1; dynamic_leverage = LEVERAGE_1
-            elif adj_down_top1 > th['down_top_1']:  target_signal = -1; target_tier = 3; dynamic_leverage = LEVERAGE_3
-            elif adj_down_top5 > th['down_top_5']:  target_signal = -1; target_tier = 2; dynamic_leverage = LEVERAGE_2
-            elif adj_down_top10 > th['down_top_10']: target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+                target_signal = 0
+                target_tier = 0
+                dynamic_leverage = 0.0
+                if adj_up_top1 > th['up_top_1']:
+                    target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+                elif adj_up_top5 > th['up_top_5']:
+                    target_signal = 1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+                elif adj_up_top10 > th['up_top_10']:
+                    target_signal = 1; target_tier = 1; dynamic_leverage = LEVERAGE_1
+                elif adj_down_top1 > th['down_top_1']:
+                    target_signal = -1; target_tier = 3; dynamic_leverage = LEVERAGE_3
+                elif adj_down_top5 > th['down_top_5']:
+                    target_signal = -1; target_tier = 2; dynamic_leverage = LEVERAGE_2
+                elif adj_down_top10 > th['down_top_10']:
+                    target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
 
-            # 阶梯过滤器核心逻辑
-            actual_signal = 0
-            if forced_exit_lock.get("active"):
                 actual_signal = 0
-            elif inventory_guard["block_new_orders"]:
-                actual_signal = 0
-            elif target_signal != 0:
-                if position_tier_state["side"] == 0:
-                    actual_signal = target_signal
-                elif position_tier_state["side"] == target_signal:
-                    if target_tier > position_tier_state["highest_tier"]:
-                        actual_signal = target_signal
-                else:
-                    actual_signal = target_signal # 反向平仓交由 OMS 处理
-
-            if needs_evaluation_log:
-                action_str = "按兵不动"
                 if forced_exit_lock.get("active"):
-                    action_str = "🧊 强制退出冷却中，等待下一根1h K线闭合后再评估"
+                    actual_signal = 0
                 elif inventory_guard["block_new_orders"]:
-                    action_str = "🧯 异常库存隔离中，主引擎禁止继续下单"
-                elif actual_signal == 1: 
-                    action_str = f"🚀 触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
-                elif actual_signal == -1: 
-                    action_str = f"🩸 触发做空 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
+                    actual_signal = 0
+                elif target_signal != 0:
+                    if position_tier_state["side"] == 0:
+                        actual_signal = target_signal
+                    elif position_tier_state["side"] == target_signal:
+                        if target_tier > position_tier_state["highest_tier"]:
+                            actual_signal = target_signal
+                    else:
+                        actual_signal = target_signal
 
-                inventory_reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
-                forced_exit_text = "无"
-                if forced_exit_lock.get("active"):
-                    forced_exit_text = (
-                        f"{forced_exit_lock.get('reason', '强制退出')} | "
-                        f"锁定至下一根闭合K线 (> {forced_exit_lock.get('anchor_closed_ts', 0)})"
+                if needs_evaluation_log:
+                    action_str = "按兵不动"
+                    if forced_exit_lock.get("active"):
+                        action_str = "强制退出冷却中，等待下一根1h K线闭合后再评估"
+                    elif inventory_guard["block_new_orders"]:
+                        action_str = "异常库存隔离中，主引擎禁止继续下单"
+                    elif actual_signal == 1:
+                        action_str = f"触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
+                    elif actual_signal == -1:
+                        action_str = f"触发做空 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
+
+                    inventory_reason_text = " | ".join(inventory_guard["hard_reasons"] + inventory_guard["soft_reasons"]) or "无"
+                    forced_exit_text = "无"
+                    if forced_exit_lock.get("active"):
+                        forced_exit_text = (
+                            f"{forced_exit_lock.get('reason', '强制退出')} | "
+                            f"锁定至下一根闭合K线 (> {forced_exit_lock.get('anchor_closed_ts', 0)})"
+                        )
+                    eval_log = (
+                        f"【触发原因】{trigger_reason}\n"
+                        f"【原始概率】多:{cached_p_up:.4f} | 平:{cached_p_flat:.4f} | 空:{cached_p_down:.4f}\n"
+                        f"【融合概率(入场级Tier1)】多:{adj_up_top10:.4f} | 空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
+                        f"【引擎决策】{action_str} | 状态机: {position_tier_state} | 来源: {position_state_meta['source']} | "
+                        f"仓位同步新鲜: {'是' if position_state_meta['sync_fresh'] else '否'}\n"
+                        f"【库存守卫】模式: {inventory_guard['mode']} | 当前杠杆: {inventory_guard['current_leverage']:.2f}x | "
+                        f"止损覆盖: {inventory_guard['stop_coverage']['status']} | 原因: {inventory_reason_text}"
+                        f"\n【强制退出冷却】{forced_exit_text}"
                     )
-                eval_log = (
-                    f"【触发原因】{trigger_reason}\n"
-                    f"【原始概率】📈多:{cached_p_up:.4f} | ⚪平:{cached_p_flat:.4f} | 📉空:{cached_p_down:.4f}\n"
-                    f"【融合概率(入场级Tier1)】📈多:{adj_up_top10:.4f} | 📉空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
-                    f"【引擎决策】{action_str} | 状态机: {position_tier_state} | 来源: {position_state_meta['source']} | "
-                    f"仓位同步新鲜: {'是' if position_state_meta['sync_fresh'] else '否'}\n"
-                    f"【库存守卫】模式: {inventory_guard['mode']} | 当前杠杆: {inventory_guard['current_leverage']:.2f}x | "
-                    f"止损覆盖: {inventory_guard['stop_coverage']['status']} | 原因: {inventory_reason_text}"
-                    f"\n【强制退出冷却】{forced_exit_text}"
-                )
-                print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] 🧠 单模型评估汇报:\n{eval_log}\n")
-                log_system_alert("🧠 决策评估", SYMBOL, eval_log)
+                    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 单模型评估汇报:\n{eval_log}\n")
+                    log_system_alert("🧠 决策评估", symbol, eval_log)
 
+                if actual_signal != 0:
+                    print(f"\n[{snapshot['server_time']}] [{symbol}] 突破阶梯红线，最新价: {current_price} | 发送 OMS 指令 (Tier-{target_tier})...")
+                    log_system_alert(
+                        "🔥 下单触发",
+                        symbol,
+                        f"信号: {'做多' if actual_signal==1 else '做空'} | Tier: {target_tier} | 目标杠杆: {dynamic_leverage}x | 价格: {current_price:.4f}"
+                    )
+                    success, actual_margin = execute_gate_trade(
+                        symbol=symbol,
+                        signal=actual_signal,
+                        leverage=dynamic_leverage,
+                        current_price=current_price,
+                        tp_pct=dynamic_tp,
+                        sl_pct=dynamic_sl,
+                        risk_margin_usd=dynamic_margin_usd,
+                    )
+                    if success:
+                        print(f"✅ [{symbol}] 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
+                        log_system_alert("✅ 下单成交", symbol, f"Tier-{target_tier} 建立 | 成交价: {current_price:.4f} | 保证金: ${actual_margin:.2f}")
+                        rt["last_trade_hour"] = rt["latest_closed_ts"]
+                        position_tier_state["side"] = actual_signal
+                        position_tier_state["highest_tier"] = target_tier
+                    else:
+                        log_system_alert("❌ 下单失败", symbol, f"OMS 返回 False | 信号: {'做多' if actual_signal==1 else '做空'} | 价格: {current_price:.4f}")
 
-            if actual_signal != 0:
-                print(f"\n[{snapshot['server_time']}] 🔥 突破阶梯红线！最新价: {current_price} | 发送 OMS 指令 (Tier-{target_tier})...")
-                log_system_alert("🔥 下单触发", SYMBOL,
-                    f"信号: {'做多' if actual_signal==1 else '做空'} | Tier: {target_tier} | 目标杠杆: {dynamic_leverage}x | 价格: {current_price:.4f}")
-                success, actual_margin = execute_gate_trade(
-                    symbol=SYMBOL,
-                    signal=actual_signal,
-                    leverage=dynamic_leverage,
-                    current_price=current_price,
-                    tp_pct=dynamic_tp,
-                    sl_pct=dynamic_sl,
-                    risk_margin_usd=dynamic_margin_usd,
-                )
-                if success:
-                    print(f"✅ 成交！价格: {current_price} | 动用保证金: ${actual_margin:.2f}")
-                    log_system_alert("✅ 下单成交", SYMBOL,
-                        f"Tier-{target_tier} 建立 | 成交价: {current_price:.4f} | 保证金: ${actual_margin:.2f}")
-                    last_trade_hour = latest_closed_ts
-                    last_trade_signal = actual_signal
-                    # 升级状态机最高记录
-                    position_tier_state["side"] = actual_signal
-                    position_tier_state["highest_tier"] = target_tier
-                else:
-                    log_system_alert("❌ 下单失败", SYMBOL,
-                        f"OMS 返回 False | 信号: {'做多' if actual_signal==1 else '做空'} | 价格: {current_price:.4f}")
-            
-            # 👇 新增：引擎遥测状态原子级持久化 (Telemetry State Persistence)
-            live_state_payload = {
-                "timestamp": current_time,
-                "server_time": snapshot.get('server_time', int(current_time * 1000)),
-                "symbol": SYMBOL,
-                "current_price": current_price,
-                "macro_score": cached_macro_score,
-                "model_inference": {
-                    "raw_prob_up": float(cached_p_up),
-                    "raw_prob_down": float(cached_p_down),
-                    "adj_prob_up_tier1": float(adj_up_top10),
-                    "adj_prob_down_tier1": float(adj_down_top10),
-                    "macro_score": float(cached_macro_score)
-                },
-                "execution_state": {
-                    "current_signal": int(actual_signal),
-                    "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
-                    "last_inferred_hour": int(last_inferred_hour),
-                    "last_trade_hour": int(last_trade_hour)
-                },
-                "position_tier_state": {
-                    "side": int(position_tier_state["side"]),
-                    "highest_tier": int(position_tier_state["highest_tier"])
-                },
-                "position_state_meta": {
-                    "source": position_state_meta["source"],
-                    "sync_fresh": bool(position_state_meta["sync_fresh"]),
-                    "sync_age_sec": None if np.isinf(position_state_meta["sync_age_sec"]) else round(float(position_state_meta["sync_age_sec"]), 3)
-                },
-                "inventory_guard": {
-                    "mode": inventory_guard["mode"],
-                    "block_new_orders": bool(inventory_guard["block_new_orders"]),
-                    "current_leverage": float(inventory_guard["current_leverage"]),
-                    "configured_leverages": [float(x) for x in inventory_guard["configured_leverages"]],
-                    "matching_open_record_count": int(inventory_guard["matching_open_record_count"]),
-                    "hard_reasons": inventory_guard["hard_reasons"],
-                    "soft_reasons": inventory_guard["soft_reasons"],
-                    "stop_coverage": {
-                        "status": inventory_guard["stop_coverage"]["status"],
-                        "expected_contracts": float(inventory_guard["stop_coverage"]["expected_contracts"]),
-                        "matched_stop_count": int(inventory_guard["stop_coverage"]["matched_stop_count"]),
-                        "max_stop_size": float(inventory_guard["stop_coverage"]["max_stop_size"]),
-                        "coverage_ratio": float(inventory_guard["stop_coverage"]["coverage_ratio"]),
-                        "reason": inventory_guard["stop_coverage"]["reason"]
+                symbol_payloads[symbol] = {
+                    "timestamp": current_time,
+                    "server_time": snapshot.get('server_time', int(current_time * 1000)),
+                    "symbol": symbol,
+                    "current_price": current_price,
+                    "macro_score": cached_macro_score,
+                    "model_inference": {
+                        "raw_prob_up": float(cached_p_up),
+                        "raw_prob_flat": float(cached_p_flat),
+                        "raw_prob_down": float(cached_p_down),
+                        "adj_prob_up_tier1": float(adj_up_top10),
+                        "adj_prob_down_tier1": float(adj_down_top10),
+                        "macro_score": float(cached_macro_score)
+                    },
+                    "execution_state": {
+                        "current_signal": int(actual_signal),
+                        "target_signal": int(target_signal),
+                        "target_tier": int(target_tier),
+                        "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
+                        "last_inferred_hour": int(rt["last_inferred_hour"]),
+                        "last_trade_hour": int(rt["last_trade_hour"])
+                    },
+                    "position_tier_state": {
+                        "side": int(position_tier_state["side"]),
+                        "highest_tier": int(position_tier_state["highest_tier"])
+                    },
+                    "position_state_meta": {
+                        "source": position_state_meta["source"],
+                        "sync_fresh": bool(position_state_meta["sync_fresh"]),
+                        "sync_age_sec": None if np.isinf(position_state_meta["sync_age_sec"]) else round(float(position_state_meta["sync_age_sec"]), 3)
+                    },
+                    "inventory_guard": {
+                        "mode": inventory_guard["mode"],
+                        "block_new_orders": bool(inventory_guard["block_new_orders"]),
+                        "current_leverage": float(inventory_guard["current_leverage"]),
+                        "configured_leverages": [float(x) for x in inventory_guard["configured_leverages"]],
+                        "matching_open_record_count": int(inventory_guard["matching_open_record_count"]),
+                        "hard_reasons": inventory_guard["hard_reasons"],
+                        "soft_reasons": inventory_guard["soft_reasons"],
+                        "stop_coverage": _compact_stop_coverage(inventory_guard["stop_coverage"])
+                    },
+                    "forced_exit_lock": {
+                        "active": bool(forced_exit_lock.get("active", False)),
+                        "anchor_closed_ts": int(forced_exit_lock.get("anchor_closed_ts", 0) or 0),
+                        "reason": forced_exit_lock.get("reason", ""),
+                        "trigger_ts": float(forced_exit_lock.get("trigger_ts", 0.0) or 0.0)
                     }
-                },
-                "forced_exit_lock": {
-                    "active": bool(forced_exit_lock.get("active", False)),
-                    "anchor_closed_ts": int(forced_exit_lock.get("anchor_closed_ts", 0) or 0),
-                    "reason": forced_exit_lock.get("reason", ""),
-                    "trigger_ts": float(forced_exit_lock.get("trigger_ts", 0.0) or 0.0)
                 }
-            }
 
-            tmp_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json.tmp")
-            target_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
-            
-            try:
-                # 1. 写入临时文件
-                with open(tmp_state_path, "w", encoding="utf-8") as f:
-                    json.dump(live_state_payload, f, ensure_ascii=False, indent=2)
-                # 2. 操作系统级原子替换，杜绝外部进程读到不完整的 JSON
-                os.replace(tmp_state_path, target_state_path)
-            except IOError as e:
-                print(f"⚠️ 状态持久化写入失败: {e}")
-            # 👆 新增结束
+            except Exception as e:
+                print(f"❌ [{symbol}] 主循环单币异常: {e}")
 
-        except Exception as e:
-            print(f"❌ 主循环异常: {e}")
-            
-        # 稳定维持 10 秒的心跳，给 bailout_worker 提供充足的反应时间
-        time.sleep(HEARTBEAT_INTERVAL)
+        live_state_payload = {
+            "timestamp": time.time(),
+            "mode": "multi_symbol",
+            "active_symbols": list(runtimes.keys()),
+            "symbols": symbol_payloads,
+        }
+        if symbol_payloads:
+            primary_symbol = next(iter(symbol_payloads))
+            live_state_payload["primary_symbol"] = primary_symbol
+            # 兼容旧 UI / 右脑读取路径：顶层仍放第一个币种的状态。
+            live_state_payload.update(symbol_payloads[primary_symbol])
+
+        tmp_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json.tmp")
+        target_state_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
+        try:
+            with open(tmp_state_path, "w", encoding="utf-8") as f:
+                json.dump(live_state_payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_state_path, target_state_path)
+        except IOError as e:
+            print(f"⚠️ 状态持久化写入失败: {e}")
+
+        elapsed = time.time() - cycle_start
+        time.sleep(max(1.0, HEARTBEAT_INTERVAL - elapsed))
 
 if __name__ == "__main__":
     run_live()

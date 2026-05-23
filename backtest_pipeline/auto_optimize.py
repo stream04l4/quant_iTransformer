@@ -20,11 +20,11 @@ ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
     'SEQ_LEN': [672],
     'CLASS_THRESHOLD': [0.015],
-    'E_LAYERS': [2],
-    'D_MODEL': [128],
+    'E_LAYERS': [1],
+    'D_MODEL': [64],
     'DROPOUT': [0.2],
     'BATCH_SIZE': [128],
-    'LEARNING_RATE': [5e-6],
+    'LEARNING_RATE': [1e-5],
     'EPOCHS': [50]
 }
 

@@ -13,7 +13,7 @@ import polars as pl
 from quant_config.config import (
     SYMBOL, AUX_SYMBOLS, WHALE_NOTIONAL_THRESHOLD_USDT, RETAIL_NOTIONAL_THRESHOLD_USDT,
     LIVE_DATA_DIR, TEMP_DIR, PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR,
-    KLINE_COLS, FUNDING_COLS
+    KLINE_COLS, FUNDING_COLS, LIVE_SYMBOL_CONFIGS
 )
 
 app = FastAPI(title="Binance链币种: {} 极速行情网关".format(SYMBOL))
@@ -33,10 +33,47 @@ DERIVATIVE_LOOKBACK_HOURS = 1250
 ONE_MINUTE_HISTORY_LIMIT = DERIVATIVE_LOOKBACK_HOURS * 60 + 120
 RECENT_AGGTRADE_REST_BACKFILL_HOURS = 48
 
-# 将主币种和辅助币种合并初始化
-all_symbols = [SYMBOL] + AUX_SYMBOLS
+def _normalize_symbol_key(raw_symbol):
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _normalize_live_configs():
+    raw_configs = LIVE_SYMBOL_CONFIGS if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS else {
+        SYMBOL: {"aux_symbols": AUX_SYMBOLS}
+    }
+    normalized = {}
+    for raw_symbol, cfg in raw_configs.items():
+        sym_key = _normalize_symbol_key(raw_symbol)
+        cfg = cfg or {}
+        normalized[sym_key] = {
+            "aux_symbols": [_normalize_symbol_key(s) for s in cfg.get("aux_symbols", [])]
+        }
+    return normalized
+
+
+LIVE_CONFIGS = _normalize_live_configs()
+LIVE_MAIN_SYMBOLS = list(LIVE_CONFIGS.keys())
+LIVE_MAIN_SYMBOL_SET = set(LIVE_MAIN_SYMBOLS)
+
+
+def _build_subscription_specs():
+    specs = {}
+    for sym in LIVE_MAIN_SYMBOLS:
+        specs[sym] = {"market_symbol": sym, "is_spot": False}
+
+    for cfg in LIVE_CONFIGS.values():
+        for aux_sym in cfg.get("aux_symbols", []):
+            # 如果辅助参考资产本身也是实盘主合约，需要额外订阅一份现货，避免覆盖合约数据。
+            store_key = f"{aux_sym}_SPOT" if aux_sym in LIVE_MAIN_SYMBOL_SET else aux_sym
+            specs.setdefault(store_key, {"market_symbol": aux_sym, "is_spot": True})
+    return specs
+
+
+SUBSCRIPTION_SPECS = _build_subscription_specs()
+all_symbols = list(SUBSCRIPTION_SPECS.keys())
 
 for sym in all_symbols:
+    spec = SUBSCRIPTION_SPECS[sym]
     market_data_store[sym] = {
         "1m": deque(maxlen=ONE_MINUTE_HISTORY_LIMIT), # 覆盖完整 1h 推理窗口的 RV 预热
         "1h": deque(maxlen=1250), # 从 500 提升到 1000，确保满足 504 需求
@@ -47,7 +84,7 @@ for sym in all_symbols:
     }
     
     # 只有主币种才需要复杂的订单流和衍生品特征
-    if sym == SYMBOL:
+    if not spec["is_spot"]:
         market_data_store[sym].update({
             # 将 trades 升级，记录 quote_volume, count, 及大中小单
             "taker_stats_1h": {}, 
@@ -1444,13 +1481,14 @@ async def db_persist_loop():
             if records:
                 await asyncio.to_thread(upsert_memory_1h_records, records)
 
-            main_data = market_data_store.get(SYMBOL, {})
-            if main_data.get("1m"):
-                await asyncio.to_thread(upsert_memory_1m_records, SYMBOL, list(main_data["1m"])[-5:])
-            for hist_key in DERIVATIVE_METRIC_KEYS:
-                hist = main_data.get(hist_key, [])
-                if hist:
-                    await asyncio.to_thread(upsert_derivative_history_records, SYMBOL, hist_key, hist[-5:])
+            for main_symbol in LIVE_MAIN_SYMBOLS:
+                main_data = market_data_store.get(main_symbol, {})
+                if main_data.get("1m"):
+                    await asyncio.to_thread(upsert_memory_1m_records, main_symbol, list(main_data["1m"])[-5:])
+                for hist_key in DERIVATIVE_METRIC_KEYS:
+                    hist = main_data.get(hist_key, [])
+                    if hist:
+                        await asyncio.to_thread(upsert_derivative_history_records, main_symbol, hist_key, hist[-5:])
         except Exception:
             pass
 # ==========================================
@@ -1503,15 +1541,17 @@ async def start_gateways():
         startup_delay = 0.0 
         
         for sym in all_symbols:
+            spec = SUBSCRIPTION_SPECS[sym]
             # 简化解析逻辑：直接加斜杠
-            if "/" not in sym:
-                quote = "USDT" if sym.endswith("USDT") else "BTC"
-                sym_standard = f"{sym[:-len(quote)]}/{quote}"
+            market_symbol = spec["market_symbol"]
+            if "/" not in market_symbol:
+                quote = "USDT" if market_symbol.endswith("USDT") else "BTC"
+                sym_standard = f"{market_symbol[:-len(quote)]}/{quote}"
             else:
-                sym_standard = sym
+                sym_standard = market_symbol
 
             # 自动分配引擎
-            is_spot = (sym in AUX_SYMBOLS)
+            is_spot = spec["is_spot"]
             ex = build_exchange(is_spot)
             exchange_registry[sym] = ex
             
@@ -1607,7 +1647,7 @@ async def get_market_snapshot(symbol: str):
     }
     
     # 只有主币种附加深度微观特征
-    if clean_sym == SYMBOL or clean_sym.replace("/", "") == SYMBOL:
+    if clean_sym in LIVE_MAIN_SYMBOL_SET or clean_sym.replace("/", "") in LIVE_MAIN_SYMBOL_SET:
         # 🚨 修正：彻底剔除未闭合的 1m K 线，防止 RV 污染
         safe_1m = list(data.get("1m", []))
         current_minute_ts = int(time.time() / 60) * 60000

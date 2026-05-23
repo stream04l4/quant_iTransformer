@@ -10,24 +10,63 @@ import ccxt
 from state_manager import state
 from execution_oms import build_gate_close_stop_initial, get_gate_stop_coverage_size, log_system_alert
 from quant_config.config import (
-    DATA_DIR, LIVE_DATA_DIR, MODEL_DIR,
+    DATA_DIR, LIVE_DATA_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     HARD_TP, HARD_SL, HOLD_PERIOD, 
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1,
-    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS
 )
 from dotenv import load_dotenv
 load_dotenv()
 
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
-JSON_PATH = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
 
 
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _normalize_live_configs():
+    raw_configs = LIVE_SYMBOL_CONFIGS if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS else {
+        SYMBOL: {"experiment_id": EXPERIMENT_ID, "aux_symbols": AUX_SYMBOLS}
+    }
+    normalized = {}
+    for raw_symbol, cfg in raw_configs.items():
+        sym_key = _normalize_symbol_key(raw_symbol)
+        cfg = cfg or {}
+        normalized[sym_key] = {"experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID))}
+    return normalized
+
+
+LIVE_CONFIGS = _normalize_live_configs()
+
+
+def _load_thresholds_by_symbol():
+    thresholds = {}
+    for sym_key, cfg in LIVE_CONFIGS.items():
+        exp_id = cfg.get("experiment_id", EXPERIMENT_ID)
+        json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+        try:
+            with open(json_path, "r") as f:
+                config_data = json.load(f)
+                thresholds[sym_key] = config_data.get("thresholds", config_data)
+        except Exception as e:
+            print(f"❌ 右脑加载 {sym_key} 阈值文件失败 ({json_path.name}): {e}")
+            thresholds[sym_key] = {}
+    return thresholds
+
+
+def _status_for_symbol(live_status, base_sym):
+    base_sym = _normalize_symbol_key(base_sym)
+    symbol_status = (live_status.get("symbols", {}) or {}).get(base_sym)
+    if symbol_status:
+        return symbol_status
+    if _normalize_symbol_key(live_status.get("symbol")) == base_sym:
+        return live_status
+    return {}
 
 
 def _inspect_snapshot_stop_coverage(position):
@@ -251,7 +290,7 @@ def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_s
     )
 
 
-def _read_last_inferred_hour():
+def _read_last_inferred_hour(base_sym=None):
     """读取主引擎最近一次使用的闭合 1h K 线时间戳，供强制退出后做本K线冷却。"""
     status_path = os.path.join(LIVE_DATA_DIR, "live_status.json")
     if not os.path.exists(status_path):
@@ -260,6 +299,9 @@ def _read_last_inferred_hour():
     try:
         with open(status_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
+        if base_sym is not None:
+            symbol_status = _status_for_symbol(payload, base_sym)
+            return int(symbol_status.get("execution_state", {}).get("last_inferred_hour", 0) or 0)
         return int(payload.get("execution_state", {}).get("last_inferred_hour", 0) or 0)
     except Exception:
         return 0
@@ -271,7 +313,7 @@ def _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=None):
     只有等到下一根新 K 线闭合，主引擎才允许再次入场。
     """
     if anchor_closed_ts is None:
-        anchor_closed_ts = _read_last_inferred_hour()
+        anchor_closed_ts = _read_last_inferred_hour(base_sym)
     try:
         anchor_closed_ts = int(anchor_closed_ts or 0)
     except (TypeError, ValueError):
@@ -421,15 +463,7 @@ def bailout_worker():
     bailout_cooldown_locks = {}
     last_worker_error_ts = 0.0
     
-    # 加载回测同款概率阈值
-    th = {}
-    try:
-        with open(JSON_PATH, 'r') as f:
-            config_data = json.load(f)
-            # 🚨 修复 2：解包带有 metadata 信息的工业级 JSON 格式
-            th = config_data.get("thresholds", config_data)
-    except Exception as e:
-        print(f"❌ 右脑加载阈值文件失败，请检查模型编号: {e}")
+    thresholds_by_symbol = _load_thresholds_by_symbol()
 
     while True:
         try:
@@ -453,11 +487,6 @@ def bailout_worker():
                         live_status = json.load(f)
                 except: pass
                 
-            # 🚨 修复 1：读取模型最原始的输出概率，切断字段命名错位
-            inference_data = live_status.get("model_inference", {})
-            raw_p_up = inference_data.get("raw_prob_up", 0.0)
-            raw_p_down = inference_data.get("raw_prob_down", 0.0)
-
             hard_tp = HARD_TP   # K线物理止盈幅度（直接来自 config）
             hard_sl = HARD_SL   # K线物理底部止损幅度（直接来自 config）
             
@@ -478,6 +507,12 @@ def bailout_worker():
                 
             for p, base_sym, data in results:
                 try:
+                    symbol_status = _status_for_symbol(live_status, base_sym)
+                    inference_data = symbol_status.get("model_inference", {}) or {}
+                    raw_p_up = inference_data.get("raw_prob_up", 0.0)
+                    raw_p_down = inference_data.get("raw_prob_down", 0.0)
+                    th = thresholds_by_symbol.get(base_sym, {})
+
                     gate_sym = p['symbol']
                     pos_side = str(p.get('side', '')).upper()
                     info = p.get('info', {}) or {}
@@ -541,7 +576,7 @@ def bailout_worker():
                     # ---------------------------------------------------------
                     current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
-                    _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_status, th)
+                    _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, symbol_status, th)
                     hold_hours = (time.time() - mem['entry_time']) / 3600.0
                     
                     # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，

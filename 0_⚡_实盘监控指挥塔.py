@@ -20,11 +20,14 @@ from quant_config.config import (
     SYMBOL, DATA_DIR, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
-    FORECAST_HORIZON, EXPERIMENT_ID
+    FORECAST_HORIZON, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS
 )
 
 # --- 核心配置路径 ---
-ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
+if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS:
+    ALL_SYMBOLS = [str(s).split(":")[0].replace("/", "") for s in LIVE_SYMBOL_CONFIGS.keys()]
+else:
+    ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
 
 # --- UI 页面配置与高频轮询开关 ---
 st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
@@ -1257,6 +1260,7 @@ def render_market_radar():
                 with open(status_file, "r") as f:
                     status_data = json.load(f)
             except: pass
+        status_data = (status_data.get("symbols", {}) or {}).get(target_symbol, status_data)
             
         # 填充展示指标 (优先使用根节点的 timestamp，适配新 Payload)
         last_update_ts = status_data.get("timestamp", time.time())
