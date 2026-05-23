@@ -40,7 +40,12 @@ BACKTEST_SEARCH_SPACE = {
 # 🚨 修复：传入 target_horizon，精准提取目标周期的核心指标
 def extract_alpha_metrics(output, target_horizon):
     metrics = {}
-    pattern = r"\[N=(\d+)h\]\s+胜率:\s*([\d\.]+)%\s*\|\s*单笔期望:\s*([\+\-\d\.]+)%\s*\|\s*IC:\s*([\+\-\d\.]+)\s*\|\s*Rank_IC:\s*([\+\-\d\.]+)"
+    num = r"([\+\-]?(?:\d+(?:\.\d*)?|\.\d+|inf))"
+    pattern = (
+        rf"\[N=(\d+)h\]\s+胜率:\s*{num}%\s*\|\s*"
+        rf"单笔期望:\s*{num}%\s*\|\s*IC:\s*{num}\s*\|\s*Rank_IC:\s*{num}"
+        rf"(?:\s*\|\s*IC_IR:\s*{num}\s*\|\s*IC胜率:\s*{num}%\s*\|\s*IC_MDD:\s*{num})?"
+    )
     matches = re.findall(pattern, output)
     
     for m in matches:
@@ -49,10 +54,16 @@ def extract_alpha_metrics(output, target_horizon):
         metrics[f'mean_ret_{n}h'] = float(m[2])
         metrics[f'ic_{n}h'] = float(m[3])
         metrics[f'rank_ic_{n}h'] = float(m[4])
+        metrics[f'ic_ir_{n}h'] = float(m[5]) if m[5] else 0.0
+        metrics[f'ic_win_rate_{n}h'] = float(m[6]) if m[6] else 0.0
+        metrics[f'ic_mdd_{n}h'] = float(m[7]) if m[7] else 0.0
         
     # 精准锚定主要排序指标
     metrics['primary_rank_ic'] = metrics.get(f'rank_ic_{target_horizon}h', 0.0)
     metrics['primary_acc'] = metrics.get(f'acc_{target_horizon}h', 0.0)
+    metrics['primary_ic_ir'] = metrics.get(f'ic_ir_{target_horizon}h', 0.0)
+    metrics['primary_ic_win_rate'] = metrics.get(f'ic_win_rate_{target_horizon}h', 0.0)
+    metrics['primary_ic_mdd'] = metrics.get(f'ic_mdd_{target_horizon}h', 0.0)
     return metrics
 
 def extract_backtest_metrics(output):
@@ -210,7 +221,14 @@ def main():
                         target_hz = res.get('FORECAST_HORIZON', 12)
                         rank_ic = res.get('primary_rank_ic', 0)
                         acc_val = res.get('primary_acc', 0)
-                        print(f"   {progress_str} 🧠 [Alpha] 核心 {target_hz}h Rank_IC: {rank_ic:>+6.4f} | 胜率: {acc_val:>5.2f}% | ID: {res['exp_id']}")
+                        ic_ir = res.get('primary_ic_ir', 0)
+                        ic_win = res.get('primary_ic_win_rate', 0)
+                        ic_mdd = res.get('primary_ic_mdd', 0)
+                        print(
+                            f"   {progress_str} 🧠 [Alpha] 核心 {target_hz}h Rank_IC: {rank_ic:>+6.4f} | "
+                            f"IC_IR: {ic_ir:>+6.3f} | IC胜率: {ic_win:>5.2f}% | IC_MDD: {ic_mdd:>6.4f} | "
+                            f"胜率: {acc_val:>5.2f}% | ID: {res['exp_id']}"
+                        )
                     else:
                         print(f"   {progress_str} 🏦 [回测] 期望值: {res['expectancy_pct']:>+6.3f}% | 恢复因子: {res['recovery_factor']:>5.2f} | ID: {res['exp_id']}")
         
