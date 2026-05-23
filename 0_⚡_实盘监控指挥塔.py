@@ -19,7 +19,7 @@ load_dotenv()
 from quant_config.config import (
     SYMBOL, DATA_DIR, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
-    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI,
+    BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
     FORECAST_HORIZON, EXPERIMENT_ID
 )
 
@@ -1170,6 +1170,7 @@ st.sidebar.markdown(f"""
 |  单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
 | 🟢 K线物理止盈 | `{HARD_TP*100:.1f}%` |
 | 🔴 K线物理止损 | `{HARD_SL*100:.1f}%` |
+| 📍 追踪ATR回撤 | `ATR({TRAILING_ATR_PERIOD}) × {TRAILING_ATR_MULTI}` |
 | ⚡ 瀑布ATR乘数 | `{BAILOUT_ATR_MULTI}x` |
 | 📊 爆量乘数 | `{BAILOUT_VOL_MULTI}x` |
 | **📈 做多门槛 (Tier 1/2/3)** | `{th.get('up_top_10', 0):.2%} / {th.get('up_top_5', 0):.2%} / {th.get('up_top_1', 0):.2%}` |

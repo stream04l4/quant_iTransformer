@@ -29,12 +29,13 @@ ALPHA_SEARCH_SPACE = {
 }
 
 BACKTEST_SEARCH_SPACE = {
-    'LEVERAGE_1': [1.0, 2.0],
-    'LEVERAGE_2': [2.0, 3.0],
-    'LEVERAGE_3': [3.0, 4.0, 5.0],
-    'HOLD_PERIOD': [6, 12, 24],
+    'LEVERAGE_1': [2.0],
+    'LEVERAGE_2': [5.0],
+    'LEVERAGE_3': [8.0],
+    'HOLD_PERIOD': [12],
     'HARD_TP': [0.03, 0.04, 0.05],
-    'HARD_SL': [0.015, 0.02, 0.03, 0.04]
+    'HARD_SL': [0.015, 0.02, 0.03, 0.04],
+    'TRAILING_ATR_MULTI': [5.0]
 }
 
 # 🚨 修复：传入 target_horizon，精准提取目标周期的核心指标

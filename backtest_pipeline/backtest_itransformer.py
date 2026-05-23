@@ -15,9 +15,21 @@ sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
     EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, 
-    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON
+    LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
 )
 from historical_pipeline.train_itransformer import InvertedTransformer
+
+
+def _compute_atr(highs, lows, closes, period):
+    prev_closes = np.roll(closes, 1)
+    prev_closes[0] = closes[0]
+    true_ranges = np.maximum.reduce([
+        highs - lows,
+        np.abs(highs - prev_closes),
+        np.abs(lows - prev_closes),
+    ])
+    return pd.Series(true_ranges).rolling(period, min_periods=1).mean().to_numpy()
 
 
 def run_backtest():
@@ -116,6 +128,7 @@ def run_backtest():
     highs_1m = df_1m["high"].to_numpy()
     lows_1m = df_1m["low"].to_numpy()
     closes_1m = df_1m["close"].to_numpy()
+    atr_1m = _compute_atr(highs_1m, lows_1m, closes_1m, TRAILING_ATR_PERIOD)
 
     valid_timestamps_sec = np.array(valid_timestamps).astype('datetime64[s]').astype(np.int64)
 
@@ -324,6 +337,13 @@ def run_backtest():
                         best_intra = (entry_price - m_low) / entry_price
                         close_return = (entry_price - m_close) / entry_price
 
+                    atr_price = atr_1m[m_idx] if m_idx < len(atr_1m) else 0.0
+                    trailing_retrace_phys = (
+                        TRAILING_ATR_MULTI * atr_price / entry_price
+                        if entry_price > 0 and atr_price > 0
+                        else 0.0
+                    )
+
                     hold_timer_mins -= 1
 
                     worst_pnl_pct = current_leverage * worst_intra
@@ -356,8 +376,8 @@ def run_backtest():
                             trailing_active = True
                             dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
                             
-                    if trailing_active:
-                        dynamic_sl_phys = max(dynamic_sl_phys, max_unrealized_phys_pnl - 0.01)
+                    if trailing_active and trailing_retrace_phys > 0:
+                        dynamic_sl_phys = max(dynamic_sl_phys, max_unrealized_phys_pnl - trailing_retrace_phys)
 
                     if worst_intra <= dynamic_sl_phys:
                         close_position = True

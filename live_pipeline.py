@@ -18,7 +18,7 @@ from quant_config.config import (
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
-    EXPERIMENT_ID, TRAIN_DATA_DIR  
+    EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -799,6 +799,8 @@ def run_live():
             # 右脑风控熔断器参数（直接来自 config）
             state.dynamic_settings["bailout_atr_multi"] = BAILOUT_ATR_MULTI
             state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
+            state.dynamic_settings["trailing_atr_period"] = TRAILING_ATR_PERIOD
+            state.dynamic_settings["trailing_atr_multi"] = TRAILING_ATR_MULTI
             
             # 仓位保证金与止盈止损参数（直接来自 config）
             dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET  # 单笔保证金 = 总资本 × 风险拨备率

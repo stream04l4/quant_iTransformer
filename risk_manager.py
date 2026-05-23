@@ -14,7 +14,8 @@ from quant_config.config import (
     HARD_TP, HARD_SL, HOLD_PERIOD, 
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID,
-    MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1
+    MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1,
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -97,6 +98,25 @@ def _inspect_snapshot_stop_coverage(position):
         "coverage_ratio": coverage_ratio,
         "reason": "",
     }
+
+
+def _calc_recent_atr(ohlcv, period, current_close=None):
+    if not ohlcv or len(ohlcv) < 2:
+        return 0.0
+
+    recent = ohlcv[-(period + 1):]
+    tr_list = []
+    for i in range(1, len(recent)):
+        prev_close = float(recent[i - 1][4])
+        curr_h = float(recent[i][2])
+        curr_l = float(recent[i][3])
+        if current_close is not None and i == len(recent) - 1:
+            curr_h = max(curr_h, float(current_close))
+            curr_l = min(curr_l, float(current_close))
+        tr = max(curr_h - curr_l, abs(curr_h - prev_close), abs(curr_l - prev_close))
+        tr_list.append(tr)
+
+    return sum(tr_list) / len(tr_list) if tr_list else 0.0
 
 
 def _safe_parse_epoch(raw_value):
@@ -468,6 +488,11 @@ def bailout_worker():
                     mark_px = float(p.get('markPrice', info.get('mark_price', entry_px)) or entry_px)
                     current_close = float(data.get('current_price', mark_px) if data else mark_px)
                     current_close = current_close if current_close > 0 else entry_px
+                    trailing_atr_price = (
+                        _calc_recent_atr(data.get('ohlcv_1m'), TRAILING_ATR_PERIOD, current_close)
+                        if data and data.get('ohlcv_1m')
+                        else 0.0
+                    )
 
                     # 冷却检测 (防重复触发)
                     last_fired_time = bailout_cooldown_locks.get(base_sym, 0)
@@ -543,9 +568,10 @@ def bailout_worker():
                         mem['trailing_active'] = True
                         mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], hard_tp)
                         
-                    # 追踪算法应用：1% 回撤限制
-                    if mem['trailing_active']:
-                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['max_phys_pnl'] - 0.01)
+                    # 追踪算法应用：ATR 自适应回撤限制
+                    if mem['trailing_active'] and trailing_atr_price > 0:
+                        trailing_retrace_phys = TRAILING_ATR_MULTI * trailing_atr_price / entry_px
+                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['max_phys_pnl'] - trailing_retrace_phys)
 
                     if need_market_close:
                         execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)

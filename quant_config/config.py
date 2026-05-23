@@ -69,6 +69,9 @@ FEE_RATE = 0.0005
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
 HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.04))           
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.04))
+# 追踪止盈回撤宽度：ATR(period) × multi / entry_price，替代固定 1% 回撤。
+TRAILING_ATR_PERIOD = int(os.environ.get("OPT_TRAILING_ATR_PERIOD", 14))
+TRAILING_ATR_MULTI = float(os.environ.get("OPT_TRAILING_ATR_MULTI", 5.0))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
