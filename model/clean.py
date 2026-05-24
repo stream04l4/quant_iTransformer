@@ -20,7 +20,12 @@ SAFE_IDS = [
     "2C2F9681",
     "80F2A0DE",
     "1A86D81B",
-    "E8A6060C"
+    "E8A6060C",
+    "C2615AA6",
+    "31814EBA",
+    "6ADB71DE",
+    "E170B793",
+    "B41D609C",
 ]
 DELETE_PATTERNS = [
     "dynamic_thresholds_EXP_*.json",

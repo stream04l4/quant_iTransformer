@@ -279,7 +279,11 @@ def train_model():
                 
         avg_val_loss = val_loss / len(val_loader)
         val_acc = (val_correct / val_total) * 100
+        prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr < prev_lr:
+            print(f"    📉 验证 Loss 进入平台期，学习率自动降低: {prev_lr:.2e} -> {current_lr:.2e}")
         
         # 🚨 诊断打印：监控模型是否摆烂（只预测震荡类1）
         all_val_preds = torch.cat(val_preds_list)
@@ -287,7 +291,7 @@ def train_model():
         alpha_metrics = compute_validation_alpha_metrics(all_val_logits, val_set.Y, val_set.Y_raw)
         pred_dist = torch.bincount(all_val_preds, minlength=3).cpu().numpy()
         
-        print(f"Epoch [{epoch+1:02d}/{EPOCHS}] LR: {optimizer.param_groups[0]['lr']:.2e} | "
+        print(f"Epoch [{epoch+1:02d}/{EPOCHS}] LR: {current_lr:.2e} | "
               f"T_Loss: {avg_train_loss:.4f} | V_Loss: {avg_val_loss:.4f} (Acc: {val_acc:.2f}%) "
               f"| RankIC: {alpha_metrics['rank_ic']:+.4f} | Top精度: {alpha_metrics['top_precision']:.2%} "
               f"| Spread: {alpha_metrics['tail_return_spread']:+.4f} | Score: {alpha_metrics['selection_score']:+.4f} "

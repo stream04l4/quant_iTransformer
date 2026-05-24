@@ -19,10 +19,10 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
     'SEQ_LEN': [672],
-    'CLASS_THRESHOLD': [0.015],
-    'E_LAYERS': [2],
+    'CLASS_THRESHOLD': [0.018],
+    'E_LAYERS': [1],
     'D_MODEL': [128],
-    'DROPOUT': [0.4],
+    'DROPOUT': [0.3],
     'BATCH_SIZE': [128],
     'LEARNING_RATE': [5e-6],
     'EPOCHS': [100]
@@ -33,8 +33,8 @@ BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_2': [5.0],
     'LEVERAGE_3': [8.0],
     'HOLD_PERIOD': [12],
-    'HARD_TP': [0.015],
-    'HARD_SL': [0.015],
+    'HARD_TP': [0.025],
+    'HARD_SL': [0.025],
     'TRAILING_ATR_MULTI': [3.5]
 }
 
