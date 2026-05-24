@@ -24,24 +24,57 @@ from quant_config.config import (
 )
 
 # --- 核心配置路径 ---
-if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS:
-    ALL_SYMBOLS = [str(s).split(":")[0].replace("/", "") for s in LIVE_SYMBOL_CONFIGS.keys()]
-else:
-    ALL_SYMBOLS = [SYMBOL] if isinstance(SYMBOL, list) else [SYMBOL]
+def _normalize_symbol_key(raw_symbol):
+    """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
+    return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _normalize_live_configs():
+    if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS:
+        raw_configs = LIVE_SYMBOL_CONFIGS
+    else:
+        fallback_symbols = SYMBOL if isinstance(SYMBOL, list) else [SYMBOL]
+        raw_configs = {
+            sym: {"experiment_id": EXPERIMENT_ID, "aux_symbols": AUX_SYMBOLS}
+            for sym in fallback_symbols
+        }
+    normalized = {}
+    for raw_symbol, cfg in raw_configs.items():
+        sym_key = _normalize_symbol_key(raw_symbol)
+        cfg = cfg or {}
+        normalized[sym_key] = {
+            "experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID)),
+            "aux_symbols": [_normalize_symbol_key(s) for s in cfg.get("aux_symbols", [])],
+        }
+    return normalized
+
+
+LIVE_CONFIGS = _normalize_live_configs()
+ALL_SYMBOLS = list(LIVE_CONFIGS.keys())
 
 # --- UI 页面配置与高频轮询开关 ---
 st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
  
-# --- 🧠 加载概率门槛 ---
-th = {}
-try:
-    json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{EXPERIMENT_ID}.json")
-    if os.path.exists(json_path):
-        with open(json_path, 'r') as f:
-            raw_data = json.load(f)
-            th = raw_data.get("thresholds", raw_data)
-except Exception:
-    pass
+# --- 🧠 按实盘配置加载概率门槛 ---
+def _load_thresholds_for_experiment(exp_id):
+    json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{exp_id}.json")
+    if not os.path.exists(json_path):
+        return {}, json_path
+    with open(json_path, 'r') as f:
+        raw_data = json.load(f)
+    return raw_data.get("thresholds", raw_data), json_path
+
+
+THRESHOLDS_BY_SYMBOL = {}
+THRESHOLD_SOURCE_BY_SYMBOL = {}
+for _sym, _cfg in LIVE_CONFIGS.items():
+    _exp_id = _cfg.get("experiment_id", EXPERIMENT_ID)
+    try:
+        _th, _path = _load_thresholds_for_experiment(_exp_id)
+    except Exception:
+        _th, _path = {}, os.path.join(MODEL_DIR, f"dynamic_thresholds_{_exp_id}.json")
+    THRESHOLDS_BY_SYMBOL[_sym] = _th
+    THRESHOLD_SOURCE_BY_SYMBOL[_sym] = {"experiment_id": _exp_id, "path": _path}
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -1166,9 +1199,19 @@ def render_bottom_alerts():
 
 # ---------------------------------------------------------
 # 📋 核心风控参数来自 config.py（只读展示，如需修改请编辑 quant_config/config.py 并重启）
+threshold_symbol = _normalize_symbol_key(
+    st.session_state.get("ui_radar_target") or (ALL_SYMBOLS[0] if ALL_SYMBOLS else SYMBOL)
+)
+if threshold_symbol not in THRESHOLDS_BY_SYMBOL and ALL_SYMBOLS:
+    threshold_symbol = ALL_SYMBOLS[0]
+th = THRESHOLDS_BY_SYMBOL.get(threshold_symbol, {})
+threshold_meta = THRESHOLD_SOURCE_BY_SYMBOL.get(threshold_symbol, {"experiment_id": EXPERIMENT_ID})
+
 st.sidebar.markdown(f"""
 | 参数 | 当前值 |
 |------|--------|
+| 🎯 门槛标的 | `{threshold_symbol}` |
+| 🧬 门槛模型 | `{threshold_meta.get('experiment_id', EXPERIMENT_ID)}` |
 | 🏦 初始资本 | `{INITIAL_CAPITAL:,.0f} USDT` |
 |  单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
 | 🟢 K线物理止盈 | `{HARD_TP*100:.1f}%` |
@@ -1179,6 +1222,8 @@ st.sidebar.markdown(f"""
 | **📈 做多门槛 (Tier 1/2/3)** | `{th.get('up_top_10', 0):.2%} / {th.get('up_top_5', 0):.2%} / {th.get('up_top_1', 0):.2%}` |
 | **📉 做空门槛 (Tier 1/2/3)** | `{th.get('down_top_10', 0):.2%} / {th.get('down_top_5', 0):.2%} / {th.get('down_top_1', 0):.2%}` |
 """)
+if not th:
+    st.sidebar.warning(f"未加载到 {threshold_symbol} 的概率门槛文件，请检查 config.py 中的 experiment_id。")
 
 st.sidebar.divider()
 

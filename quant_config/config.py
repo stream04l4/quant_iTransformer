@@ -106,13 +106,13 @@ LIVE_SYMBOL_CONFIGS = {
         "aux_symbols": AUX_SYMBOLS,
     },
     "BTCUSDT": {
-        "experiment_id": "EXP_BTC模型ID",
+        "experiment_id": "EXP_6ADB71DE",
         "aux_symbols": ["ETHUSDT", "ETHBTC"],
     },
-    "SOLUSDT": {
-        "experiment_id": "EXP_SOL模型ID",
-        "aux_symbols": ["BTCUSDT", "SOLBTC"],
-    },
+##    "SOLUSDT": {
+##        "experiment_id": "EXP_SOL模型ID",
+##        "aux_symbols": ["BTCUSDT", "SOLBTC"],
+##    },
 }
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
