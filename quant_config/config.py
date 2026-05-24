@@ -117,11 +117,11 @@ LIVE_SYMBOL_CONFIGS = {
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))
-EPOCHS = int(os.environ.get("OPT_EPOCHS", 50))
-LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 1e-5))
+EPOCHS = int(os.environ.get("OPT_EPOCHS", 100))
+LEARNING_RATE = float(os.environ.get("OPT_LEARNING_RATE", 5e-6))
 
-D_MODEL = int(os.environ.get("OPT_D_MODEL", 64))
+D_MODEL = int(os.environ.get("OPT_D_MODEL", 128))
 E_LAYERS = int(os.environ.get("OPT_E_LAYERS", 2))
-DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.3))
+DROPOUT = float(os.environ.get("OPT_DROPOUT", 0.4))
 
 CLASS_THRESHOLD = float(os.environ.get("OPT_CLASS_THRESHOLD", 0.015))

@@ -10,11 +10,17 @@ from quant_config.config import MODEL_DIR
 
 # 这是我们要保留的 5 个精英模型的 ID
 SAFE_IDS = [
-    "D47B1607",
-    "89B6D48B",
-    "501C8E18",
-    "E8F51F63",
-    "5EA98898"
+    "65FE6D05",
+    "88265D82",
+    "501A8B93",
+    "7F8A7E79",
+    "F76B3A97",
+    "C948E9A7",
+    "D726B98C",
+    "2C2F9681",
+    "80F2A0DE",
+    "1A86D81B",
+    "E8A6060C"
 ]
 DELETE_PATTERNS = [
     "dynamic_thresholds_EXP_*.json",

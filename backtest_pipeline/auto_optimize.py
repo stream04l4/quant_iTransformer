@@ -18,14 +18,14 @@ from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKT
 
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
-    'SEQ_LEN': [336],
+    'SEQ_LEN': [672],
     'CLASS_THRESHOLD': [0.015],
-    'E_LAYERS': [1],
-    'D_MODEL': [32],
-    'DROPOUT': [0.3],
-    'BATCH_SIZE': [64],
-    'LEARNING_RATE': [1e-5],
-    'EPOCHS': [50]
+    'E_LAYERS': [2],
+    'D_MODEL': [128],
+    'DROPOUT': [0.4],
+    'BATCH_SIZE': [128],
+    'LEARNING_RATE': [5e-6],
+    'EPOCHS': [100]
 }
 
 BACKTEST_SEARCH_SPACE = {
