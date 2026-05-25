@@ -46,6 +46,7 @@ def extract_alpha_metrics(output, target_horizon):
         rf"\[N=(\d+)h\]\s+胜率:\s*{num}%\s*\|\s*"
         rf"单笔期望:\s*{num}%\s*\|\s*IC:\s*{num}\s*\|\s*Rank_IC:\s*{num}"
         rf"(?:\s*\|\s*IC_IR:\s*{num}\s*\|\s*IC胜率:\s*{num}%\s*\|\s*IC_MDD:\s*{num})?"
+        rf"(?:\s*\|\s*信号:\s*(\d+)/(\d+)\s*\({num}%\))?"
     )
     matches = re.findall(pattern, output)
     
@@ -58,6 +59,9 @@ def extract_alpha_metrics(output, target_horizon):
         metrics[f'ic_ir_{n}h'] = float(m[5]) if m[5] else 0.0
         metrics[f'ic_win_rate_{n}h'] = float(m[6]) if m[6] else 0.0
         metrics[f'ic_mdd_{n}h'] = float(m[7]) if m[7] else 0.0
+        metrics[f'trade_count_{n}h'] = int(m[8]) if m[8] else 0
+        metrics[f'sample_count_{n}h'] = int(m[9]) if m[9] else 0
+        metrics[f'signal_coverage_{n}h'] = float(m[10]) if m[10] else 0.0
         
     # 精准锚定主要排序指标
     metrics['primary_rank_ic'] = metrics.get(f'rank_ic_{target_horizon}h', 0.0)
@@ -65,6 +69,9 @@ def extract_alpha_metrics(output, target_horizon):
     metrics['primary_ic_ir'] = metrics.get(f'ic_ir_{target_horizon}h', 0.0)
     metrics['primary_ic_win_rate'] = metrics.get(f'ic_win_rate_{target_horizon}h', 0.0)
     metrics['primary_ic_mdd'] = metrics.get(f'ic_mdd_{target_horizon}h', 0.0)
+    metrics['primary_trade_count'] = metrics.get(f'trade_count_{target_horizon}h', 0)
+    metrics['primary_sample_count'] = metrics.get(f'sample_count_{target_horizon}h', 0)
+    metrics['primary_signal_coverage'] = metrics.get(f'signal_coverage_{target_horizon}h', 0.0)
     return metrics
 
 def extract_backtest_metrics(output):
@@ -72,7 +79,8 @@ def extract_backtest_metrics(output):
         'win_rate': 0.0, 'final_equity': 0.0, 'sharpe': 0.0, 'trades': 0,
         'max_drawdown': 0.0, 'profit_factor': 0.0, 'calmar': 0.0, 'ls_ratio': 0.0,
         'recovery_factor': 0.0, 'expectancy_pct': 0.0,
-        'exit_reversal': 0, 'exit_hard_sl': 0, 'exit_trailing': 0, 'exit_timeout': 0
+        'exit_reversal': 0, 'exit_hard_sl': 0, 'exit_trailing': 0, 'exit_timeout': 0,
+        'exit_liquidation': 0
     }
     try:
         if match := re.search(r"▪ 撮合交易数 : (\d+) 笔 \(多:(\d+) \| 空:(\d+)\)", output):
@@ -93,6 +101,7 @@ def extract_backtest_metrics(output):
         if match := re.search(r"▪ HARD_SL_EXIT\s*:\s*(\d+)", output): metrics['exit_hard_sl'] = int(match.group(1))
         if match := re.search(r"▪ TRAILING_EXIT\s*:\s*(\d+)", output): metrics['exit_trailing'] = int(match.group(1))
         if match := re.search(r"▪ TIME_LIMIT_EXIT\s*:\s*(\d+)", output): metrics['exit_timeout'] = int(match.group(1))
+        if match := re.search(r"▪ LIQUIDATION_EXIT\s*:\s*(\d+)", output): metrics['exit_liquidation'] = int(match.group(1))
     except Exception: pass
     return metrics
 
@@ -261,9 +270,12 @@ def main():
                         target_hz = res.get('FORECAST_HORIZON', 12)
                         rank_ic = res.get('primary_rank_ic', 0)
                         acc_val = res.get('primary_acc', 0)
+                        alpha_trade_count = res.get('primary_trade_count', 0)
+                        alpha_sample_count = res.get('primary_sample_count', 0)
                         ic_ir = res.get('primary_ic_ir', 0)
                         ic_win = res.get('primary_ic_win_rate', 0)
                         ic_mdd = res.get('primary_ic_mdd', 0)
+                        bt_win_rate = res.get('bt_win_rate', 0)
                         bt_equity = res.get('bt_final_equity', 0)
                         bt_expectancy = res.get('bt_expectancy_pct', 0)
                         bt_mdd = res.get('bt_max_drawdown', 0)
@@ -273,7 +285,8 @@ def main():
                         print(
                             f"   {progress_str} 🧠 [Alpha] 核心 {target_hz}h Rank_IC: {rank_ic:>+6.4f} | "
                             f"IC_IR: {ic_ir:>+6.3f} | IC胜率: {ic_win:>5.2f}% | IC_MDD: {ic_mdd:>6.4f} | "
-                            f"胜率: {acc_val:>5.2f}% || BT净值:{bt_equity:>7.4f} | "
+                            f"Alpha命中:{acc_val:>5.2f}%({alpha_trade_count}/{alpha_sample_count}) || "
+                            f"BT胜率:{bt_win_rate:>5.2f}% | BT净值:{bt_equity:>7.4f} | "
                             f"BT期望:{bt_expectancy:>+6.3f}% | BT回撤:{bt_mdd:>+7.2f}% | "
                             f"交易:{bt_trades:>4} | 综合:{hybrid_score:>+7.4f}{bt_error_note} | ID: {res['exp_id']}"
                         )

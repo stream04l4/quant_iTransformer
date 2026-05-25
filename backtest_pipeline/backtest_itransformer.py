@@ -185,7 +185,8 @@ def run_backtest():
         "REVERSAL_EXIT": 0,    
         "HARD_SL_EXIT": 0,     
         "TRAILING_EXIT": 0,    
-        "TIME_LIMIT_EXIT": 0   
+        "TIME_LIMIT_EXIT": 0,
+        "LIQUIDATION_EXIT": 0,
     }
     pnl_list = [] 
 
@@ -396,6 +397,8 @@ def run_backtest():
                 print(f"💀 盘中分钟级扎针爆仓！发生于 {signal_time}")
                 trade_count += 1
                 gross_loss += trade_start_equity
+                exit_reasons["LIQUIDATION_EXIT"] += 1
+                pnl_list.append(-1.0)
                 continue
                 
             if close_position:
@@ -463,7 +466,7 @@ def run_backtest():
 
     avg_win = np.mean([p for p in pnl_list if p > 0]) if any(p > 0 for p in pnl_list) else 0
     avg_loss = np.mean([p for p in pnl_list if p <= 0]) if any(p <= 0 for p in pnl_list) else 0
-    expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
+    expectancy = float(np.mean(pnl_list)) if pnl_list else 0.0
     recovery_factor = total_return / (abs(max_drawdown)/100) if max_drawdown != 0 else 0
 
     print("\n" + "="*50)

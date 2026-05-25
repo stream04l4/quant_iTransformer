@@ -169,9 +169,12 @@ def evaluate_pure_alpha():
                 
             clean_df['trade_pnl'] = clean_df['signal'] * clean_df[fwd_col]
             trade_df = clean_df[clean_df['signal'] != 0]
+            trade_count = len(trade_df)
+            sample_count = len(clean_df)
+            signal_coverage = trade_count / sample_count if sample_count > 0 else 0.0
             
-            accuracy = (trade_df['trade_pnl'] > 0).mean() if len(trade_df) > 0 else 0
-            mean_return = trade_df['trade_pnl'].mean() if len(trade_df) > 0 else 0
+            accuracy = (trade_df['trade_pnl'] > 0).mean() if trade_count > 0 else 0
+            mean_return = trade_df['trade_pnl'].mean() if trade_count > 0 else 0
             
             ic_val = clean_df['alpha_score'].corr(clean_df[fwd_col], method='pearson')
             rank_ic_val = clean_df['alpha_score'].corr(clean_df[fwd_col], method='spearman')
@@ -182,6 +185,9 @@ def evaluate_pure_alpha():
                 'Mean_Ret': mean_return,
                 'IC': ic_val,
                 'Rank_IC': rank_ic_val,
+                'Trade_Count': trade_count,
+                'Sample_Count': sample_count,
+                'Signal_Coverage': signal_coverage,
                 **daily_rank_ic_stats,
             }
             
@@ -190,6 +196,7 @@ def evaluate_pure_alpha():
         for N in horizons:
             res = metrics.get(N, {
                 'Acc': 0, 'Mean_Ret': 0, 'IC': 0, 'Rank_IC': 0,
+                'Trade_Count': 0, 'Sample_Count': 0, 'Signal_Coverage': 0,
                 'Rank_IC_IR': 0, 'Rank_IC_Win_Rate': 0, 'Rank_IC_MDD': 0,
                 'Daily_Rank_IC_Count': 0,
             })
@@ -198,7 +205,8 @@ def evaluate_pure_alpha():
                 f" {marker} [N={N:02d}h] 胜率:{res['Acc']*100:5.2f}% | "
                 f"单笔期望:{res['Mean_Ret']*100:+6.3f}% | IC:{res['IC']:+6.4f} | "
                 f"Rank_IC:{res['Rank_IC']:+6.4f} | IC_IR:{res['Rank_IC_IR']:+6.3f} | "
-                f"IC胜率:{res['Rank_IC_Win_Rate']*100:5.2f}% | IC_MDD:{res['Rank_IC_MDD']:.4f}"
+                f"IC胜率:{res['Rank_IC_Win_Rate']*100:5.2f}% | IC_MDD:{res['Rank_IC_MDD']:.4f} | "
+                f"信号:{res['Trade_Count']}/{res['Sample_Count']} ({res['Signal_Coverage']*100:.2f}%)"
             )
             row[f'Rank_IC_{N}h'] = res['Rank_IC']
             row[f'Rank_IC_IR_{N}h'] = res['Rank_IC_IR']
@@ -206,6 +214,9 @@ def evaluate_pure_alpha():
             row[f'Rank_IC_MDD_{N}h'] = res['Rank_IC_MDD']
             row[f'Daily_Rank_IC_Count_{N}h'] = res['Daily_Rank_IC_Count']
             row[f'Acc_{N}h'] = res['Acc']
+            row[f'Trade_Count_{N}h'] = res['Trade_Count']
+            row[f'Sample_Count_{N}h'] = res['Sample_Count']
+            row[f'Signal_Coverage_{N}h'] = res['Signal_Coverage']
         print("-" * 60)
         all_reports.append(row)
 

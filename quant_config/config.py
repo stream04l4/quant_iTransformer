@@ -28,8 +28,8 @@ MODEL_DIR = PROJECT_ROOT / "model"
 # ==========================================
 # 2. 交易标的与业务参数 (Trading & Features)
 # ==========================================
-SYMBOL = "SOLUSDT"
-AUX_SYMBOLS = ["BTCUSDT", "SOLBTC"]  
+SYMBOL = "BTCUSDT"
+AUX_SYMBOLS = ["ETHUSDT", "ETHBTC"]  
 
 def normalize_symbol(raw_symbol):
     return str(raw_symbol or "").split(":")[0].replace("/", "").upper()
