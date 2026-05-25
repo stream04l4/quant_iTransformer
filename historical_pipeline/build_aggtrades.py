@@ -84,6 +84,12 @@ def process_csv_to_features(csv_path: Path, output_parquet_path: Path):
     final_df = hourly_features.select([
         "hour_timestamp", "cvd", "whale_buy", "whale_sell", "whale_net_flow",
         "retail_vol", "retail_ratio", "whale_ls_ratio"
+    ]).with_columns([
+        pl.col(col).cast(pl.Float64, strict=False)
+        for col in [
+            "cvd", "whale_buy", "whale_sell", "whale_net_flow",
+            "retail_vol", "retail_ratio", "whale_ls_ratio"
+        ]
     ])
 
     final_df.write_parquet(output_parquet_path)

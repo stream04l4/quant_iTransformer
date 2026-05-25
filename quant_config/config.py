@@ -20,8 +20,9 @@ TRAIN_DATA_DIR = DATA_DIR / "train"
 LIVE_DATA_DIR = DATA_DIR / "live"
 
 TEMP_DIR = TRAIN_DATA_DIR / "raw_temp"
-PROCESSED_AGGTRADES_DIR = TRAIN_DATA_DIR / "processed" / "aggtrades_1h"
-PROCESSED_MAIN_DIR = TRAIN_DATA_DIR / "processed" / "main_features_1h"
+PROCESSED_DIR = TRAIN_DATA_DIR / "processed"
+PROCESSED_AGGTRADES_ROOT = PROCESSED_DIR / "aggtrades_1h"
+PROCESSED_MAIN_ROOT = PROCESSED_DIR / "main_features_1h"
 MODEL_DIR = PROJECT_ROOT / "model"
 
 # ==========================================
@@ -29,6 +30,18 @@ MODEL_DIR = PROJECT_ROOT / "model"
 # ==========================================
 SYMBOL = "SOLUSDT"
 AUX_SYMBOLS = ["BTCUSDT", "SOLBTC"]  
+
+def normalize_symbol(raw_symbol):
+    return str(raw_symbol or "").split(":")[0].replace("/", "").upper()
+
+def processed_aggtrades_dir(symbol=None):
+    return PROCESSED_AGGTRADES_ROOT / normalize_symbol(symbol or SYMBOL)
+
+def processed_main_dir(symbol=None):
+    return PROCESSED_MAIN_ROOT / normalize_symbol(symbol or SYMBOL)
+
+PROCESSED_AGGTRADES_DIR = processed_aggtrades_dir(SYMBOL)
+PROCESSED_MAIN_DIR = processed_main_dir(SYMBOL)
 
 WHALE_NOTIONAL_THRESHOLD_USDT = 200000.0
 RETAIL_NOTIONAL_THRESHOLD_USDT = 4000.0
@@ -38,7 +51,7 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
-DATA_START_MONTH = (2020, 9)   
+DATA_START_MONTH = (2021, 12)   
 DATA_END_MONTH = (2026, 5)     
 
 # ==========================================
@@ -100,20 +113,33 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 
 # 实盘组合配置：训练脚本仍使用上面的 SYMBOL/AUX_SYMBOLS 单币种配置；
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
+# 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
 LIVE_SYMBOL_CONFIGS = {
     SYMBOL: {
         "experiment_id": EXPERIMENT_ID,
         "aux_symbols": AUX_SYMBOLS,
-    },
-    "BTCUSDT": {
-        "experiment_id": "EXP_6ADB71DE",
-        "aux_symbols": ["ETHUSDT", "ETHBTC"],
-    },
-    "SOLUSDT": {
-        "experiment_id": "EXP_SOL模型ID",
-        "aux_symbols": ["BTCUSDT", "SOLBTC"],
+        "models": [
+            {"experiment_id": EXPERIMENT_ID, "weight": 1.0},
+        ],
     },
 }
+
+if normalize_symbol(SYMBOL) != "BTCUSDT":
+    LIVE_SYMBOL_CONFIGS["BTCUSDT"] = {
+        "aux_symbols": ["ETHUSDT", "ETHBTC"],
+        "models": [
+            {"experiment_id": "EXP_6ADB71DE", "weight": 1.0},
+        ],
+    }
+
+# 继续加其它币种时按下面结构追加即可：
+# LIVE_SYMBOL_CONFIGS["ETHUSDT"] = {
+#     "aux_symbols": ["BTCUSDT", "ETHBTC"],
+#     "models": [
+#         {"experiment_id": "EXP_ETH_A", "weight": 0.7},
+#         {"experiment_id": "EXP_ETH_B", "weight": 0.3},
+#     ],
+# }
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
 BATCH_SIZE = int(os.environ.get("OPT_BATCH_SIZE", 128))

@@ -34,6 +34,30 @@ def _normalize_symbol_key(raw_symbol):
     return str(raw_symbol or "").split(":")[0].replace("/", "")
 
 
+def _normalize_model_specs(cfg):
+    raw_models = cfg.get("models")
+    if not raw_models:
+        raw_models = [{"experiment_id": cfg.get("experiment_id", EXPERIMENT_ID), "weight": cfg.get("weight", 1.0)}]
+
+    normalized = []
+    for i, raw_model in enumerate(raw_models):
+        model_cfg = raw_model or {}
+        exp_id = str(model_cfg.get("experiment_id", cfg.get("experiment_id", EXPERIMENT_ID)))
+        weight = float(model_cfg.get("weight", 1.0))
+        if weight <= 0:
+            raise ValueError(f"模型权重必须为正数: experiment_id={exp_id}, weight={weight}")
+        normalized.append({
+            "name": str(model_cfg.get("name", exp_id)),
+            "experiment_id": exp_id,
+            "weight": weight,
+        })
+
+    total_weight = sum(m["weight"] for m in normalized)
+    for model_cfg in normalized:
+        model_cfg["normalized_weight"] = model_cfg["weight"] / total_weight
+    return normalized
+
+
 def _normalize_live_configs():
     raw_configs = LIVE_SYMBOL_CONFIGS if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS else {
         SYMBOL: {"experiment_id": EXPERIMENT_ID, "aux_symbols": AUX_SYMBOLS}
@@ -45,6 +69,7 @@ def _normalize_live_configs():
         normalized[sym_key] = {
             "experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID)),
             "aux_symbols": [_normalize_symbol_key(s) for s in cfg.get("aux_symbols", [])],
+            "models": _normalize_model_specs(cfg),
         }
     return normalized
 
@@ -744,8 +769,8 @@ def _build_inventory_guard(symbol, position_tier_state, position_state_meta):
         "state_source": position_state_meta["source"]
     }
 
-def _load_symbol_runtime(symbol, cfg):
-    exp_id = str(cfg.get("experiment_id", EXPERIMENT_ID))
+def _load_model_component(symbol, model_cfg):
+    exp_id = str(model_cfg.get("experiment_id", EXPERIMENT_ID))
     model_path = MODEL_DIR / f"itransformer_{symbol}_best_{exp_id}.pth"
     json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
 
@@ -754,7 +779,7 @@ def _load_symbol_runtime(symbol, cfg):
     if not json_path.exists():
         raise FileNotFoundError(f"❌ [{symbol}] 找不到动态阈值文件: {json_path}")
 
-    print(f"📥 [{symbol}] 加载模型权重: {model_path.name}")
+    print(f"📥 [{symbol}] 加载模型权重: {model_path.name} | weight={model_cfg['normalized_weight']:.3f}")
     checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
     feature_cols = checkpoint['feature_cols']
     ckpt_seq_len = checkpoint.get('seq_len')
@@ -775,19 +800,81 @@ def _load_symbol_runtime(symbol, cfg):
         thresholds = config_data.get("thresholds", config_data)
 
     return {
-        "symbol": symbol,
+        "name": model_cfg.get("name", exp_id),
         "exp_id": exp_id,
+        "weight": float(model_cfg["normalized_weight"]),
+        "raw_weight": float(model_cfg["weight"]),
         "model_path": model_path,
         "json_path": json_path,
         "model": model,
         "feature_cols": feature_cols,
         "seq_len": ckpt_seq_len,
         "thresholds": thresholds,
+    }
+
+
+def _weighted_thresholds(model_components):
+    threshold_keys = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+    return {
+        key: sum(float(component["thresholds"][key]) * component["weight"] for component in model_components)
+        for key in threshold_keys
+    }
+
+
+def _run_weighted_model_ensemble(rt, features_df):
+    ensemble_probs = np.zeros(3, dtype=np.float64)
+    model_details = []
+
+    with torch.no_grad():
+        for component in rt["models"]:
+            missing_cols = [c for c in component["feature_cols"] if c not in features_df.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"[{rt['symbol']}] 模型 {component['exp_id']} 所需特征缺失: {missing_cols}"
+                )
+
+            inference_window = features_df[component["feature_cols"]].iloc[-component["seq_len"]:]
+            input_raw = inference_window.values.astype('float32')
+            x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+            logits = component["model"](x_tensor)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            ensemble_probs += probs * component["weight"]
+            model_details.append({
+                "name": component["name"],
+                "exp_id": component["exp_id"],
+                "weight": component["weight"],
+                "prob_down": float(probs[0]),
+                "prob_flat": float(probs[1]),
+                "prob_up": float(probs[2]),
+            })
+
+    return ensemble_probs, model_details
+
+
+def _load_symbol_runtime(symbol, cfg):
+    model_components = [_load_model_component(symbol, model_cfg) for model_cfg in cfg.get("models", [])]
+    if not model_components:
+        raise ValueError(f"❌ [{symbol}] 未配置任何实盘模型。")
+    max_seq_len = max(component["seq_len"] for component in model_components)
+    ensemble_thresholds = _weighted_thresholds(model_components)
+    primary_component = model_components[0]
+
+    return {
+        "symbol": symbol,
+        "exp_id": primary_component["exp_id"],
+        "model_path": primary_component["model_path"],
+        "json_path": primary_component["json_path"],
+        "models": model_components,
+        "model_count": len(model_components),
+        "seq_len": max_seq_len,
+        "thresholds": ensemble_thresholds,
         "aux_symbols": cfg.get("aux_symbols", []),
         "last_inferred_hour": 0,
         "cached_p_down": 0.0,
         "cached_p_flat": 0.0,
         "cached_p_up": 0.0,
+        "cached_model_details": [],
         "cached_macro_score": 0.0,
         "last_macro_ts": "0",
         "last_trade_hour": 0,
@@ -881,24 +968,27 @@ def run_live():
                                 direct_cross_snap,
                                 seq_len=rt["seq_len"]
                             )
-                            inference_window = features_df[rt["feature_cols"]].iloc[-rt["seq_len"]:]
-                            input_raw = inference_window.values.astype('float32')
-                            x_tensor = torch.tensor(input_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
                             try:
                                 os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
                                 audit_csv_path = os.path.join(TRAIN_DATA_DIR, f"live_inference_audit_{symbol}.csv")
-                                inference_window.to_csv(audit_csv_path, index=False)
-                                print(f"   💾 [{symbol}] 特征审计矩阵 {inference_window.shape} 已输出至: {audit_csv_path}")
+                                features_df.to_csv(audit_csv_path, index=False)
+                                print(f"   💾 [{symbol}] 特征审计矩阵 {features_df.shape} 已输出至: {audit_csv_path}")
                             except Exception as e:
                                 print(f"   ⚠️ [{symbol}] 特征审计 CSV 输出失败: {e}")
 
-                            with torch.no_grad():
-                                logits = rt["model"](x_tensor)
-                                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                            probs, model_details = _run_weighted_model_ensemble(rt, features_df)
 
                             rt["cached_p_down"], rt["cached_p_flat"], rt["cached_p_up"] = probs[0], probs[1], probs[2]
+                            rt["cached_model_details"] = model_details
                             rt["cached_macro_score"], rt["last_macro_ts"] = get_macro_sentiment_info()
+                            detail_text = " | ".join(
+                                f"{m['exp_id']}@{m['weight']:.2f}: 多{m['prob_up']:.3f}/平{m['prob_flat']:.3f}/空{m['prob_down']:.3f}"
+                                for m in model_details
+                            )
+                            print(f"🧠 [{symbol}] Ensemble({rt['model_count']}): 多{probs[2]:.4f} | 平{probs[1]:.4f} | 空{probs[0]:.4f}")
+                            if detail_text:
+                                print(f"   └─ 子模型: {detail_text}")
                             print(
                                 f"📡 [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] "
                                 f"[{symbol}] 宏观情绪得分: {rt['cached_macro_score']:+.2f} (TS: {rt['last_macro_ts']})"
@@ -1009,8 +1099,12 @@ def run_live():
                             f"{forced_exit_lock.get('reason', '强制退出')} | "
                             f"锁定至下一根闭合K线 (> {forced_exit_lock.get('anchor_closed_ts', 0)})"
                         )
+                    model_stack_text = ", ".join(
+                        f"{m['exp_id']}@{m['weight']:.2f}" for m in rt["cached_model_details"]
+                    ) or "尚无推理明细"
                     eval_log = (
                         f"【触发原因】{trigger_reason}\n"
+                        f"【模型架构】加权Ensemble x{rt['model_count']} | {model_stack_text}\n"
                         f"【原始概率】多:{cached_p_up:.4f} | 平:{cached_p_flat:.4f} | 空:{cached_p_down:.4f}\n"
                         f"【融合概率(入场级Tier1)】多:{adj_up_top10:.4f} | 空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
                         f"【引擎决策】{action_str} | 状态机: {position_tier_state} | 来源: {position_state_meta['source']} | "
@@ -1019,7 +1113,7 @@ def run_live():
                         f"止损覆盖: {inventory_guard['stop_coverage']['status']} | 原因: {inventory_reason_text}"
                         f"\n【强制退出冷却】{forced_exit_text}"
                     )
-                    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 单模型评估汇报:\n{eval_log}\n")
+                    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 多模型评估汇报:\n{eval_log}\n")
                     log_system_alert("🧠 决策评估", symbol, eval_log)
 
                 if actual_signal != 0:
@@ -1059,7 +1153,19 @@ def run_live():
                         "raw_prob_down": float(cached_p_down),
                         "adj_prob_up_tier1": float(adj_up_top10),
                         "adj_prob_down_tier1": float(adj_down_top10),
-                        "macro_score": float(cached_macro_score)
+                        "macro_score": float(cached_macro_score),
+                        "model_count": int(rt["model_count"]),
+                        "ensemble_models": [
+                            {
+                                "name": m["name"],
+                                "experiment_id": m["exp_id"],
+                                "weight": float(m["weight"]),
+                                "prob_up": float(m["prob_up"]),
+                                "prob_flat": float(m["prob_flat"]),
+                                "prob_down": float(m["prob_down"]),
+                            }
+                            for m in rt["cached_model_details"]
+                        ],
                     },
                     "execution_state": {
                         "current_signal": int(actual_signal),

@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import requests
 import zipfile
 import numpy as np
@@ -201,19 +202,93 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
     
     type_temp_dir = TEMP_DIR / "metrics" / symbol
     type_temp_dir.mkdir(parents=True, exist_ok=True)
+    hourly_cache_path = type_temp_dir / f"{symbol}_metrics_hourly.parquet"
+    manifest_path = type_temp_dir / f"{symbol}_metrics_manifest.json"
+
+    def read_metrics_manifest():
+        if not manifest_path.exists():
+            return None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"   ⚠️ Metrics manifest 读取失败，将重新校验缓存: {e}")
+            return None
+
+    def read_hourly_cache():
+        if not hourly_cache_path.exists():
+            return None
+        try:
+            df = pl.read_parquet(hourly_cache_path)
+            required_cols = {"hour_timestamp", "sum_open_interest"}
+            if not required_cols.issubset(set(df.columns)):
+                print(f"   ⚠️ Metrics 小时级缓存 schema 过期，将重建: {hourly_cache_path.name}")
+                return None
+            return df.select(["hour_timestamp", "sum_open_interest"]).sort("hour_timestamp")
+        except Exception as e:
+            print(f"   ⚠️ Metrics 小时级缓存读取失败，将重建: {e}")
+            return None
+
+    def filter_metrics_range(df):
+        end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+        start_inclusive = datetime.combine(start_date, datetime.min.time())
+        return df.filter(
+            (pl.col("hour_timestamp") >= start_inclusive)
+            & (pl.col("hour_timestamp") < end_exclusive)
+        )
+
+    cached_hourly = read_hourly_cache()
+    manifest = read_metrics_manifest()
+    download_start_date = start_date
+
+    if cached_hourly is not None and manifest:
+        try:
+            manifest_end = date.fromisoformat(manifest["requested_end"])
+            if manifest_end >= end_date:
+                cached_slice = filter_metrics_range(cached_hourly)
+                if not cached_slice.is_empty():
+                    print(f"   ♻️ 复用 Metrics 小时级缓存: {hourly_cache_path.name} | {cached_slice.height} 行")
+                    return cached_slice
+            if manifest_end < end_date:
+                download_start_date = manifest_end + timedelta(days=1)
+                print(f"   ♻️ Metrics 已缓存至 {manifest_end}，仅补齐 {download_start_date} -> {end_date}")
+        except Exception as e:
+            print(f"   ⚠️ Metrics manifest 内容异常，将重新扫描日线缓存: {e}")
+
+    if download_start_date > end_date:
+        cached_slice = filter_metrics_range(cached_hourly) if cached_hourly is not None else None
+        return cached_slice if cached_slice is not None and not cached_slice.is_empty() else None
+
+    date_list = [
+        download_start_date + timedelta(days=x)
+        for x in range((end_date - download_start_date).days + 1)
+    ]
+
+    def day_sandbox_dir(d):
+        return type_temp_dir / d.strftime("%Y-%m-%d")
+
+    def is_day_resolved(d):
+        sandbox_dir = day_sandbox_dir(d)
+        if not sandbox_dir.exists():
+            return False
+        has_csv = any(p.is_file() and p.suffix.lower() == ".csv" for p in sandbox_dir.iterdir())
+        return has_csv or (sandbox_dir / "missing.marker").exists()
     
     def download_day(d):
         date_str = d.strftime("%Y-%m-%d")
         url = f"{base_url}/{symbol}/{symbol}-metrics-{date_str}.zip"
         
         # 🚨 每日隔离沙盒
-        sandbox_dir = type_temp_dir / date_str
+        sandbox_dir = day_sandbox_dir(d)
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         zip_path = sandbox_dir / "temp.zip"
+        missing_marker = sandbox_dir / "missing.marker"
 
         existing_csvs = [p for p in sandbox_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
         if existing_csvs:
             return existing_csvs[0]
+        if missing_marker.exists():
+            return None
         
         for attempt in range(3):
             try:
@@ -226,6 +301,9 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
                         z.extract(csv_filename, sandbox_dir)
                     os.remove(zip_path)
                     return sandbox_dir / csv_filename
+                if r.status_code == 404:
+                    missing_marker.write_text(f"{url}\n", encoding="utf-8")
+                    return None
                 time.sleep(1)
             except Exception:
                 time.sleep(1)
@@ -242,7 +320,8 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
                 print(f"   已处理 {i+1}/{len(date_list)} 天的数据...")
 
     if not csv_paths:
-        return None
+        cached_slice = filter_metrics_range(cached_hourly) if cached_hourly is not None else None
+        return cached_slice if cached_slice is not None and not cached_slice.is_empty() else None
 
     print(f"   💾 正在合并 {len(csv_paths)} 天的 Metrics 数据...")
     dfs = []
@@ -274,7 +353,33 @@ def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
     
     # 按小时聚合，提取最末状态
     metrics_hourly = metrics_df.sort("exact_timestamp").group_by("hour_timestamp").last()
-    return metrics_hourly.select(["hour_timestamp", "sum_open_interest"])
+    metrics_hourly = metrics_hourly.select(["hour_timestamp", "sum_open_interest"])
+
+    if cached_hourly is not None and not cached_hourly.is_empty():
+        metrics_hourly = pl.concat([cached_hourly, metrics_hourly], how="vertical_relaxed")
+
+    metrics_hourly = (
+        metrics_hourly
+        .sort("hour_timestamp")
+        .unique(subset=["hour_timestamp"], keep="last")
+        .select(["hour_timestamp", "sum_open_interest"])
+    )
+    metrics_hourly.write_parquet(hourly_cache_path)
+
+    if all(is_day_resolved(d) for d in date_list):
+        old_start = date.fromisoformat(manifest["requested_start"]) if manifest and "requested_start" in manifest else start_date
+        manifest_payload = {
+            "symbol": symbol,
+            "requested_start": min(old_start, start_date).isoformat(),
+            "requested_end": end_date.isoformat(),
+            "hourly_cache": hourly_cache_path.name,
+            "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest_payload, f, ensure_ascii=False, indent=2)
+        print(f"   💾 Metrics 小时级缓存已更新: {hourly_cache_path.name}")
+
+    return filter_metrics_range(metrics_hourly)
 
 def build_rsi_expr(price_col: str, period: int) -> pl.Expr:
     delta = pl.col(price_col).diff()
@@ -482,14 +587,19 @@ def build_features(horizon):
     )
 
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
-    if list(PROCESSED_AGGTRADES_DIR.glob("*.parquet")):
+    symbol_agg_files = sorted(PROCESSED_AGGTRADES_DIR.glob(f"{SYMBOL}_aggTrades_*.parquet"))
+    if symbol_agg_files:
         # 🚨 致命缺陷修复：强行按时间去重，防范月度包与日线增量包交叉覆盖导致的行数爆炸
         # 日线增量通常比月度包更新，显式排序与优先级保证同一小时保留结果可复现。
-        parquet_files = sorted(PROCESSED_AGGTRADES_DIR.glob("*.parquet"))
+        parquet_files = symbol_agg_files
         required_agg_cols = {
             "hour_timestamp", "cvd", "whale_buy", "whale_sell",
             "whale_net_flow", "retail_ratio", "whale_ls_ratio"
         }
+        agg_float_cols = [
+            "cvd", "whale_buy", "whale_sell", "whale_net_flow",
+            "retail_vol", "retail_ratio", "whale_ls_ratio"
+        ]
         invalid_agg_files = []
         for f in parquet_files:
             missing_cols = required_agg_cols - set(pl.read_parquet_schema(f).keys())
@@ -503,12 +613,18 @@ def build_features(horizon):
                 f"{preview}{extra}"
             )
 
-        dfs_agg = [
-            pl.read_parquet(f).with_columns(
-                pl.lit(1 if "_daily_" in f.name else 0).alias("_source_priority")
+        def read_agg_parquet(f: Path) -> pl.DataFrame:
+            df = pl.read_parquet(f)
+            casts = [
+                pl.col(col).cast(pl.Float64, strict=False)
+                for col in agg_float_cols
+                if col in df.columns
+            ]
+            return df.with_columns(
+                casts + [pl.lit(1 if "_daily_" in f.name else 0).alias("_source_priority")]
             )
-            for f in parquet_files
-        ]
+
+        dfs_agg = [read_agg_parquet(f) for f in parquet_files]
         df_agg = (
             pl.concat(dfs_agg, how="diagonal")
             .sort(["hour_timestamp", "_source_priority"])
@@ -522,7 +638,7 @@ def build_features(horizon):
             pl.col("whale_ls_ratio").fill_nan(None)
         ])
     else:
-        print("⚠️ 警告：未找到 aggTrades Parquet 文件，将跳过订单流维度。")
+        print(f"⚠️ 警告：未找到 {SYMBOL} 的 aggTrades Parquet 文件，将跳过订单流维度。")
 
     # 🚨 时序平稳化：去除高度共线的 net_taker_vol，保留 vpt 和 cvd
     print("🌊 [时序平稳化] 正在对高维度绝对量特征进行 Robust Z-Score (MAD) 降维与截断...")

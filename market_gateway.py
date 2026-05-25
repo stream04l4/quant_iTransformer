@@ -13,6 +13,8 @@ import polars as pl
 from quant_config.config import (
     SYMBOL, AUX_SYMBOLS, WHALE_NOTIONAL_THRESHOLD_USDT, RETAIL_NOTIONAL_THRESHOLD_USDT,
     LIVE_DATA_DIR, TEMP_DIR, PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR,
+    PROCESSED_AGGTRADES_ROOT, PROCESSED_MAIN_ROOT,
+    processed_aggtrades_dir, processed_main_dir,
     KLINE_COLS, FUNDING_COLS, LIVE_SYMBOL_CONFIGS
 )
 
@@ -98,7 +100,7 @@ for sym in all_symbols:
 LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = LIVE_DATA_DIR / "gateway_state.db"
 DERIVATIVE_HISTORY_WINDOW_MS = DERIVATIVE_LOOKBACK_HOURS * 3600000
-PROCESSED_DERIVATIVE_CANDIDATE_DIRS = [PROCESSED_AGGTRADES_DIR, PROCESSED_MAIN_DIR]
+PROCESSED_DERIVATIVE_ROOT_DIRS = [PROCESSED_AGGTRADES_ROOT, PROCESSED_MAIN_ROOT]
 DERIVATIVE_METRIC_KEYS = {
     "premium_history": "premium_close",
     "funding_history": "funding_rate",
@@ -302,8 +304,25 @@ def load_tempdir_derivative_history(symbol, cutoff_ts_ms):
                     for row in merged.iter_rows(named=True)
                 ]
 
+    metrics_cache_path = TEMP_DIR / "metrics" / symbol / f"{symbol}_metrics_hourly.parquet"
+    if metrics_cache_path.exists():
+        try:
+            merged = (
+                pl.read_parquet(metrics_cache_path, columns=["hour_timestamp", "sum_open_interest"])
+                .filter(pl.col("hour_timestamp") >= cutoff_dt)
+                .sort("hour_timestamp")
+                .drop_nulls(["hour_timestamp", "sum_open_interest"])
+            )
+            if not merged.is_empty():
+                result["oi_history"] = [
+                    [int(row["hour_timestamp"].timestamp() * 1000), float(row["sum_open_interest"])]
+                    for row in merged.iter_rows(named=True)
+                ]
+        except Exception as e:
+            print(f"   ⚠️ [TEMP_DIR衍生品缓存] {symbol} Metrics 小时级缓存读取失败: {e}")
+
     metrics_files = sorted((TEMP_DIR / "metrics" / symbol).glob("*/*.csv"))
-    if metrics_files:
+    if "oi_history" not in result and metrics_files:
         frames = []
         for file_path in metrics_files:
             try:
@@ -394,12 +413,17 @@ def load_processed_derivative_history(symbol, cutoff_ts_ms):
     frames = []
     scanned_files = 0
 
-    for directory in PROCESSED_DERIVATIVE_CANDIDATE_DIRS:
+    candidate_dirs = [
+        processed_aggtrades_dir(symbol),
+        processed_main_dir(symbol),
+        *PROCESSED_DERIVATIVE_ROOT_DIRS,
+    ]
+    for directory in dict.fromkeys(candidate_dirs):
         if not directory.exists():
             continue
 
         symbol_files = sorted(directory.glob(f"{symbol}*.parquet")) + sorted(directory.glob(f"{symbol}*.csv"))
-        candidate_files = symbol_files if symbol_files else (sorted(directory.glob("*.parquet")) + sorted(directory.glob("*.csv")))
+        candidate_files = symbol_files
 
         for file_path in candidate_files:
             scanned_files += 1
@@ -1303,12 +1327,17 @@ async def sync_local_aggtrades_to_db(symbol):
     """一次性动作：从本地 Parquet 抽取大户/散户拆单特征覆盖到 SQLite"""
     print(f"📂 [订单流预热] 尝试从本地 Parquet 回填 {symbol} 的微观特征...")
     try:
-        parquet_files = list(PROCESSED_AGGTRADES_DIR.glob(f"{symbol}_aggTrades_*.parquet"))
+        agg_dir = processed_aggtrades_dir(symbol)
+        parquet_files = sorted(agg_dir.glob(f"{symbol}_aggTrades_*.parquet"))
+        scan_pattern = agg_dir / f"{symbol}_aggTrades_*.parquet"
+        if not parquet_files:
+            parquet_files = sorted(PROCESSED_AGGTRADES_ROOT.glob(f"{symbol}_aggTrades_*.parquet"))
+            scan_pattern = PROCESSED_AGGTRADES_ROOT / f"{symbol}_aggTrades_*.parquet"
         if not parquet_files:
             return
 
         df = (
-            pl.scan_parquet(PROCESSED_AGGTRADES_DIR / f"{symbol}_aggTrades_*.parquet")
+            pl.scan_parquet(scan_pattern)
             .collect()
             .sort("hour_timestamp")
             .unique(subset=["hour_timestamp"], keep="last")
