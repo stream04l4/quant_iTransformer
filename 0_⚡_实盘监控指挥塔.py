@@ -29,6 +29,33 @@ def _normalize_symbol_key(raw_symbol):
     return str(raw_symbol or "").split(":")[0].replace("/", "")
 
 
+def _normalize_model_specs(cfg):
+    raw_models = cfg.get("models")
+    if not raw_models:
+        raw_models = [{"experiment_id": cfg.get("experiment_id", EXPERIMENT_ID), "weight": cfg.get("weight", 1.0)}]
+
+    normalized = []
+    for raw_model in raw_models:
+        model_cfg = raw_model or {}
+        exp_id = str(model_cfg.get("experiment_id", cfg.get("experiment_id", EXPERIMENT_ID)))
+        weight = float(model_cfg.get("weight", 1.0))
+        if weight <= 0:
+            continue
+        normalized.append({
+            "name": str(model_cfg.get("name", exp_id)),
+            "experiment_id": exp_id,
+            "weight": weight,
+        })
+
+    if not normalized:
+        normalized = [{"name": EXPERIMENT_ID, "experiment_id": EXPERIMENT_ID, "weight": 1.0}]
+
+    total_weight = sum(m["weight"] for m in normalized)
+    for model_cfg in normalized:
+        model_cfg["normalized_weight"] = model_cfg["weight"] / total_weight
+    return normalized
+
+
 def _normalize_live_configs():
     if isinstance(LIVE_SYMBOL_CONFIGS, dict) and LIVE_SYMBOL_CONFIGS:
         raw_configs = LIVE_SYMBOL_CONFIGS
@@ -45,6 +72,7 @@ def _normalize_live_configs():
         normalized[sym_key] = {
             "experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID)),
             "aux_symbols": [_normalize_symbol_key(s) for s in cfg.get("aux_symbols", [])],
+            "models": _normalize_model_specs(cfg),
         }
     return normalized
 
@@ -65,16 +93,47 @@ def _load_thresholds_for_experiment(exp_id):
     return raw_data.get("thresholds", raw_data), json_path
 
 
+def _load_weighted_thresholds(model_specs):
+    threshold_keys = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+    weighted = {key: 0.0 for key in threshold_keys}
+    model_meta = []
+    loaded_any = False
+
+    for spec in model_specs:
+        exp_id = spec["experiment_id"]
+        try:
+            thresholds, path = _load_thresholds_for_experiment(exp_id)
+        except Exception:
+            thresholds, path = {}, os.path.join(MODEL_DIR, f"dynamic_thresholds_{exp_id}.json")
+
+        loaded = bool(thresholds)
+        loaded_any = loaded_any or loaded
+        if loaded:
+            for key in threshold_keys:
+                weighted[key] += float(thresholds.get(key, 0.0)) * spec["normalized_weight"]
+
+        model_meta.append({
+            "name": spec.get("name", exp_id),
+            "experiment_id": exp_id,
+            "weight": spec["normalized_weight"],
+            "path": path,
+            "loaded": loaded,
+        })
+
+    label = ", ".join(f"{m['experiment_id']}@{m['weight']:.2f}" for m in model_meta) or str(EXPERIMENT_ID)
+    return (weighted if loaded_any else {}), {
+        "experiment_id": label,
+        "mode": "weighted_ensemble" if len(model_meta) > 1 else "single_model",
+        "models": model_meta,
+    }
+
+
 THRESHOLDS_BY_SYMBOL = {}
 THRESHOLD_SOURCE_BY_SYMBOL = {}
 for _sym, _cfg in LIVE_CONFIGS.items():
-    _exp_id = _cfg.get("experiment_id", EXPERIMENT_ID)
-    try:
-        _th, _path = _load_thresholds_for_experiment(_exp_id)
-    except Exception:
-        _th, _path = {}, os.path.join(MODEL_DIR, f"dynamic_thresholds_{_exp_id}.json")
+    _th, _meta = _load_weighted_thresholds(_cfg.get("models", []))
     THRESHOLDS_BY_SYMBOL[_sym] = _th
-    THRESHOLD_SOURCE_BY_SYMBOL[_sym] = {"experiment_id": _exp_id, "path": _path}
+    THRESHOLD_SOURCE_BY_SYMBOL[_sym] = _meta
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -320,18 +379,28 @@ def load_trade_history_for_symbol(symbol):
 
 
 def resolve_current_serving_model(symbol):
-    """统一解析当前服役模型身份，优先级: EXPERIMENT_ID > registry > 最新本地权重。"""
-    current_inf_version = str(EXPERIMENT_ID or "").strip() or "unknown"
+    """统一解析当前服役模型身份，兼容单模型与加权 ensemble。"""
+    sym_key = _normalize_symbol_key(symbol)
+    model_specs = LIVE_CONFIGS.get(sym_key, {}).get("models", [])
+    primary_exp_id = str(model_specs[0]["experiment_id"]) if model_specs else str(EXPERIMENT_ID or "").strip()
+    current_inf_version = primary_exp_id or "unknown"
     curr_m_data_version = current_inf_version
     curr_m_name = "未命名"
     curr_m_created_at = pd.NaT
+    model_stack = [
+        {
+            "experiment_id": m.get("experiment_id", "unknown"),
+            "weight": float(m.get("normalized_weight", m.get("weight", 1.0))),
+        }
+        for m in model_specs
+    ]
 
     registry_file = os.path.join(MODEL_DIR, "model_registry.json")
     if os.path.exists(registry_file):
         try:
             with open(registry_file, "r", encoding="utf-8") as f:
                 reg_data = json.load(f)
-            reg_item = reg_data.get(current_inf_version, {})
+            reg_item = reg_data.get(primary_exp_id, {})
             if reg_item:
                 curr_m_data_version = reg_item.get('data_version', curr_m_data_version) or curr_m_data_version
                 curr_m_name = reg_item.get('name', curr_m_name) or curr_m_name
@@ -339,7 +408,7 @@ def resolve_current_serving_model(symbol):
         except Exception:
             pass
 
-    model_file = os.path.join(MODEL_DIR, f"itransformer_{symbol}_best_{current_inf_version}.pth")
+    model_file = os.path.join(MODEL_DIR, f"itransformer_{symbol}_best_{primary_exp_id}.pth")
     if os.path.exists(model_file):
         if curr_m_name == "未命名":
             curr_m_name = os.path.splitext(os.path.basename(model_file))[0]
@@ -374,11 +443,16 @@ def resolve_current_serving_model(symbol):
     if pd.isna(curr_m_created_at):
         curr_m_created_at = pd.to_datetime('2000-01-01')
 
+    if len(model_stack) > 1:
+        current_inf_version = " + ".join(f"{m['experiment_id']}@{m['weight']:.2f}" for m in model_stack)
+        curr_m_name = f"Ensemble x{len(model_stack)}"
+
     return {
         'inference_version': current_inf_version,
         'data_version': curr_m_data_version,
         'name': curr_m_name,
         'created_at': curr_m_created_at,
+        'model_stack': model_stack,
     }
 
 st.title("iTransformer 预测引擎")
@@ -1038,14 +1112,21 @@ with dash_tab4:
     st.caption("此处仅对当前实盘正在加载的 AI 模型进行单独剥离分析，排除历史其他老旧型号的混合数据污染，用于直观评估【大模型当下的实战准确度与诚实度】。")
 
     if not df_closed_trades.empty:
-        model_meta = resolve_current_serving_model(SYMBOL)
+        serving_symbol = _normalize_symbol_key(st.session_state.get("ui_radar_target") or SYMBOL)
+        if serving_symbol not in ALL_SYMBOLS and ALL_SYMBOLS:
+            serving_symbol = ALL_SYMBOLS[0]
+        model_meta = resolve_current_serving_model(serving_symbol)
         current_inf_version = model_meta['inference_version']
         curr_m_data_version = model_meta['data_version']
         curr_m_created_at = model_meta['created_at']
         curr_m_name = model_meta['name']
+        model_stack = model_meta.get('model_stack', [])
+        serving_closed_trades = df_closed_trades.copy()
+        if 'symbol' in serving_closed_trades.columns:
+            serving_closed_trades = serving_closed_trades[serving_closed_trades['symbol'] == serving_symbol].copy()
 
-        version_series = df_closed_trades.get('version', pd.Series(index=df_closed_trades.index, dtype='object')).fillna("unknown")
-        version_matched_df = df_closed_trades[version_series == curr_m_data_version].copy()
+        version_series = serving_closed_trades.get('version', pd.Series(index=serving_closed_trades.index, dtype='object')).fillna("unknown")
+        version_matched_df = serving_closed_trades[version_series == curr_m_data_version].copy()
         v_df_curr = version_matched_df[version_matched_df['exec_ts'] >= curr_m_created_at].copy()
 
         fallback_reason = ""
@@ -1054,19 +1135,21 @@ with dash_tab4:
             if not v_df_curr.empty:
                 fallback_reason = "当前主模型上线后的闭环样本为空，已回退为同血统历史样本。"
         if v_df_curr.empty:
-            known_version_df = df_closed_trades[version_series != "unknown"].copy()
+            known_version_df = serving_closed_trades[version_series != "unknown"].copy()
             if not known_version_df.empty:
                 latest_version = known_version_df.sort_values('exec_ts').iloc[-1]['version']
                 v_df_curr = known_version_df[known_version_df['version'] == latest_version].copy()
                 fallback_reason = f"当前主模型血统暂无闭环样本，已临时展示最近一个有实盘样本的模型血统 `{latest_version}`。"
         if v_df_curr.empty and (version_series == "unknown").any():
-            v_df_curr = df_closed_trades[version_series == "unknown"].copy()
+            v_df_curr = serving_closed_trades[version_series == "unknown"].copy()
             fallback_reason = "历史流水缺少模型血统字段，已退化展示未标注版本的实盘样本。"
         
-        st.info(f"🛡️ **正在服役的主将**: `[{curr_m_data_version}] {curr_m_name}` (指纹 UUID: `{current_inf_version}`)")
+        st.info(f"🛡️ **{serving_symbol} 正在服役的模型组**: `[{curr_m_data_version}] {curr_m_name}` (指纹: `{current_inf_version}`)")
+        if model_stack:
+            st.caption("权重编队: " + " | ".join(f"`{m['experiment_id']}` × {m['weight']:.1%}" for m in model_stack))
         
         if v_df_curr.empty:
-            version_mix = df_closed_trades['version'].value_counts(dropna=False).to_dict()
+            version_mix = serving_closed_trades['version'].value_counts(dropna=False).to_dict() if 'version' in serving_closed_trades.columns else {}
             st.caption(f"⏳ 当前主模型血统 `{curr_m_data_version}` 暂无已完结的【实盘发车】平仓样本。现有历史样本分布: `{version_mix}`")
         else:
             if fallback_reason:
@@ -1206,12 +1289,14 @@ if threshold_symbol not in THRESHOLDS_BY_SYMBOL and ALL_SYMBOLS:
     threshold_symbol = ALL_SYMBOLS[0]
 th = THRESHOLDS_BY_SYMBOL.get(threshold_symbol, {})
 threshold_meta = THRESHOLD_SOURCE_BY_SYMBOL.get(threshold_symbol, {"experiment_id": EXPERIMENT_ID})
+threshold_model_count = len(threshold_meta.get("models", [])) if isinstance(threshold_meta, dict) else 1
+threshold_mode_label = "加权Ensemble" if threshold_model_count > 1 else "单模型"
 
 st.sidebar.markdown(f"""
 | 参数 | 当前值 |
 |------|--------|
 | 🎯 门槛标的 | `{threshold_symbol}` |
-| 🧬 门槛模型 | `{threshold_meta.get('experiment_id', EXPERIMENT_ID)}` |
+| 🧬 门槛模型 | `{threshold_mode_label} x{threshold_model_count}` |
 | 🏦 初始资本 | `{INITIAL_CAPITAL:,.0f} USDT` |
 |  单笔风险预算 | `{BASE_RISK_BUDGET:.1%}` |
 | 🟢 K线物理止盈 | `{HARD_TP*100:.1f}%` |
@@ -1224,6 +1309,23 @@ st.sidebar.markdown(f"""
 """)
 if not th:
     st.sidebar.warning(f"未加载到 {threshold_symbol} 的概率门槛文件，请检查 config.py 中的 experiment_id。")
+with st.sidebar.expander("🧬 模型权重/门槛来源", expanded=False):
+    threshold_models = threshold_meta.get("models", []) if isinstance(threshold_meta, dict) else []
+    if threshold_models:
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "模型": m.get("experiment_id", "unknown"),
+                    "权重": f"{float(m.get('weight', 0.0)):.2%}",
+                    "阈值": "已加载" if m.get("loaded") else "缺失",
+                }
+                for m in threshold_models
+            ]),
+            hide_index=True,
+            width='stretch',
+        )
+    else:
+        st.caption(f"`{threshold_meta.get('experiment_id', EXPERIMENT_ID)}`")
 
 st.sidebar.divider()
 
@@ -1318,8 +1420,9 @@ def render_market_radar():
         
         p_up = inference_data.get("raw_prob_up", 0.33)
         p_down = inference_data.get("raw_prob_down", 0.33)
-        # 通过多空原始概率动态推导震荡概率 (保证和为1)
-        p_flat = max(0.0, 1.0 - p_up - p_down)
+        p_flat = inference_data.get("raw_prob_flat", max(0.0, 1.0 - p_up - p_down))
+        model_count = int(inference_data.get("model_count", 1) or 1)
+        ensemble_models = inference_data.get("ensemble_models", []) or []
         
         adj_p_up = inference_data.get("adj_prob_up_tier1", p_up)
         adj_p_down = inference_data.get("adj_prob_down_tier1", p_down)
@@ -1337,14 +1440,40 @@ def render_market_radar():
         # ==========================================
         # 🧠 第一行：iTransformer 大模型预测概率
         # ==========================================
-        st.markdown("##### iTransformer 大模型概率分布")
-        c1, c2, c3, c4, c5 = st.columns(5)
+        model_title = f"iTransformer 加权多模型概率分布 x{model_count}" if model_count > 1 else "iTransformer 大模型概率分布"
+        st.markdown(f"##### {model_title}")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         
         c1.metric("当前标的价格", f"${current_price:,.4f}")
         c2.metric("宏观情绪加成", f"{macro_score:+.2f}", delta_color="normal" if macro_score != 0 else "off")
         c3.metric("看涨概率 (p_up)", f"{adj_p_up:.2%}", f"原始: {p_up:.2%}")
         c4.metric("震荡概率 (p_flat)", f"{p_flat:.2%}")
         c5.metric("看跌概率 (p_down)", f"{adj_p_down:.2%}", f"原始: {p_down:.2%}")
+        c6.metric("模型票仓", f"{model_count} 个", "加权平均" if model_count > 1 else "单模型")
+
+        if ensemble_models:
+            with st.expander("查看子模型概率与权重", expanded=model_count > 1):
+                model_df = pd.DataFrame([
+                    {
+                        "模型": m.get("experiment_id", m.get("name", "unknown")),
+                        "权重": float(m.get("weight", 0.0)) * 100,
+                        "看涨": float(m.get("prob_up", 0.0)) * 100,
+                        "震荡": float(m.get("prob_flat", 0.0)) * 100,
+                        "看跌": float(m.get("prob_down", 0.0)) * 100,
+                    }
+                    for m in ensemble_models
+                ])
+                st.dataframe(
+                    model_df,
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        "权重": st.column_config.ProgressColumn("权重", format="%.1f%%", min_value=0.0, max_value=100.0),
+                        "看涨": st.column_config.ProgressColumn("看涨", format="%.1f%%", min_value=0.0, max_value=100.0),
+                        "震荡": st.column_config.ProgressColumn("震荡", format="%.1f%%", min_value=0.0, max_value=100.0),
+                        "看跌": st.column_config.ProgressColumn("看跌", format="%.1f%%", min_value=0.0, max_value=100.0),
+                    }
+                )
 
         # --- 绘制极简趋势预测图 ---
         fig = go.Figure()
