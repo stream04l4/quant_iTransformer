@@ -51,6 +51,29 @@ def csv_has_header(csv_path: Path) -> bool:
     except ValueError:
         return True
 
+def csv_schema_overrides(data_type: str) -> dict[str, pl.DataType]:
+    if data_type == "fundingRate":
+        return {
+            "calc_time": pl.Int64,
+            "funding_interval_hours": pl.Float64,
+            "last_funding_rate": pl.Float64,
+        }
+
+    return {
+        "open_time": pl.Int64,
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "volume": pl.Float64,
+        "close_time": pl.Int64,
+        "quote_volume": pl.Float64,
+        "count": pl.Int64,
+        "taker_buy_volume": pl.Float64,
+        "taker_buy_quote_volume": pl.Float64,
+        "ignore": pl.Float64,
+    }
+
 def fetch_binance_data(market, data_type, symbol, year, month, timeframe="1h"):
     month_str = f"{month:02d}"
     base = BINANCE_BASE_URL_FUTURES if market == "futures" else BINANCE_BASE_URL_SPOT
@@ -114,7 +137,12 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
         csv_path = fetch_binance_data(market, data_type, symbol, year, month, timeframe)
         if csv_path and csv_path.exists():
             cols = FUNDING_COLS if data_type == "fundingRate" else KLINE_COLS
-            df = pl.read_csv(csv_path, has_header=csv_has_header(csv_path), new_columns=cols)
+            df = pl.read_csv(
+                csv_path,
+                has_header=csv_has_header(csv_path),
+                new_columns=cols,
+                schema_overrides=csv_schema_overrides(data_type),
+            )
             time_col = "calc_time" if data_type == "fundingRate" else "open_time"
             df = df.cast({col: pl.Float64 for col in cols if col != time_col})
             return df

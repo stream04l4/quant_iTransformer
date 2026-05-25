@@ -27,8 +27,8 @@ MODEL_DIR = PROJECT_ROOT / "model"
 # ==========================================
 # 2. 交易标的与业务参数 (Trading & Features)
 # ==========================================
-SYMBOL = "BTCUSDT"
-AUX_SYMBOLS = ["ETHUSDT", "ETHBTC"]  
+SYMBOL = "SOLUSDT"
+AUX_SYMBOLS = ["BTCUSDT", "SOLBTC"]  
 
 WHALE_NOTIONAL_THRESHOLD_USDT = 200000.0
 RETAIL_NOTIONAL_THRESHOLD_USDT = 4000.0
@@ -38,7 +38,7 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # ==========================================
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
-DATA_START_MONTH = (2020, 1)   
+DATA_START_MONTH = (2020, 9)   
 DATA_END_MONTH = (2026, 5)     
 
 # ==========================================
@@ -109,10 +109,10 @@ LIVE_SYMBOL_CONFIGS = {
         "experiment_id": "EXP_6ADB71DE",
         "aux_symbols": ["ETHUSDT", "ETHBTC"],
     },
-##    "SOLUSDT": {
-##        "experiment_id": "EXP_SOL模型ID",
-##        "aux_symbols": ["BTCUSDT", "SOLBTC"],
-##    },
+    "SOLUSDT": {
+        "experiment_id": "EXP_SOL模型ID",
+        "aux_symbols": ["BTCUSDT", "SOLBTC"],
+    },
 }
 
 SEQ_LEN = int(os.environ.get("OPT_SEQ_LEN", 672))
