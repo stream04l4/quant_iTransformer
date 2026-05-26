@@ -17,6 +17,9 @@ from quant_config.config import (
     LIVE_DATA_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
+    MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE, MACRO_LOGIT_TAIL_SCORE,
+    MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA,
+    MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
     LIVE_SYMBOL_CONFIGS
@@ -417,15 +420,45 @@ def compute_features(main_snap, aux_reference_snap=None, direct_cross_snap=None,
 # ⚡ 贝叶斯 Logit 融合算子
 # ==========================================
 def apply_logit_fusion(base_prob, macro_score, alpha):
-    """将大模型概率转换为 Log-Odds，加上宏观偏置后再还原为概率 (防止概率越界且边缘平滑)"""
+    """
+    将模型概率转换为 Log-Odds 后注入宏观偏置。
+
+    宏观分数采用非线性强度曲线：
+    - 低于 config 中的 dead zone 基本无影响。
+    - 中段对 Tier-1 仅产生小幅概率扰动。
+    - 黑天鹅/大波动区间凸性放大，Tier-1 可直接推动信号越线。
+    - alpha 仍表示档位权重：Tier-1(top10) 最大，Tier-3(top1) 最小。
+    """
     epsilon = 1e-7
-    # 防御性剪裁，防止极端情况除零报错
-    p_safe = np.clip(base_prob, epsilon, 1.0 - epsilon)
-    # 转换为无限边界的 Logit 空间
+    p_safe = np.clip(float(base_prob or 0.0), epsilon, 1.0 - epsilon)
     logit = np.log(p_safe / (1.0 - p_safe))
-    # 注入宏观偏置
-    adjusted_logit = logit + (alpha * macro_score)
-    # Sigmoid 还原回 [0, 1] 空间
+
+    score = float(np.clip(float(macro_score or 0.0), -1.0, 1.0))
+    abs_score = abs(score)
+    sign = 1.0 if score >= 0 else -1.0
+    tier_scale = float(np.clip(float(alpha or 0.0) / max(abs(MACRO_ALPHA_TOP_10), 1e-9), 0.0, 1.0))
+
+    dead_zone = min(max(MACRO_LOGIT_DEAD_ZONE, 0.0), 1.0)
+    mid_score = min(max(MACRO_LOGIT_MID_SCORE, dead_zone + 1e-9), 1.0)
+    tail_score = min(max(MACRO_LOGIT_TAIL_SCORE, mid_score + 1e-9), 1.0)
+
+    if abs_score <= dead_zone:
+        macro_delta = 0.0
+    elif abs_score <= mid_score:
+        x = (abs_score - dead_zone) / (mid_score - dead_zone)
+        macro_delta = MACRO_LOGIT_MID_DELTA * (x ** MACRO_LOGIT_MID_POWER)
+    elif abs_score <= tail_score:
+        x = (abs_score - mid_score) / (tail_score - mid_score)
+        macro_delta = MACRO_LOGIT_MID_DELTA + (
+            MACRO_LOGIT_TAIL_DELTA - MACRO_LOGIT_MID_DELTA
+        ) * (x ** MACRO_LOGIT_TAIL_POWER)
+    else:
+        x = (abs_score - tail_score) / (1.0 - tail_score + 1e-9)
+        macro_delta = MACRO_LOGIT_TAIL_DELTA + (
+            MACRO_LOGIT_MAX_DELTA - MACRO_LOGIT_TAIL_DELTA
+        ) * (x ** MACRO_LOGIT_EXTREME_POWER)
+
+    adjusted_logit = logit + (sign * macro_delta * tier_scale)
     return float(1.0 / (1.0 + np.exp(-adjusted_logit)))
 
 # ==========================================

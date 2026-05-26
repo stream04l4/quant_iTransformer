@@ -87,10 +87,20 @@ TRAILING_ATR_PERIOD = int(os.environ.get("OPT_TRAILING_ATR_PERIOD", 14))
 TRAILING_ATR_MULTI = float(os.environ.get("OPT_TRAILING_ATR_MULTI", 3.5))
 
 # --- 实盘专用风控与仓位参数 ---
-# 宏观情绪 Logit 贝叶斯融合分层系数 (Alpha)
-MACRO_ALPHA_TOP_10 = 0.10            # Tier 1 (入场门槛): 宏观权重极高，主导尾部风险与大趋势
+# 宏观情绪非线性 Logit 融合参数。
+# MACRO_ALPHA_TOP_* 只表示档位相对权重；曲线强度由 MACRO_LOGIT_* 控制。
+MACRO_ALPHA_TOP_10 = 0.10            # Tier 1 (入场门槛): 模型信心不足，外部宏观输入权重最高
 MACRO_ALPHA_TOP_5 = 0.05             # Tier 2 (波段加仓): 宏观权重中等
-MACRO_ALPHA_TOP_1 = 0.02             # Tier 3 (激进杠杆): 宏观权重极低，尊重微观量价动能
+MACRO_ALPHA_TOP_1 = 0.02             # Tier 3 (激进杠杆): 模型信号很强，宏观只做轻微确认
+MACRO_LOGIT_DEAD_ZONE = float(os.environ.get("OPT_MACRO_LOGIT_DEAD_ZONE", 0.20))
+MACRO_LOGIT_MID_SCORE = float(os.environ.get("OPT_MACRO_LOGIT_MID_SCORE", 0.50))
+MACRO_LOGIT_TAIL_SCORE = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_SCORE", 0.80))
+MACRO_LOGIT_MID_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_MID_DELTA", 0.075))
+MACRO_LOGIT_TAIL_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_DELTA", 0.420))
+MACRO_LOGIT_MAX_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_MAX_DELTA", 0.550))
+MACRO_LOGIT_MID_POWER = float(os.environ.get("OPT_MACRO_LOGIT_MID_POWER", 1.35))
+MACRO_LOGIT_TAIL_POWER = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_POWER", 3.0))
+MACRO_LOGIT_EXTREME_POWER = float(os.environ.get("OPT_MACRO_LOGIT_EXTREME_POWER", 1.5))
 
 HEARTBEAT_INTERVAL = 10              # 实盘高频心跳间隔(秒)
 MAX_NOTIONAL_ALTS = 10000            # 实盘非BTC/ETH最大notional(USDT)
