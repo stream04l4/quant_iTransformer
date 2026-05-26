@@ -255,6 +255,36 @@ class TradFiScraper:
 # ==========================================
 # 🧠 V3 大脑：DeepSeek 宏观情绪裁判
 # ==========================================
+def calibrate_macro_score(raw_score, marquee_text="", urgency="low"):
+    """把大模型的自然语言判断压回交易系统可解释的强度标尺。"""
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError):
+        score = 0.0
+
+    score = max(-1.0, min(1.0, score))
+    text = str(marquee_text or "")
+    urgency = str(urgency or "low").lower()
+
+    neutral_terms = [
+        "震荡", "横盘", "观望", "维持", "休市", "数据陈旧",
+        "缺乏方向", "缺乏明确方向", "中性", "互相矛盾"
+    ]
+    extreme_terms = [
+        "黑天鹅", "崩盘", "暴跌", "暴涨", "大跌", "大涨", "急跌", "急涨",
+        "史诗", "逼空", "毁灭性", "交易所被盗", "流动性枯竭", "极端", "高危"
+    ]
+
+    is_neutral_text = any(term in text for term in neutral_terms)
+    has_extreme_text = any(term in text for term in extreme_terms)
+
+    if is_neutral_text and not has_extreme_text:
+        cap = 0.40 if urgency == "medium" else 0.30
+        score = max(-cap, min(cap, score))
+
+    return round(score, 2)
+
+
 class DeepSeekMacroAgent:
     """
     接入 DeepSeek API，负责消化异构数据并输出冷血量化得分。
@@ -331,11 +361,21 @@ class DeepSeekMacroAgent:
            - 数据源：`fear_and_greed`。
 
         【打分情景锚点（请严格参考此标尺校准你的输出分数，防止分数漂移）】
-        +0.80 ~ +1.00：纳指暴涨 + 10年期美债收益率与美元指数大跌 + 宏观与行业消息共振利好 + 极度贪婪。
-        +0.30 ~ +0.50：美股温和上涨，无重大新闻，风险偏好稳定修复。
-        -0.10 ~ +0.10：周末休市期，或者宏观与消息面互相矛盾，缺乏明确方向。
-        -0.50 ~ -0.80：纳指大跌 + 10年期美债收益率与美元指数飙升 + 风险事件扩散。
-        -0.80 ~ -1.00：发生黑天鹅事件（如顶级交易所被盗、监管毁灭性打击、宏观流动性极度枯竭）。
+        +0.00 ~ +0.20：中性震荡、休市/数据陈旧、消息互相矛盾、缺乏明确方向。
+        +0.20 ~ +0.35：轻微风险偏好修复；只允许用于“温和修复/偏暖震荡”，不得称作强趋势。
+        +0.40 ~ +0.60：明确方向性风险偏好改善；必须同时有【新鲜资产】趋势证据或重要利好新闻支撑。普通震荡不得进入本区间。
+        +0.70 ~ +1.00：大波动/极端风险偏好释放；需要 Z-Score > 2 或重大行业/宏观事件共振。
+        -0.00 ~ -0.20：中性偏弱震荡、休市/数据陈旧、消息互相矛盾、缺乏明确方向。
+        -0.20 ~ -0.35：轻微风险偏好降温；只允许用于“弱势震荡/偏冷震荡”，不得称作强趋势。
+        -0.40 ~ -0.60：明确方向性风险偏好恶化；必须同时有【新鲜资产】趋势证据或重要利空新闻支撑。普通震荡不得进入本区间。
+        -0.70 ~ -1.00：大波动/极端恐慌；需要 Z-Score < -2、宏观流动性剧烈收紧或黑天鹅事件。
+
+        【震荡区间硬约束】
+        如果 `marquee_text` 的语义包含“震荡、横盘、观望、维持、休市、数据陈旧、缺乏方向”，且没有明确的“大跌/暴跌/暴涨/黑天鹅/监管毁灭性打击/交易所被盗/流动性枯竭”等极端事件：
+        - `urgency` 必须为 low 或 medium。
+        - low 紧急度时，|score| 不得超过 0.30。
+        - medium 紧急度时，|score| 不得超过 0.40。
+        - 0.40 以上代表较大方向性波动，0.70 以上代表大波动/极端事件，禁止用于普通震荡描述。
 
         【物理限速锁与历史多重锚点防漂移机制 (State Drift Prevention)】：
         如果用户提供了【历史打分基线】（包含 T-1、T-10、T-50），你必须按以下严格逻辑使用它们：
@@ -439,10 +479,18 @@ class DeepSeekMacroAgent:
                     preview = clean_str[:500].replace("\n", "\\n")
                     raise ValueError(f"DeepSeek content 不是合法 JSON: {json_content_err} | preview={preview}")
                 
+                marquee_text = sanitize_marquee_text(str(decision.get("marquee_text", "API 返回解析异常，使用默认兜底。")))
+                urgency = str(decision.get("urgency", "low")).lower()
+                calibrated_score = calibrate_macro_score(
+                    float(decision.get("score", 0.00)),
+                    marquee_text,
+                    urgency,
+                )
+
                 return {
-                    "score": round(float(decision.get("score", 0.00)), 2), 
-                    "marquee_text": sanitize_marquee_text(str(decision.get("marquee_text", "API 返回解析异常，使用默认兜底。"))),
-                    "urgency": str(decision.get("urgency", "low")).lower()
+                    "score": calibrated_score,
+                    "marquee_text": marquee_text,
+                    "urgency": urgency
                 }
                 
             except Exception as e:
