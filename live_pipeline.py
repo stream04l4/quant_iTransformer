@@ -28,6 +28,12 @@ load_dotenv()
 # ==========================================
 GATEWAY_URL = "http://127.0.0.1:8000/api/snapshot"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+GATEWAY_CONNECT_TIMEOUT = 1.0
+GATEWAY_READ_TIMEOUT = 5.0
+GATEWAY_DEGRADED_AFTER = 2
+GATEWAY_ALERT_COOLDOWN = 60.0
+GATEWAY_SESSION = requests.Session()
+gateway_request_state = {}
 
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
@@ -83,6 +89,48 @@ def _resolve_aux_request_symbol(sym):
     sym_key = _normalize_symbol_key(sym)
     return f"{sym_key}_SPOT" if sym_key in LIVE_MAIN_SYMBOL_SET else sym_key
 
+
+def _gateway_request_state(sym):
+    sym_key = _normalize_symbol_key(sym)
+    return gateway_request_state.setdefault(sym_key, {
+        "consecutive_failures": 0,
+        "last_alert_ts": 0.0,
+        "last_error": "",
+    })
+
+
+def _mark_gateway_success(sym, latency_ms):
+    state_info = _gateway_request_state(sym)
+    previous_failures = int(state_info.get("consecutive_failures", 0) or 0)
+    if previous_failures >= GATEWAY_DEGRADED_AFTER:
+        msg = f"本地行情网关已恢复，连续失败清零 | latency={latency_ms:.0f}ms"
+        print(f"✅ [{_normalize_symbol_key(sym)}] {msg}")
+        log_system_alert("✅ 行情网关恢复", _normalize_symbol_key(sym), msg)
+    state_info["consecutive_failures"] = 0
+    state_info["last_error"] = ""
+
+
+def _mark_gateway_failure(sym, reason):
+    sym_key = _normalize_symbol_key(sym)
+    state_info = _gateway_request_state(sym_key)
+    state_info["consecutive_failures"] = int(state_info.get("consecutive_failures", 0) or 0) + 1
+    state_info["last_error"] = reason
+    fail_count = state_info["consecutive_failures"]
+    now = time.time()
+
+    if fail_count == 1:
+        print(f"⚠️ [{sym_key}] 行情网关快照暂不可用: {reason}")
+        return
+
+    if fail_count >= GATEWAY_DEGRADED_AFTER and now - float(state_info.get("last_alert_ts", 0.0) or 0.0) >= GATEWAY_ALERT_COOLDOWN:
+        msg = (
+            f"本地行情网关连续 {fail_count} 次快照失败，主引擎将跳过本轮交易评估 | "
+            f"原因: {reason}"
+        )
+        print(f"❌ [{sym_key}] {msg}")
+        log_system_alert("❌ 行情网关超时", sym_key, msg)
+        state_info["last_alert_ts"] = now
+
 # ==========================================
 # 🧠 宏观情报读取器 (DeepSeek 接口)
 # ==========================================
@@ -110,12 +158,28 @@ def fetch_gateway_snapshot(sym):
     """从本地网关拉取指定币种快照"""
     # 格式化请求符号，兼容网关的 REST 解析
     request_sym = sym.replace("/", "")
+    start_ts = time.time()
     try:
-        resp = requests.get(f"{GATEWAY_URL}/{request_sym}", timeout=2)
+        resp = GATEWAY_SESSION.get(
+            f"{GATEWAY_URL}/{request_sym}",
+            timeout=(GATEWAY_CONNECT_TIMEOUT, GATEWAY_READ_TIMEOUT),
+        )
+        latency_ms = (time.time() - start_ts) * 1000
         if resp.status_code != 200:
+            _mark_gateway_failure(request_sym, f"HTTP {resp.status_code}: {resp.text[:180]}")
             return None
-        return resp.json()
-    except Exception:
+        payload = resp.json()
+        payload["_gateway_latency_ms"] = latency_ms
+        _mark_gateway_success(request_sym, latency_ms)
+        return payload
+    except requests.exceptions.Timeout:
+        _mark_gateway_failure(
+            request_sym,
+            f"读取超时 > {GATEWAY_READ_TIMEOUT:.1f}s；网关进程可能仍存活但 API 响应阻塞",
+        )
+        return None
+    except requests.exceptions.RequestException as e:
+        _mark_gateway_failure(request_sym, f"{type(e).__name__}: {e}")
         return None
 
 def assert_hourly_continuity(df):
@@ -931,12 +995,10 @@ def run_live():
 
         for symbol, rt in runtimes.items():
             try:
-                resp = requests.get(f"{GATEWAY_URL}/{symbol}", timeout=2)
-                if resp.status_code != 200:
-                    print(f"⚠️ [{symbol}] 行情快照不可用: HTTP {resp.status_code}")
+                snapshot = fetch_gateway_snapshot(symbol)
+                if not snapshot:
                     continue
 
-                snapshot = resp.json()
                 current_time = time.time()
                 current_price = snapshot['current_price']
                 try:

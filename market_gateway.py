@@ -2,6 +2,7 @@ import asyncio
 import ccxt.pro as ccxtpro
 from collections import deque
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 import uvicorn
 import threading
 import random
@@ -1646,6 +1647,7 @@ async def start_gateways():
 @app.get("/api/snapshot/{symbol}")
 async def get_market_snapshot(symbol: str):
     """ 核心接口：返回该币种在内存中缓存的所有特征切片 """
+    request_start = time.time()
     # 优先检查原样，兼容全字母（如 BTCUSDT）
     if symbol in market_data_store:
         clean_sym = symbol
@@ -1691,7 +1693,17 @@ async def get_market_snapshot(symbol: str):
             "oi_history": data.get("oi_history", [])
         })
 
-    return response
+    api_response = JSONResponse(content=response)
+    latency_ms = (time.time() - request_start) * 1000
+    if latency_ms > 750:
+        print(
+            f"   ⚠️ [API 慢响应] /api/snapshot/{symbol} -> {clean_sym} "
+            f"耗时 {latency_ms:.0f}ms | "
+            f"1h={len(response.get('ohlcv_1h', []))} "
+            f"1m={len(response.get('ohlcv_1m', []))} "
+            f"taker={len(response.get('taker_stats_1h', {}))}"
+        )
+    return api_response
 
 def run_api():
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

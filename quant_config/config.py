@@ -114,11 +114,18 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 # 实盘组合配置：训练脚本仍使用上面的 SYMBOL/AUX_SYMBOLS 单币种配置；
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
 # 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
+BTCUSDT_LIVE_MODELS = [
+    {"experiment_id": "EXP_6ADB71DE", "weight": 0.4},
+    {"experiment_id": "EXP_A49047F0", "weight": 0.25},
+    {"experiment_id": "EXP_AA8D8236", "weight": 0.2},
+    {"experiment_id": "EXP_321B10D8", "weight": 0.15},
+]
+
 LIVE_SYMBOL_CONFIGS = {
     SYMBOL: {
-        "experiment_id": EXPERIMENT_ID,
+        "experiment_id": "EXP_6ADB71DE" if normalize_symbol(SYMBOL) == "BTCUSDT" else EXPERIMENT_ID,
         "aux_symbols": AUX_SYMBOLS,
-        "models": [
+        "models": BTCUSDT_LIVE_MODELS if normalize_symbol(SYMBOL) == "BTCUSDT" else [
             {"experiment_id": EXPERIMENT_ID, "weight": 1.0},
         ],
     },
@@ -127,9 +134,7 @@ LIVE_SYMBOL_CONFIGS = {
 if normalize_symbol(SYMBOL) != "BTCUSDT":
     LIVE_SYMBOL_CONFIGS["BTCUSDT"] = {
         "aux_symbols": ["ETHUSDT", "ETHBTC"],
-        "models": [
-            {"experiment_id": "EXP_6ADB71DE", "weight": 1.0},
-        ],
+        "models": BTCUSDT_LIVE_MODELS,
     }
 
 # 继续加其它币种时按下面结构追加即可：

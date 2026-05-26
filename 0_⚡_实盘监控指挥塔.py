@@ -1111,16 +1111,23 @@ with dash_tab4:
     st.markdown("##### 🤖 当前服役主模型 (Live) 实盘绩效监控")
     st.caption("此处仅对当前实盘正在加载的 AI 模型进行单独剥离分析，排除历史其他老旧型号的混合数据污染，用于直观评估【大模型当下的实战准确度与诚实度】。")
 
-    if not df_closed_trades.empty:
-        serving_symbol = _normalize_symbol_key(st.session_state.get("ui_radar_target") or SYMBOL)
-        if serving_symbol not in ALL_SYMBOLS and ALL_SYMBOLS:
-            serving_symbol = ALL_SYMBOLS[0]
-        model_meta = resolve_current_serving_model(serving_symbol)
-        current_inf_version = model_meta['inference_version']
-        curr_m_data_version = model_meta['data_version']
-        curr_m_created_at = model_meta['created_at']
-        curr_m_name = model_meta['name']
-        model_stack = model_meta.get('model_stack', [])
+    serving_symbol = _normalize_symbol_key(st.session_state.get("ui_radar_target") or SYMBOL)
+    if serving_symbol not in ALL_SYMBOLS and ALL_SYMBOLS:
+        serving_symbol = ALL_SYMBOLS[0]
+    model_meta = resolve_current_serving_model(serving_symbol)
+    current_inf_version = model_meta['inference_version']
+    curr_m_data_version = model_meta['data_version']
+    curr_m_created_at = model_meta['created_at']
+    curr_m_name = model_meta['name']
+    model_stack = model_meta.get('model_stack', [])
+
+    st.info(f"🛡️ **{serving_symbol} 正在服役的模型组**: `[{curr_m_data_version}] {curr_m_name}` (指纹: `{current_inf_version}`)")
+    if model_stack:
+        st.caption("权重编队: " + " | ".join(f"`{m['experiment_id']}` × {m['weight']:.1%}" for m in model_stack))
+
+    if df_closed_trades.empty:
+        st.info("💡 暂无平仓流水。")
+    else:
         serving_closed_trades = df_closed_trades.copy()
         if 'symbol' in serving_closed_trades.columns:
             serving_closed_trades = serving_closed_trades[serving_closed_trades['symbol'] == serving_symbol].copy()
@@ -1143,11 +1150,6 @@ with dash_tab4:
         if v_df_curr.empty and (version_series == "unknown").any():
             v_df_curr = serving_closed_trades[version_series == "unknown"].copy()
             fallback_reason = "历史流水缺少模型血统字段，已退化展示未标注版本的实盘样本。"
-        
-        st.info(f"🛡️ **{serving_symbol} 正在服役的模型组**: `[{curr_m_data_version}] {curr_m_name}` (指纹: `{current_inf_version}`)")
-        if model_stack:
-            st.caption("权重编队: " + " | ".join(f"`{m['experiment_id']}` × {m['weight']:.1%}" for m in model_stack))
-        
         if v_df_curr.empty:
             version_mix = serving_closed_trades['version'].value_counts(dropna=False).to_dict() if 'version' in serving_closed_trades.columns else {}
             st.caption(f"⏳ 当前主模型血统 `{curr_m_data_version}` 暂无已完结的【实盘发车】平仓样本。现有历史样本分布: `{version_mix}`")
@@ -1202,8 +1204,6 @@ with dash_tab4:
                     )
                     st.plotly_chart(fig_cal, width='stretch')
                     st.caption("*(图解：完美的 AI 应该在预期胜率更高的区间，展现出对应的高物理胜率，即**极佳的校准诚实度**)*")
-    else:
-        st.info("💡 暂无平仓流水。")
 # ==========================================
 # 🚨 引擎底层警报与异常状态监控器 (挪至页末展示)
 # ==========================================
@@ -1417,12 +1417,26 @@ def render_market_radar():
         
         # 安全提取嵌套的 model_inference 数据
         inference_data = status_data.get("model_inference", {})
+        configured_model_stack = resolve_current_serving_model(target_symbol).get("model_stack", [])
         
         p_up = inference_data.get("raw_prob_up", 0.33)
         p_down = inference_data.get("raw_prob_down", 0.33)
         p_flat = inference_data.get("raw_prob_flat", max(0.0, 1.0 - p_up - p_down))
-        model_count = int(inference_data.get("model_count", 1) or 1)
+        configured_model_count = len(configured_model_stack)
+        model_count = max(int(inference_data.get("model_count", 1) or 1), configured_model_count or 1)
         ensemble_models = inference_data.get("ensemble_models", []) or []
+        if not ensemble_models and configured_model_stack:
+            ensemble_models = [
+                {
+                    "experiment_id": m.get("experiment_id", "unknown"),
+                    "weight": float(m.get("weight", 0.0)),
+                    "prob_up": np.nan,
+                    "prob_flat": np.nan,
+                    "prob_down": np.nan,
+                    "status": "等待推理",
+                }
+                for m in configured_model_stack
+            ]
         
         adj_p_up = inference_data.get("adj_prob_up_tier1", p_up)
         adj_p_down = inference_data.get("adj_prob_down_tier1", p_down)
@@ -1457,9 +1471,10 @@ def render_market_radar():
                     {
                         "模型": m.get("experiment_id", m.get("name", "unknown")),
                         "权重": float(m.get("weight", 0.0)) * 100,
-                        "看涨": float(m.get("prob_up", 0.0)) * 100,
-                        "震荡": float(m.get("prob_flat", 0.0)) * 100,
-                        "看跌": float(m.get("prob_down", 0.0)) * 100,
+                        "看涨": np.nan if pd.isna(m.get("prob_up", np.nan)) else float(m.get("prob_up", 0.0)) * 100,
+                        "震荡": np.nan if pd.isna(m.get("prob_flat", np.nan)) else float(m.get("prob_flat", 0.0)) * 100,
+                        "看跌": np.nan if pd.isna(m.get("prob_down", np.nan)) else float(m.get("prob_down", 0.0)) * 100,
+                        "状态": m.get("status", "已推理"),
                     }
                     for m in ensemble_models
                 ])
