@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import torch
 import torch.nn as nn
 import numpy as np
@@ -16,9 +17,219 @@ from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
     EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, 
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
-    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
+    normalize_symbol
 )
 from historical_pipeline.train_itransformer import InvertedTransformer
+
+
+THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="iTransformer probabilistic backtest")
+    parser.add_argument(
+        "--models",
+        default="",
+        help=(
+            "多模型回测配置，格式: EXP_A:0.4,EXP_B:0.6。"
+            "不传则沿用 EXPERIMENT_ID 单模型，保障 auto_optimize 调用链不变。"
+        ),
+    )
+    parser.add_argument(
+        "--use-live-models",
+        action="store_true",
+        help="使用 quant_config.config.LIVE_SYMBOL_CONFIGS 中当前 SYMBOL 的实盘模型组合。",
+    )
+    return parser.parse_args()
+
+
+def _normalize_model_specs(raw_specs):
+    if not raw_specs:
+        raw_specs = [{"experiment_id": EXPERIMENT_ID, "weight": 1.0}]
+
+    normalized = []
+    for raw in raw_specs:
+        exp_id = str(raw.get("experiment_id", EXPERIMENT_ID))
+        weight = float(raw.get("weight", 1.0))
+        if weight <= 0:
+            raise ValueError(f"模型权重必须为正数: experiment_id={exp_id}, weight={weight}")
+        normalized.append({
+            "name": str(raw.get("name", exp_id)),
+            "experiment_id": exp_id,
+            "weight": weight,
+        })
+
+    total_weight = sum(item["weight"] for item in normalized)
+    for item in normalized:
+        item["normalized_weight"] = item["weight"] / total_weight
+    return normalized
+
+
+def _parse_model_specs_arg(models_arg):
+    if not models_arg:
+        return []
+
+    specs = []
+    for chunk in models_arg.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            exp_id, weight = chunk.split(":", 1)
+        elif "@" in chunk:
+            exp_id, weight = chunk.split("@", 1)
+        else:
+            exp_id, weight = chunk, "1.0"
+        specs.append({"experiment_id": exp_id.strip(), "weight": float(weight)})
+    return specs
+
+
+def _model_specs_from_live_config():
+    symbol_key = normalize_symbol(SYMBOL)
+    live_cfg = None
+    for raw_symbol, cfg in (LIVE_SYMBOL_CONFIGS or {}).items():
+        if normalize_symbol(raw_symbol) == symbol_key:
+            live_cfg = cfg or {}
+            break
+
+    if not live_cfg:
+        raise ValueError(f"LIVE_SYMBOL_CONFIGS 中找不到 {SYMBOL} 的实盘模型配置。")
+    return live_cfg.get("models") or [
+        {"experiment_id": live_cfg.get("experiment_id", EXPERIMENT_ID), "weight": 1.0}
+    ]
+
+
+def _resolve_model_specs(args):
+    if args.use_live_models:
+        raw_specs = _model_specs_from_live_config()
+    else:
+        raw_specs = _parse_model_specs_arg(args.models)
+    return _normalize_model_specs(raw_specs)
+
+
+def _load_thresholds(exp_id):
+    json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+    if not json_path.exists():
+        raise FileNotFoundError(f"❌ 找不到动态阈值文件: {json_path}")
+    with open(json_path, "r") as f:
+        config_data = json.load(f)
+    return config_data.get("thresholds", config_data), json_path
+
+
+def _load_model_component(model_cfg, device):
+    exp_id = str(model_cfg["experiment_id"])
+    model_path = MODEL_DIR / f"itransformer_{SYMBOL}_best_{exp_id}.pth"
+    if not model_path.exists():
+        raise FileNotFoundError(f"❌ 找不到模型权重文件: {model_path}")
+
+    print(f"📥 加载回测模型: {model_path.name} | weight={model_cfg['normalized_weight']:.3f}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    feature_cols = checkpoint['feature_cols']
+    ckpt_seq_len = checkpoint.get('seq_len')
+    thresholds, json_path = _load_thresholds(exp_id)
+
+    model = InvertedTransformer(
+        num_variates=len(feature_cols),
+        seq_len=ckpt_seq_len,
+        d_model=checkpoint.get('d_model'),
+        n_heads=checkpoint.get('n_heads'),
+        d_ff=checkpoint.get('d_ff'),
+        e_layers=checkpoint.get('e_layers'),
+        dropout=checkpoint.get('dropout')
+    ).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    return {
+        "name": model_cfg.get("name", exp_id),
+        "exp_id": exp_id,
+        "weight": float(model_cfg["normalized_weight"]),
+        "raw_weight": float(model_cfg["weight"]),
+        "model_path": model_path,
+        "json_path": json_path,
+        "model": model,
+        "feature_cols": feature_cols,
+        "seq_len": ckpt_seq_len,
+        "forecast_horizon": checkpoint.get('forecast_horizon', FORECAST_HORIZON),
+        "d_model": checkpoint.get('d_model'),
+        "n_heads": checkpoint.get('n_heads'),
+        "d_ff": checkpoint.get('d_ff'),
+        "e_layers": checkpoint.get('e_layers'),
+        "dropout": checkpoint.get('dropout'),
+        "thresholds": thresholds,
+    }
+
+
+def _weighted_thresholds(model_components):
+    return {
+        key: sum(float(component["thresholds"][key]) * component["weight"] for component in model_components)
+        for key in THRESHOLD_KEYS
+    }
+
+
+def _validate_ensemble_components(model_components):
+    if not model_components:
+        raise ValueError("未加载任何模型。")
+
+    horizons = {int(component["forecast_horizon"]) for component in model_components}
+    if len(horizons) != 1:
+        raise ValueError(f"多模型回测要求 forecast_horizon 一致，当前: {sorted(horizons)}")
+
+    missing_thresholds = [
+        component["exp_id"]
+        for component in model_components
+        if any(key not in component["thresholds"] for key in THRESHOLD_KEYS)
+    ]
+    if missing_thresholds:
+        raise ValueError(f"以下模型动态阈值字段不完整: {missing_thresholds}")
+
+
+def _generate_weighted_probabilities(df, model_components, split_idx, device):
+    sample_count = len(df) - split_idx
+    if sample_count <= 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    ensemble_probs = np.zeros((sample_count, 3), dtype=np.float64)
+    inference_batch_size = 4096
+
+    with torch.no_grad():
+        for component in model_components:
+            missing_cols = [c for c in component["feature_cols"] if c not in df.columns]
+            if missing_cols:
+                raise ValueError(f"模型 {component['exp_id']} 所需特征缺失: {missing_cols}")
+
+            seq_len = int(component["seq_len"])
+            warmup_start_idx = split_idx - seq_len + 1
+            if warmup_start_idx < 0:
+                raise ValueError(f"数据量不足以支撑模型 {component['exp_id']} 的 seq_len={seq_len} 预热。")
+
+            x_raw = df.select(component["feature_cols"]).to_numpy().astype('float32')
+            x_test_raw = x_raw[warmup_start_idx:]
+            x_tensor = torch.tensor(x_test_raw, dtype=torch.float32, device=device)
+            x_windows = x_tensor.unfold(0, seq_len, 1).transpose(1, 2).contiguous()
+
+            component_probs = []
+            print(
+                f"   🧠 推理模型 {component['exp_id']} | seq_len={seq_len} | "
+                f"样本={len(x_windows)} | weight={component['weight']:.3f}"
+            )
+            for i in range(0, len(x_windows), inference_batch_size):
+                batch_x = x_windows[i : i + inference_batch_size]
+                with torch.amp.autocast('cuda'):
+                    logits = component["model"](batch_x)
+                    probs = torch.softmax(logits, dim=1).cpu().numpy()
+                component_probs.append(probs)
+
+            component_probs = np.concatenate(component_probs, axis=0) if component_probs else np.empty((0, 3))
+            if len(component_probs) != sample_count:
+                raise ValueError(
+                    f"模型 {component['exp_id']} 推理样本数不一致: "
+                    f"{len(component_probs)} != {sample_count}"
+                )
+            ensemble_probs += component_probs * component["weight"]
+
+    return ensemble_probs
 
 
 def _compute_atr(highs, lows, closes, period):
@@ -32,29 +243,30 @@ def _compute_atr(highs, lows, closes, period):
     return pd.Series(true_ranges).rolling(period, min_periods=1).mean().to_numpy()
 
 
-def run_backtest():
+def run_backtest(args=None):
+    if args is None:
+        args = _parse_args()
+
     DEVICE = torch.device("cuda")  # 明确 H100 环境
     
-    # 1. 优先定位模型权重文件，一切以它保存的元数据为准
-    model_files = sorted(list(MODEL_DIR.glob(f"itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth")))
-    if not model_files:
-        print("❌ 找不到对应的模型权重文件！")
+    # 1. 优先定位模型权重文件，一切以它保存的元数据为准。
+    # 默认仍是 EXPERIMENT_ID 单模型；只有显式 --models / --use-live-models 才进入 ensemble。
+    try:
+        model_specs = _resolve_model_specs(args)
+        model_components = [_load_model_component(spec, DEVICE) for spec in model_specs]
+        _validate_ensemble_components(model_components)
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
         return
-        
-    model_path = model_files[-1]
-    print(f"🚀 启动终极回测 V5 (绝对严谨财务核算 + 动态杠杆)...")
 
-    checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
-    
-    # 🚨 防呆机制 1：全面从 checkpoint 读取真实的超参，切断隐性错配
-    ckpt_horizon = checkpoint.get('forecast_horizon', FORECAST_HORIZON)
-    ckpt_seq_len = checkpoint.get('seq_len')
-    ckpt_d_model = checkpoint.get('d_model')
-    ckpt_n_heads = checkpoint.get('n_heads')
-    ckpt_d_ff = checkpoint.get('d_ff')
-    ckpt_e_layers = checkpoint.get('e_layers')
-    ckpt_dropout = checkpoint.get('dropout')
-    feature_cols = checkpoint['feature_cols']
+    primary_component = model_components[0]
+    ckpt_horizon = int(primary_component["forecast_horizon"])
+    model_count = len(model_components)
+    model_stack = ", ".join(
+        f"{component['exp_id']}@{component['weight']:.2f}" for component in model_components
+    )
+    print(f"🚀 启动终极回测 V5 (绝对严谨财务核算 + 动态杠杆)...")
+    print(f"🧩 模型模式: {'Ensemble' if model_count > 1 else 'Single'} x{model_count} | {model_stack}")
 
     # 基于真实 horizon 精准匹配特征宽表
     data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"{SYMBOL}_Master_Training_Matrix_{ckpt_horizon}h_*.parquet")))
@@ -63,52 +275,24 @@ def run_backtest():
         return
     data_path = data_files[-1]
 
-    # 显式对齐架构参数并加载模型
-    model = InvertedTransformer(
-        num_variates=len(feature_cols), 
-        seq_len=ckpt_seq_len,
-        d_model=ckpt_d_model,     
-        n_heads=ckpt_n_heads, 
-        d_ff=ckpt_d_ff,       
-        e_layers=ckpt_e_layers,   
-        dropout=ckpt_dropout      
-    ).to(DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-
     # === 1. 独立加载特征空间与执行空间 ===
     df = pl.read_parquet(data_path)
-    X_raw = df.select(feature_cols).to_numpy().astype('float32')
     timestamps = df.select("hour_timestamp").to_series().to_numpy()
     
-    # 🚨 防呆机制 2：彻底消灭时空错位。使用 seq_len 预热对齐测试集原点
-    split_idx = int(len(X_raw) * 0.8) + ckpt_horizon
-    warmup_start_idx = split_idx - ckpt_seq_len + 1
+    # 🚨 防呆机制 2：彻底消灭时空错位。使用各模型 seq_len 独立预热，对齐同一个测试集原点
+    split_idx = int(df.height * 0.8) + ckpt_horizon
+    max_seq_len = max(int(component["seq_len"]) for component in model_components)
+    warmup_start_idx = split_idx - max_seq_len + 1
     
     if warmup_start_idx < 0:
-        print(f"❌ 数据量不足以支撑 seq_len={ckpt_seq_len} 的预热！")
+        print(f"❌ 数据量不足以支撑最大 seq_len={max_seq_len} 的预热！")
         return
 
-    X_test_raw = X_raw[warmup_start_idx:]
     test_timestamps = timestamps[split_idx:]
     valid_timestamps = test_timestamps.tolist() 
     
     print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
-    
-    X_tensor = torch.tensor(X_test_raw, dtype=torch.float32, device=DEVICE)
-    # 加速修复：补齐 .contiguous() 消除显存碎片
-    X_windows = X_tensor.unfold(0, ckpt_seq_len, 1).transpose(1, 2).contiguous()
-    
-    predictions_probs = []
-    INFERENCE_BATCH_SIZE = 4096 
-    
-    with torch.no_grad():
-        for i in range(0, len(X_windows), INFERENCE_BATCH_SIZE):
-            batch_x = X_windows[i : i + INFERENCE_BATCH_SIZE]
-            with torch.amp.autocast('cuda'):
-                logits = model(batch_x)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
-            predictions_probs.extend(probs)
+    predictions_probs = _generate_weighted_probabilities(df, model_components, split_idx, DEVICE)
 
     # 极速加载 1h 和 1m 的真实物理价格 (执行空间)
     raw_kline_dir = TEMP_DIR / "klines" / SYMBOL
@@ -135,15 +319,8 @@ def run_backtest():
     # ==========================================
     # 🏦 基于 1h 决策 + 1m 显微镜追踪的双轨状态机
     # ==========================================
-    json_path = MODEL_DIR / f"dynamic_thresholds_{EXPERIMENT_ID}.json"
-    if not json_path.exists():
-        print("❌ 找不到 dynamic_thresholds.json，请先运行 check_prob_distribution.py！")
-        return
-        
-    with open(json_path, "r") as f:
-        config_data = json.load(f)
-        # 🚨 防呆机制 3：兼容带有 metadata 的新结构 JSON 和老版 Flat JSON
-        th = config_data.get("thresholds", config_data)
+    # 🚨 防呆机制 3：多模型时动态分位数阈值跟随概率 ensemble 做同权重融合。
+    th = _weighted_thresholds(model_components)
         
     print("📥 已成功加载动态分位数阈值。")
     
