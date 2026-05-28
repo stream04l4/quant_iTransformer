@@ -928,6 +928,214 @@ def _weighted_thresholds(model_components):
     }
 
 
+def _shadow_audit_db_path():
+    LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return LIVE_DATA_DIR / "live_model_shadow_audit.db"
+
+
+def _ensure_shadow_audit_schema(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS solo_model_inference (
+            symbol TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            decision_ts INTEGER NOT NULL,
+            server_time TEXT,
+            forecast_horizon INTEGER,
+            live_weight REAL,
+            entry_price REAL,
+            macro_score REAL,
+            p_down REAL,
+            p_flat REAL,
+            p_up REAL,
+            adj_p_down REAL,
+            adj_p_up REAL,
+            raw_signal INTEGER,
+            raw_tier INTEGER,
+            raw_leverage REAL,
+            adj_signal INTEGER,
+            adj_tier INTEGER,
+            adj_leverage REAL,
+            settled INTEGER DEFAULT 0,
+            settle_ts INTEGER,
+            settle_price REAL,
+            raw_pnl REAL,
+            adj_pnl REAL,
+            created_at TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (symbol, experiment_id, decision_ts)
+        )
+        """
+    )
+
+
+def _solo_decision_from_probs(p_down, p_up, thresholds):
+    if p_up > thresholds.get("up_top_1", 1.0):
+        return 1, 3, LEVERAGE_3
+    if p_up > thresholds.get("up_top_5", 1.0):
+        return 1, 2, LEVERAGE_2
+    if p_up > thresholds.get("up_top_10", 1.0):
+        return 1, 1, LEVERAGE_1
+    if p_down > thresholds.get("down_top_1", 1.0):
+        return -1, 3, LEVERAGE_3
+    if p_down > thresholds.get("down_top_5", 1.0):
+        return -1, 2, LEVERAGE_2
+    if p_down > thresholds.get("down_top_10", 1.0):
+        return -1, 1, LEVERAGE_1
+    return 0, 0, 0.0
+
+
+def _record_solo_model_shadow_decisions(symbol, rt, model_details, latest_closed_ts, current_price, macro_score, server_time):
+    """记录每次实盘推理下，各子模型单独服役时会做出的影子决策。"""
+    if not model_details:
+        return
+
+    component_by_exp = {component["exp_id"]: component for component in rt["models"]}
+    now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+
+    for detail in model_details:
+        exp_id = detail["exp_id"]
+        component = component_by_exp.get(exp_id)
+        if not component:
+            continue
+        thresholds = component["thresholds"]
+
+        p_down = float(detail["prob_down"])
+        p_flat = float(detail["prob_flat"])
+        p_up = float(detail["prob_up"])
+        raw_signal, raw_tier, raw_leverage = _solo_decision_from_probs(p_down, p_up, thresholds)
+
+        adj_p_up = apply_logit_fusion(p_up, macro_score, MACRO_ALPHA_TOP_10)
+        adj_p_down = apply_logit_fusion(p_down, -macro_score, MACRO_ALPHA_TOP_10)
+        adj_signal, adj_tier, adj_leverage = _solo_decision_from_probs(adj_p_down, adj_p_up, thresholds)
+
+        rows.append((
+            symbol,
+            exp_id,
+            int(latest_closed_ts),
+            str(server_time or ""),
+            int(FORECAST_HORIZON),
+            float(detail["weight"]),
+            float(current_price),
+            float(macro_score),
+            p_down,
+            p_flat,
+            p_up,
+            float(adj_p_down),
+            float(adj_p_up),
+            int(raw_signal),
+            int(raw_tier),
+            float(raw_leverage),
+            int(adj_signal),
+            int(adj_tier),
+            float(adj_leverage),
+            now_text,
+            now_text,
+        ))
+
+    if not rows:
+        return
+
+    try:
+        with sqlite3.connect(_shadow_audit_db_path(), timeout=5.0) as conn:
+            _ensure_shadow_audit_schema(conn)
+            conn.executemany(
+                """
+                INSERT INTO solo_model_inference (
+                    symbol, experiment_id, decision_ts, server_time, forecast_horizon,
+                    live_weight, entry_price, macro_score,
+                    p_down, p_flat, p_up, adj_p_down, adj_p_up,
+                    raw_signal, raw_tier, raw_leverage,
+                    adj_signal, adj_tier, adj_leverage,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, experiment_id, decision_ts) DO UPDATE SET
+                    server_time=excluded.server_time,
+                    forecast_horizon=excluded.forecast_horizon,
+                    live_weight=excluded.live_weight,
+                    entry_price=excluded.entry_price,
+                    macro_score=excluded.macro_score,
+                    p_down=excluded.p_down,
+                    p_flat=excluded.p_flat,
+                    p_up=excluded.p_up,
+                    adj_p_down=excluded.adj_p_down,
+                    adj_p_up=excluded.adj_p_up,
+                    raw_signal=excluded.raw_signal,
+                    raw_tier=excluded.raw_tier,
+                    raw_leverage=excluded.raw_leverage,
+                    adj_signal=excluded.adj_signal,
+                    adj_tier=excluded.adj_tier,
+                    adj_leverage=excluded.adj_leverage,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"   ⚠️ [{symbol}] 子模型影子决策落库失败: {e}")
+
+
+def _settle_solo_model_shadow_decisions(symbol, ohlcv_1h):
+    """用真实后续 1h close 给影子推理打标。不是完整 OMS 回放，而是 live horizon 方向盈亏审计。"""
+    if not ohlcv_1h:
+        return
+
+    close_by_ts = {}
+    for candle in ohlcv_1h:
+        try:
+            close_by_ts[int(candle[0])] = float(candle[4])
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not close_by_ts:
+        return
+
+    try:
+        with sqlite3.connect(_shadow_audit_db_path(), timeout=5.0) as conn:
+            _ensure_shadow_audit_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT symbol, experiment_id, decision_ts, forecast_horizon, entry_price,
+                       raw_signal, raw_leverage, adj_signal, adj_leverage
+                FROM solo_model_inference
+                WHERE symbol = ? AND settled = 0
+                """,
+                (symbol,),
+            ).fetchall()
+
+            updates = []
+            now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            for row in rows:
+                _, exp_id, decision_ts, horizon, entry_price, raw_signal, raw_lev, adj_signal, adj_lev = row
+                settle_ts = int(decision_ts) + int(horizon or FORECAST_HORIZON) * 3600000
+                settle_price = close_by_ts.get(settle_ts)
+                if settle_price is None or not entry_price:
+                    continue
+
+                raw_pnl = float(raw_signal or 0) * ((settle_price / float(entry_price)) - 1.0) * float(raw_lev or 0.0)
+                adj_pnl = float(adj_signal or 0) * ((settle_price / float(entry_price)) - 1.0) * float(adj_lev or 0.0)
+                updates.append((int(settle_ts), float(settle_price), raw_pnl, adj_pnl, now_text, symbol, exp_id, int(decision_ts)))
+
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE solo_model_inference
+                    SET settled = 1,
+                        settle_ts = ?,
+                        settle_price = ?,
+                        raw_pnl = ?,
+                        adj_pnl = ?,
+                        updated_at = ?
+                    WHERE symbol = ? AND experiment_id = ? AND decision_ts = ?
+                    """,
+                    updates,
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"   ⚠️ [{symbol}] 子模型影子审计结算失败: {e}")
+
+
 def _run_weighted_model_ensemble(rt, features_df):
     ensemble_probs = np.zeros(3, dtype=np.float64)
     model_details = []
@@ -1087,6 +1295,16 @@ def run_live():
                             rt["cached_p_down"], rt["cached_p_flat"], rt["cached_p_up"] = probs[0], probs[1], probs[2]
                             rt["cached_model_details"] = model_details
                             rt["cached_macro_score"], rt["last_macro_ts"] = get_macro_sentiment_info()
+                            _record_solo_model_shadow_decisions(
+                                symbol,
+                                rt,
+                                model_details,
+                                latest_closed_ts,
+                                current_price,
+                                rt["cached_macro_score"],
+                                snapshot.get("server_time"),
+                            )
+                            _settle_solo_model_shadow_decisions(symbol, snapshot.get('ohlcv_1h', []))
                             detail_text = " | ".join(
                                 f"{m['exp_id']}@{m['weight']:.2f}: 多{m['prob_up']:.3f}/平{m['prob_flat']:.3f}/空{m['prob_down']:.3f}"
                                 for m in model_details
@@ -1111,6 +1329,8 @@ def run_live():
                         needs_evaluation_log = True
                         trigger_reason = f"宏观哨兵突击，监测到情报异动 (TS: {new_macro_ts})"
                         print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 宏观突袭重估: {new_macro_score:+.2f}")
+
+                _settle_solo_model_shadow_decisions(symbol, snapshot.get('ohlcv_1h', []))
 
                 cached_p_up = rt["cached_p_up"]
                 cached_p_down = rt["cached_p_down"]

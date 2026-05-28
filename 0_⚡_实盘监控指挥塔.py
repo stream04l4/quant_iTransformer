@@ -4,7 +4,6 @@ import os
 import sys
 import pynvml
 import psutil
-import subprocess
 import streamlit as st
 import ccxt
 import pandas as pd
@@ -454,6 +453,79 @@ def resolve_current_serving_model(symbol):
         'created_at': curr_m_created_at,
         'model_stack': model_stack,
     }
+
+
+def _shadow_audit_db_path():
+    return os.path.join(LIVE_DATA_DIR, "live_model_shadow_audit.db")
+
+
+def load_live_shadow_model_audit(symbol):
+    db_path = _shadow_audit_db_path()
+    if not os.path.exists(db_path):
+        return pd.DataFrame(), db_path
+    try:
+        with sqlite3.connect(db_path, timeout=2.0) as conn:
+            df = pd.read_sql(
+                """
+                SELECT *
+                FROM solo_model_inference
+                WHERE symbol = ?
+                ORDER BY decision_ts DESC
+                """,
+                conn,
+                params=(_normalize_symbol_key(symbol),),
+            )
+        return df, db_path
+    except Exception:
+        return pd.DataFrame(), db_path
+
+
+def summarize_live_shadow_model_audit(audit_df, model_stack):
+    if audit_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    weight_by_exp = {
+        str(m.get("experiment_id", "")): float(m.get("weight", 0.0) or 0.0)
+        for m in model_stack
+    }
+
+    for exp_id, g in audit_df.groupby("experiment_id"):
+        settled = g[pd.to_numeric(g.get("settled", 0), errors="coerce").fillna(0).astype(int) == 1].copy()
+        adj_trades = g[pd.to_numeric(g.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0]
+        settled_adj = settled[pd.to_numeric(settled.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0].copy()
+        settled_raw = settled[pd.to_numeric(settled.get("raw_signal", 0), errors="coerce").fillna(0).astype(int) != 0].copy()
+
+        adj_pnl = pd.to_numeric(settled_adj.get("adj_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        raw_pnl = pd.to_numeric(settled_raw.get("raw_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        last = g.sort_values("decision_ts").iloc[-1]
+
+        rows.append({
+            "experiment_id": exp_id,
+            "live_weight": weight_by_exp.get(str(exp_id), float(g["live_weight"].iloc[0]) if "live_weight" in g else 0.0),
+            "inference_count": len(g),
+            "shadow_trade_count": len(adj_trades),
+            "settled_trade_count": len(adj_pnl),
+            "pending_trade_count": max(0, len(adj_trades) - len(adj_pnl)),
+            "win_rate": float((adj_pnl > 0).mean()) if len(adj_pnl) else np.nan,
+            "avg_pnl": float(adj_pnl.mean()) if len(adj_pnl) else np.nan,
+            "total_pnl": float(adj_pnl.sum()) if len(adj_pnl) else 0.0,
+            "raw_win_rate": float((raw_pnl > 0).mean()) if len(raw_pnl) else np.nan,
+            "raw_total_pnl": float(raw_pnl.sum()) if len(raw_pnl) else 0.0,
+            "long_count": int((pd.to_numeric(g.get("adj_signal", 0), errors="coerce") == 1).sum()),
+            "short_count": int((pd.to_numeric(g.get("adj_signal", 0), errors="coerce") == -1).sum()),
+            "last_signal": int(last.get("adj_signal", 0) or 0),
+            "last_tier": int(last.get("adj_tier", 0) or 0),
+            "last_p_up": float(last.get("p_up", 0.0) or 0.0),
+            "last_p_down": float(last.get("p_down", 0.0) or 0.0),
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        by=["total_pnl", "win_rate", "settled_trade_count"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+
 
 st.title("iTransformer 预测引擎")
 
@@ -1124,6 +1196,82 @@ with dash_tab4:
     st.info(f"🛡️ **{serving_symbol} 正在服役的模型组**: `[{curr_m_data_version}] {curr_m_name}` (指纹: `{current_inf_version}`)")
     if model_stack:
         st.caption("权重编队: " + " | ".join(f"`{m['experiment_id']}` × {m['weight']:.1%}" for m in model_stack))
+
+    st.markdown("###### 🧪 Live 子模型影子账本")
+    st.caption("从 live_pipeline 真实推理流落库：每次实盘推理时，逐个记录子模型如果单独服役会发出的信号，并在预测周期结束后用真实后续价格打标盈亏。旧推理若此前没落库，无法完整补算。")
+    shadow_df, shadow_db_path = load_live_shadow_model_audit(serving_symbol)
+    if os.path.exists(shadow_db_path):
+        shadow_mtime = datetime.fromtimestamp(os.path.getmtime(shadow_db_path)).strftime("%Y-%m-%d %H:%M:%S")
+        st.caption(f"影子账本: `{os.path.basename(shadow_db_path)}` | 更新时间: `{shadow_mtime}`")
+
+    if shadow_df.empty:
+        st.info("暂无 Live 子模型影子账本。重启 live_pipeline 后，将从下一次整点推理开始累积。")
+    else:
+        shadow_summary = summarize_live_shadow_model_audit(shadow_df, model_stack)
+        if shadow_summary.empty:
+            st.info("影子账本已有原始记录，但尚无可汇总的子模型数据。")
+        else:
+            display_shadow = shadow_summary.copy()
+            display_shadow["Live权重"] = display_shadow["live_weight"].apply(lambda x: f"{x:.1%}")
+            display_shadow["影子胜率"] = display_shadow["win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["累计影子ROE"] = display_shadow["total_pnl"].apply(lambda x: f"{x:+.2%}")
+            display_shadow["平均单次ROE"] = display_shadow["avg_pnl"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:+.2%}")
+            display_shadow["未加宏观胜率"] = display_shadow["raw_win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["未加宏观累计"] = display_shadow["raw_total_pnl"].apply(lambda x: f"{x:+.2%}")
+            display_shadow["最近信号"] = display_shadow.apply(
+                lambda r: "多" if int(r["last_signal"]) == 1 else ("空" if int(r["last_signal"]) == -1 else "无"),
+                axis=1,
+            )
+            display_shadow["最近概率"] = display_shadow.apply(
+                lambda r: f"多{float(r['last_p_up']):.2%} / 空{float(r['last_p_down']):.2%}",
+                axis=1,
+            )
+            st.dataframe(
+                display_shadow[[
+                    "experiment_id", "Live权重", "inference_count", "shadow_trade_count",
+                    "settled_trade_count", "pending_trade_count", "影子胜率",
+                    "累计影子ROE", "平均单次ROE", "未加宏观胜率", "未加宏观累计",
+                    "long_count", "short_count", "最近信号", "last_tier", "最近概率"
+                ]],
+                hide_index=True,
+                width='stretch',
+                column_config={
+                    "experiment_id": "模型",
+                    "inference_count": "推理数",
+                    "shadow_trade_count": "影子发车",
+                    "settled_trade_count": "已结算",
+                    "pending_trade_count": "待结算",
+                    "long_count": "多",
+                    "short_count": "空",
+                    "last_tier": "最近Tier",
+                }
+            )
+
+            with st.expander("查看最近 100 条子模型影子推理明细", expanded=False):
+                recent_shadow = shadow_df.head(100).copy()
+                if not recent_shadow.empty:
+                    recent_shadow["decision_time"] = pd.to_datetime(recent_shadow["decision_ts"], unit="ms", errors="coerce")
+                    recent_shadow["方向"] = recent_shadow["adj_signal"].map({1: "多", -1: "空", 0: "无"})
+                    recent_shadow["影子ROE"] = pd.to_numeric(recent_shadow["adj_pnl"], errors="coerce").apply(
+                        lambda x: "待结算" if pd.isna(x) else f"{x:+.2%}"
+                    )
+                    st.dataframe(
+                        recent_shadow[[
+                            "decision_time", "experiment_id", "方向", "adj_tier",
+                            "p_up", "p_down", "entry_price", "settle_price", "影子ROE"
+                        ]],
+                        hide_index=True,
+                        width='stretch',
+                        column_config={
+                            "decision_time": "推理时间",
+                            "experiment_id": "模型",
+                            "adj_tier": "Tier",
+                            "p_up": st.column_config.NumberColumn("p_up", format="%.4f"),
+                            "p_down": st.column_config.NumberColumn("p_down", format="%.4f"),
+                            "entry_price": st.column_config.NumberColumn("入场参考价", format="$%.4f"),
+                            "settle_price": st.column_config.NumberColumn("结算价", format="$%.4f"),
+                        }
+                    )
 
     if df_closed_trades.empty:
         st.info("💡 暂无平仓流水。")
