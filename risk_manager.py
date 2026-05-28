@@ -185,23 +185,23 @@ def _safe_parse_epoch(raw_value):
     return ts
 
 
-def _resolve_position_entry_time(position, base_sym):
-    """
-    优先使用交易所仓位对象里的 open_time/timestamp，避免新仓尚未写库时误拿到上一笔老仓时间。
-    仅当交易所字段缺失时，才退回本地最新同向开仓流水。
-    """
-    info = position.get("info", {}) or {}
-    candidates = [
-        info.get("open_time"),
-        position.get("timestamp"),
-        position.get("lastUpdateTimestamp"),
-        info.get("update_time"),
-    ]
-    for raw_ts in candidates:
-        parsed_ts = _safe_parse_epoch(raw_ts)
-        if parsed_ts is not None:
-            return parsed_ts
+def _parse_local_exec_ts(raw_value):
+    """解析 live_trades 中的本地执行时间。"""
+    if not raw_value:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+        try:
+            return datetime.strptime(str(raw_value), fmt).timestamp()
+        except (TypeError, ValueError):
+            continue
+    try:
+        return pd.to_datetime(raw_value, errors="coerce").timestamp()
+    except Exception:
+        return None
 
+
+def _resolve_latest_same_side_trade_time(position, base_sym):
+    """读取本地最近一笔同向开仓/补仓时间，作为持仓超时计时锚点。"""
     db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
     pos_side = str(position.get("side", "")).upper()
     local_open_side = "buy" if pos_side == "LONG" else "sell"
@@ -220,9 +220,38 @@ def _resolve_position_entry_time(position, base_sym):
             )
             row = cur.fetchone()
             if row:
-                return datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                return _parse_local_exec_ts(row[0])
     except Exception:
         pass
+    return None
+
+
+def _resolve_position_entry_time(position, base_sym):
+    """
+    以最近一笔同向开仓/补仓作为持仓超时计时锚点。
+    交易所 open_time 往往只代表首次开仓；加仓后需要优先采用本地最新下单流水。
+    """
+    info = position.get("info", {}) or {}
+    exchange_entry_ts = None
+    candidates = [
+        info.get("open_time"),
+        position.get("timestamp"),
+        position.get("lastUpdateTimestamp"),
+        info.get("update_time"),
+    ]
+    for raw_ts in candidates:
+        parsed_ts = _safe_parse_epoch(raw_ts)
+        if parsed_ts is not None:
+            exchange_entry_ts = parsed_ts
+            break
+
+    local_trade_ts = _resolve_latest_same_side_trade_time(position, base_sym)
+    if local_trade_ts is not None and (
+        exchange_entry_ts is None or local_trade_ts >= exchange_entry_ts - 1.0
+    ):
+        return local_trade_ts
+    if exchange_entry_ts is not None:
+        return exchange_entry_ts
 
     return time.time()
 
@@ -414,7 +443,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
         _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=anchor_closed_ts)
                     
         # 5. 警报与推送
-        log_system_alert("🆘 熔断跳伞", base_sym, f"微观崩塌 ({reason})，已市价斩仓逃生。")
+        log_system_alert("🆘 主动风控", base_sym, f"{reason}，已下发市价平仓。")
         
         pos_lev = float(p.get('leverage', p['info'].get('leverage', p['info'].get('lever', 1))))
         if pos_lev <= 0: pos_lev = 10.0
@@ -425,15 +454,22 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
         abs_profit = raw_pnl * (contracts * contract_size * entry_px)
         
         PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN")
-        push_title = f"🆘 [高频熔断] {base_sym} 微观结构雪崩！"
+        push_title = f"🧯 [Gate实盘] {base_sym} 主动风控平仓"
         dir_str = "做多 🟢" if pos_side == 'LONG' else "做空 🔴"
-        pnl_icon = "🟢 逃生结算" if abs_profit > 0 else "🔴 截断亏损"
+        if abs_profit > 0:
+            pnl_label = "🟢 估算盈利"
+        elif abs_profit < 0:
+            pnl_label = "🔴 估算亏损"
+        else:
+            pnl_label = "🟡 近似保本"
         
         push_content = (
             f"<b>🔹 交易标的：</b>{base_sym} ({dir_str})<br>"
-            f"<b>🔸 触发警报：</b>{reason} (右脑紧急接管)<br>"
-            f"<b>🎯 逃生均价：</b>${current_price:.4f}<br>"
-            f"<b>{pnl_icon}：</b>{abs_profit:+.2f} USDT ({realized_roe:+.2%})"
+            f"<b>🔸 出场原因：</b>{reason}<br>"
+            f"<b>⚙️ 执行动作：</b>右脑风控市价减仓/平仓<br>"
+            f"<b>🎯 估算平仓价：</b>${current_price:.4f}<br>"
+            f"<b>{pnl_label}：</b>{abs_profit:+.2f} USDT ({realized_roe:+.2%})<br>"
+            f"<b>⏰ 时间：</b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
         state.recent_pushes[base_sym] = time.time()
@@ -558,6 +594,7 @@ def bailout_worker():
                     entry_px = float(p.get('entryPrice', info.get('entry_price', info.get('avgPx', 0))) or 0.0)
                     if entry_px <= 0:
                         continue
+                    position_contracts = abs(float(info.get('size', p.get('contracts', 0)) or 0.0))
 
                     mark_px = float(p.get('markPrice', info.get('mark_price', entry_px)) or entry_px)
                     current_close = float(data.get('current_price', mark_px) if data else mark_px)
@@ -585,6 +622,7 @@ def bailout_worker():
                             'last_same_signal_refresh_ts': 0.0,
                             'last_sl_update_px': 0.0,
                             'last_entry_px': entry_px,  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
+                            'last_contracts': position_contracts,
                             'last_stop_repair_ts': 0.0,
                             'last_snapshot_warn_ts': 0.0,
                         }
@@ -593,11 +631,20 @@ def bailout_worker():
                     # ---------------------------------------------------------
                     # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
                     # ---------------------------------------------------------
-                    if 'last_entry_px' not in mem: 
+                    if 'last_entry_px' not in mem:
                         mem['last_entry_px'] = entry_px
-                        
-                    # 如果交易所最新返回的均价和我们内存中的均价偏差超过 0.01%，说明触发了实盘加仓！
-                    if abs(entry_px - mem['last_entry_px']) / max(mem['last_entry_px'], 1e-9) > 0.0001:
+                    if 'last_contracts' not in mem:
+                        mem['last_contracts'] = position_contracts
+
+                    entry_px_shifted = abs(entry_px - mem['last_entry_px']) / max(mem['last_entry_px'], 1e-9) > 0.0001
+                    contracts_increased = position_contracts > float(mem.get('last_contracts', 0.0) or 0.0) * 1.0001
+                    add_position_detected = contracts_increased or (
+                        entry_px_shifted
+                        and position_contracts >= float(mem.get('last_contracts', 0.0) or 0.0) * 0.9999
+                    )
+
+                    # 如果交易所最新返回的均价/张数发生同向增加，说明触发了实盘加仓。
+                    if add_position_detected:
                         # 记住当时的物理绝对止损价格
                         if pos_side == 'LONG':
                             abs_sl = mem['last_entry_px'] * (1 + mem['dynamic_sl_phys'])
@@ -607,15 +654,27 @@ def bailout_worker():
                             abs_sl = mem['last_entry_px'] * (1 - mem['dynamic_sl_phys'])
                             mem['dynamic_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
                             mem['max_phys_pnl'] = (entry_px - current_close) / entry_px
-                            
+
                         mem['last_entry_px'] = entry_px
-                        print(f"⚖️ [{base_sym}] 右脑侦测到阶梯加仓行为！新均价 ${entry_px:.4f}，已平移止损防线防止误杀。")
+                        mem['last_contracts'] = position_contracts
+                        latest_trade_ts = _resolve_latest_same_side_trade_time(p, base_sym)
+                        mem['entry_time'] = latest_trade_ts or time.time()
+                        mem['last_same_signal_refresh_ts'] = max(
+                            float(mem.get('last_same_signal_refresh_ts', 0.0) or 0.0),
+                            mem['entry_time'],
+                        )
+                        print(
+                            f"⚖️ [{base_sym}] 右脑侦测到阶梯加仓行为！新均价 ${entry_px:.4f}，"
+                            f"持仓计时已重置至 {datetime.fromtimestamp(mem['entry_time']).strftime('%Y-%m-%d %H:%M:%S')}，"
+                            "并已平移止损防线防止误杀。"
+                        )
+                    else:
+                        mem['last_contracts'] = position_contracts
                     # ---------------------------------------------------------
                     # 📈 轨道 1：动态物理状态机 (更新底层 OCO 止损单)
                     # ---------------------------------------------------------
                     current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
-                    _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, symbol_status, th)
                     hold_hours = (time.time() - mem['entry_time']) / 3600.0
                     
                     # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，

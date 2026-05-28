@@ -152,34 +152,20 @@ def portfolio_sync_worker():
                                 dir_str = "多单 🟢" if str(old_p.get('side', '')).lower() == 'long' else "空单 🔴"
                                 contracts = old_p.get('contracts', 0)
                                 abs_profit, realized_roe = _estimate_close_pnl_from_position(old_p)
-                                if abs_profit is None and realized_roe is None:
-                                    pnl_line = "<b>💰 结算盈亏：</b>快照不足，暂无法估算<br>"
-                                else:
-                                    if abs_profit is not None and abs_profit > 0:
-                                        pnl_icon = "🟢 盈利"
-                                    elif abs_profit is not None and abs_profit < 0:
-                                        pnl_icon = "🔴 亏损"
-                                    elif realized_roe is not None and realized_roe > 0:
-                                        pnl_icon = "🟢 盈利"
-                                    elif realized_roe is not None and realized_roe < 0:
-                                        pnl_icon = "🔴 亏损"
-                                    else:
-                                        pnl_icon = "🟡 保本"
-
-                                    pnl_parts = []
-                                    if abs_profit is not None:
-                                        pnl_parts.append(f"{abs_profit:+.2f} USDT")
-                                    if realized_roe is not None:
-                                        pnl_parts.append(f"{realized_roe:+.2%}")
-                                    pnl_line = f"<b>{pnl_icon}：</b>{' '.join(pnl_parts)}<br>"
+                                pnl_line = _format_close_pnl_line(abs_profit, realized_roe, estimated=True)
+                                exit_reason = _infer_passive_exit_reason(old_p, abs_profit, realized_roe)
+                                info = old_p.get("info", {}) or {}
+                                exit_px = _safe_float(old_p.get("markPrice", info.get("mark_price", info.get("markPx", 0))), 0.0)
+                                exit_px_line = f"<b>🎯 估算平仓价：</b>${exit_px:.4f}<br>" if exit_px > 0 else ""
 
                                 push_title = f"🏁 [Gate实盘] {k} 仓位已平仓"
                                 push_content = (
                                     f"<b>🔹 交易标的：</b>{k} ({dir_str})<br>"
-                                    f"<b>🔸 平仓类型：</b>交易所系统结算 (止盈/止损/手动)<br>"
+                                    f"<b>🔸 出场原因：</b>{exit_reason}<br>"
                                     f"<b>📦 结算数量：</b>{contracts} 张<br>"
+                                    f"{exit_px_line}"
                                     f"{pnl_line}"
-                                    f"<b>⏰ 时间：</b>{datetime.now().strftime('%H:%M:%S')}"
+                                    f"<b>⏰ 时间：</b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                                 )
                                 state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
                                 state.recent_pushes[k] = time.time()
@@ -334,6 +320,43 @@ def _estimate_close_pnl_from_position(position, exit_price=None):
         realized_roe /= 100.0
 
     return abs_profit, realized_roe
+
+
+def _format_close_pnl_line(abs_profit, realized_roe, estimated=True):
+    """生成平仓推送中的客观盈亏行。"""
+    prefix = "估算" if estimated else "结算"
+    if abs_profit is None and realized_roe is None:
+        return f"<b>💰 {prefix}盈亏：</b>快照不足，暂无法估算<br>"
+
+    pnl_probe = abs_profit if abs_profit is not None else realized_roe
+    if pnl_probe > 0:
+        pnl_label = f"🟢 {prefix}盈利"
+    elif pnl_probe < 0:
+        pnl_label = f"🔴 {prefix}亏损"
+    else:
+        pnl_label = f"🟡 {prefix}保本"
+
+    pnl_parts = []
+    if abs_profit is not None:
+        pnl_parts.append(f"{abs_profit:+.2f} USDT")
+    if realized_roe is not None:
+        pnl_parts.append(f"{realized_roe:+.2%}")
+    return f"<b>{pnl_label}：</b>{' '.join(pnl_parts)}<br>"
+
+
+def _infer_passive_exit_reason(position, abs_profit, realized_roe):
+    """
+    交易所条件单/手动平仓没有回传明确触发源。
+    这里只按最后一帧仓位快照给出客观推断，避免把止盈、止损、手动误报成确定事实。
+    """
+    pnl_probe = abs_profit if abs_profit is not None else realized_roe
+    if pnl_probe is None:
+        return "交易所仓位消失，可能为条件单触发或手动平仓；快照不足，无法判断盈亏方向"
+    if pnl_probe > 0:
+        return "交易所仓位消失；按最后快照看为盈利出场，倾向止盈/追踪止盈或手动止盈"
+    if pnl_probe < 0:
+        return "交易所仓位消失；按最后快照看为亏损出场，倾向兜底止损或手动止损"
+    return "交易所仓位消失；按最后快照看接近保本，可能为手动平仓或条件单贴近成本触发"
 
 
 def _record_passive_close_to_db(symbol_key, position, close_side="exchange_close"):
