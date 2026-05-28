@@ -421,6 +421,71 @@ def get_gate_stop_coverage_size(stop_order, expected_contracts):
         return None
 
 
+def _gate_stop_text(stop_order):
+    initial = (stop_order.get("info", {}) or {}).get("initial", {}) or {}
+    return str(stop_order.get("clientOrderId", "") or initial.get("text", "") or "")
+
+
+def _gate_stop_auto_size(stop_order):
+    initial = (stop_order.get("info", {}) or {}).get("initial", {}) or {}
+    return str(initial.get("auto_size", "") or "").lower()
+
+
+def _position_contracts(position):
+    if not position:
+        return 0.0
+    info = position.get("info", {}) or {}
+    return abs(_safe_float(position.get("contracts", info.get("size", info.get("contracts", 0))), 0.0))
+
+
+def _position_entry_price(position):
+    if not position:
+        return 0.0
+    info = position.get("info", {}) or {}
+    return _safe_float(position.get("entryPrice", info.get("entry_price", info.get("avgPx", 0))), 0.0)
+
+
+def _is_same_side_close_stop(stop_order, close_side):
+    expected_auto_size = "close_long" if str(close_side).upper() == "LONG" else "close_short"
+    auto_size = _gate_stop_auto_size(stop_order)
+    if auto_size:
+        return auto_size == expected_auto_size
+    return is_gate_close_position_stop(stop_order)
+
+
+def cancel_obsolete_gate_close_stops(exchange, gate_symbol, keep_text, close_side, stop_orders=None):
+    """
+    新止损确认挂上后，撤掉同币种同方向旧的平仓止损。
+    只清理带 sl/tsl 标识的平仓条件单，避免误伤其它人工挂单。
+    """
+    keep_text = str(keep_text or "").lower()
+    gate_key = _normalize_symbol_key(gate_symbol)
+    stops = stop_orders
+    if stops is None:
+        stops = exchange.fetch_open_orders(gate_symbol, params={'stop': True})
+
+    cancelled = 0
+    for stop_order in stops:
+        if _normalize_symbol_key(stop_order.get("symbol")) != gate_key:
+            continue
+
+        text = _gate_stop_text(stop_order).lower()
+        if text == keep_text:
+            continue
+        if "sl" not in text and "tsl" not in text:
+            continue
+        if not _is_same_side_close_stop(stop_order, close_side):
+            continue
+
+        try:
+            exchange.cancel_order(stop_order["id"], gate_symbol, params={'stop': True})
+            cancelled += 1
+        except Exception as e:
+            print(f"   ⚠️ 旧止损单撤销失败，保留由右脑后续校验: id={stop_order.get('id')} err={e}")
+
+    return cancelled
+
+
 def build_gate_close_stop_initial(native_symbol, text_label, close_side):
     """构造 Gate 平全仓条件止损单的 initial 字段。"""
     normalized_side = str(close_side or "").upper()
@@ -686,39 +751,66 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         filled_order = exchange_private.fetch_order(order['id'], gate_symbol)
         actual_fill_price = float(filled_order.get('average') or filled_order.get('price') or current_price)
         slippage = abs(actual_fill_price - current_price) / current_price
+
+        try:
+            post_fill_positions = exchange_private.fetch_positions([gate_symbol])
+        except Exception as e:
+            print(f"   ⚠️ 成交后仓位均价读取失败，临时使用本次成交价计算止损: {e}")
+            post_fill_positions = []
+        active_position = next(
+            (
+                p for p in post_fill_positions
+                if _position_contracts(p) > 1e-8
+                and str(p.get('side', '')).lower() == ('long' if side == 'buy' else 'short')
+            ),
+            None
+        )
+        position_entry_price = _position_entry_price(active_position) or actual_fill_price
+        position_contracts = _position_contracts(active_position) or order_amount
         
         # 基于真实的成交均价，计算物理止盈止损位
         # 统一量纲：传入的 tp_pct 和 sl_pct 是带杠杆的预期收益率/亏损率，因此需要除以杠杆得到实际的 K 线涨跌幅
         actual_tp_move = abs(tp_pct) 
         actual_sl_move = abs(sl_pct) 
         
-        tp_price = actual_fill_price * (1 + actual_tp_move) if side == 'buy' else actual_fill_price * (1 - actual_tp_move)
-        sl_price = actual_fill_price * (1 - actual_sl_move) if side == 'buy' else actual_fill_price * (1 + actual_sl_move)
+        tp_price = position_entry_price * (1 + actual_tp_move) if side == 'buy' else position_entry_price * (1 - actual_tp_move)
+        sl_price = position_entry_price * (1 - actual_sl_move) if side == 'buy' else position_entry_price * (1 + actual_sl_move)
 
         # ---------------------------------------------------------
         # 【修改点2：移除硬止盈，只挂兜底硬止损 (给追踪止盈让路)】
         # ---------------------------------------------------------
-        # 挂载精确定量硬止损
+        # 挂载平全仓硬止损；同向升档时用交易所最新整体均价重算统一防线。
         close_side = "LONG" if side == "buy" else "SHORT"
-        sl_success = safe_post_condition(sl_rule, sl_price, "sl_tier", order_amount, close_side)
+        sl_label = f"sl_tier_{int(time.time() * 1000)}"
+        sl_success = safe_post_condition(sl_rule, sl_price, sl_label, position_contracts, close_side)
         
         # 终极物理校验
         time.sleep(1.5) 
         try:
             verify_stops = exchange_private.fetch_open_orders(gate_symbol, params={'stop': True})
-            active_texts = [str(o.get('clientOrderId', '') or o['info'].get('initial', {}).get('text', '')).lower() for o in verify_stops]
+            active_texts = [_gate_stop_text(o).lower() for o in verify_stops]
             
             # 🚨 修复 2：只要含有 sl 字样即算挂单成功，防止因 'sl_tier' != 'sl' 造成的 Python 语法误判
-            if len(verify_stops) >= 1 and any('sl' in t for t in active_texts):
+            if sl_success and any(t == sl_label.lower() for t in active_texts):
                 print("🔔 交易所底层 OCO 兜底止损单【挂单且物理校验成功】！")
+                cancelled_count = cancel_obsolete_gate_close_stops(
+                    exchange_private,
+                    gate_symbol,
+                    sl_label,
+                    close_side,
+                    verify_stops,
+                )
+                if cancelled_count:
+                    print(f"🧹 已撤销 {cancelled_count} 张同币种旧止损单，仅保留最新统一防线。")
+                    verify_stops = exchange_private.fetch_open_orders(gate_symbol, params={'stop': True})
             else:
                 msg_oco_fail = f"物理兜底止损单校验未完全通过 (现存: {len(verify_stops)}个)，可能存在遗漏，交由右脑兜底。"
                 print(f"❌ 警告：{gate_symbol} {msg_oco_fail}")
                 log_system_alert("⚠️ 挂单残缺", symbol, msg_oco_fail)
 
-            verify_positions = exchange_private.fetch_positions([gate_symbol])
+            verify_positions = post_fill_positions
             active_position = next(
-                (p for p in verify_positions if abs(float(p.get('contracts', 0) or 0)) > 1e-8),
+                (p for p in verify_positions if _position_contracts(p) > 1e-8),
                 None
             )
             coverage_check = _inspect_stop_order_coverage(active_position, verify_stops)
@@ -737,7 +829,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         print(
             f"✅ ⚡ [Gate实盘] 下单成功！方向：{side.upper()} | 数量：{order_amount} 张 {gate_symbol}。\n"
             f"🎛️ 目标总杠杆: {leverage:.2f}x | 本次补仓名义价值: ${order_amount * contract_size * actual_fill_price:,.2f}\n"
-            f"🎯 进场均价: ${actual_fill_price:.4f} (滑点 {slippage:.3%})\n"
+            f"🎯 本次成交均价: ${actual_fill_price:.4f} (滑点 {slippage:.3%}) | 仓位整体均价: ${position_entry_price:.4f}\n"
             f"🛡️ 兜底止损 (SL): ${sl_price:.4f} (极限亏损 -{abs(sl_pct):.2%})\n"
             f"🚀 追踪止盈: 已移交右脑状态机动态接管"
         )
@@ -823,12 +915,29 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                     # 👇 【修复 2：兜底价格计算】因为断网拿不到实际成交价，强制用当前盘口价测算防线
                     actual_tp_move = abs(tp_pct)
                     actual_sl_move = abs(sl_pct)
+                    position_entry_price = _position_entry_price(pos) or current_price
+                    position_contracts = _position_contracts(pos) or order_amount
                     
-                    fallback_sl_price = current_price * (1 - actual_sl_move) if side == 'buy' else current_price * (1 + actual_sl_move)
+                    fallback_sl_price = position_entry_price * (1 - actual_sl_move) if side == 'buy' else position_entry_price * (1 + actual_sl_move)
                     
                     # 立刻挂载条件单，堵住超时裸奔漏洞
                     close_side = "LONG" if side == 'buy' else "SHORT"
-                    safe_post_condition(sl_rule, fallback_sl_price, "sl_tier", order_amount, close_side)
+                    sl_label = f"sl_tier_{int(time.time() * 1000)}"
+                    if safe_post_condition(sl_rule, fallback_sl_price, sl_label, position_contracts, close_side):
+                        try:
+                            time.sleep(0.5)
+                            verify_stops = exchange_private.fetch_open_orders(gate_symbol, params={'stop': True})
+                            cancelled_count = cancel_obsolete_gate_close_stops(
+                                exchange_private,
+                                gate_symbol,
+                                sl_label,
+                                close_side,
+                                verify_stops,
+                            )
+                            if cancelled_count:
+                                print(f"🧹 [超时抢救] 已撤销 {cancelled_count} 张旧止损单，仅保留最新统一防线。")
+                        except Exception as stop_cleanup_e:
+                            print(f"   ⚠️ [超时抢救] 旧止损清理失败，交由右脑后续校验: {stop_cleanup_e}")
                     
                     # 超时抢救成功后兜底落库
                     db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{symbol}.db")

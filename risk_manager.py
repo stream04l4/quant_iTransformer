@@ -132,6 +132,16 @@ def _inspect_snapshot_stop_coverage(position):
             "reason": f"止损单覆盖不足，size={max_stop_size:.4f} < 持仓={expected_contracts:.4f}",
         }
 
+    if len(parsed_sizes) > 1:
+        return {
+            "status": "duplicate_stop",
+            "expected_contracts": expected_contracts,
+            "max_stop_size": max_stop_size,
+            "matched_stop_count": len(matched_stops),
+            "coverage_ratio": coverage_ratio,
+            "reason": f"检测到 {len(parsed_sizes)} 张可解析止损单，需收敛为单一统一防线",
+        }
+
     return {
         "status": "ok",
         "expected_contracts": expected_contracts,
@@ -659,7 +669,7 @@ def bailout_worker():
                     # 🩹 轨道 1.5：若交易所止损单丢失/覆盖不足，立即按当前防线补挂
                     # ---------------------------------------------------------
                     stop_coverage = _inspect_snapshot_stop_coverage(p)
-                    repairable_statuses = {"missing_stop", "undercovered_stop", "unparseable_stop"}
+                    repairable_statuses = {"missing_stop", "undercovered_stop", "unparseable_stop", "duplicate_stop"}
                     if stop_coverage["status"] in repairable_statuses:
                         repair_cooldown = 8.0
                         since_last_repair = time.time() - float(mem.get('last_stop_repair_ts', 0.0) or 0.0)

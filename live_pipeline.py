@@ -780,6 +780,16 @@ def _inspect_live_stop_coverage(position, symbol=None):
             "reason": f"止损单数量偏大，raw size={max_stop_size:.4f} > 持仓={expected_contracts:.4f}"
         }
 
+    if len(parsed_sizes) > 1:
+        return {
+            "status": "duplicate_stop",
+            "expected_contracts": expected_contracts,
+            "matched_stop_count": len(matched_stops),
+            "max_stop_size": max_stop_size,
+            "coverage_ratio": coverage_ratio,
+            "reason": f"检测到 {len(parsed_sizes)} 张可解析止损单，右脑将收敛为单一统一防线"
+        }
+
     return {
         "status": "ok",
         "expected_contracts": expected_contracts,
@@ -845,7 +855,7 @@ def _build_inventory_guard(symbol, position_tier_state, position_state_meta):
     stop_coverage = _inspect_live_stop_coverage(position, sym_key)
     if stop_coverage["status"] in {"missing_stop", "unparseable_stop", "undercovered_stop"}:
         hard_reasons.append(stop_coverage["reason"])
-    elif stop_coverage["status"] == "oversized_stop":
+    elif stop_coverage["status"] in {"oversized_stop", "duplicate_stop"}:
         soft_reasons.append(stop_coverage["reason"])
 
     if not position_state_meta["sync_fresh"] and position_tier_state["side"] != 0:
