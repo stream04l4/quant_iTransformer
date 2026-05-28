@@ -480,6 +480,16 @@ def load_live_shadow_model_audit(symbol):
         return pd.DataFrame(), db_path
 
 
+def _calc_shadow_max_drawdown(pnl_series):
+    pnl = pd.to_numeric(pnl_series, errors="coerce").dropna()
+    if pnl.empty:
+        return np.nan
+    equity = (1.0 + pnl).cumprod()
+    running_peak = equity.cummax()
+    drawdown = (equity / running_peak) - 1.0
+    return float(drawdown.min()) if not drawdown.empty else np.nan
+
+
 def summarize_live_shadow_model_audit(audit_df, model_stack):
     if audit_df.empty:
         return pd.DataFrame()
@@ -498,6 +508,8 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
 
         adj_pnl = pd.to_numeric(settled_adj.get("adj_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
         raw_pnl = pd.to_numeric(settled_raw.get("raw_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        settled_adj_chrono = settled_adj.sort_values("decision_ts")
+        settled_raw_chrono = settled_raw.sort_values("decision_ts")
         last = g.sort_values("decision_ts").iloc[-1]
 
         rows.append({
@@ -510,8 +522,10 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
             "win_rate": float((adj_pnl > 0).mean()) if len(adj_pnl) else np.nan,
             "avg_pnl": float(adj_pnl.mean()) if len(adj_pnl) else np.nan,
             "total_pnl": float(adj_pnl.sum()) if len(adj_pnl) else 0.0,
+            "max_drawdown": _calc_shadow_max_drawdown(settled_adj_chrono.get("adj_pnl", pd.Series(dtype=float))),
             "raw_win_rate": float((raw_pnl > 0).mean()) if len(raw_pnl) else np.nan,
             "raw_total_pnl": float(raw_pnl.sum()) if len(raw_pnl) else 0.0,
+            "raw_max_drawdown": _calc_shadow_max_drawdown(settled_raw_chrono.get("raw_pnl", pd.Series(dtype=float))),
             "long_count": int((pd.to_numeric(g.get("adj_signal", 0), errors="coerce") == 1).sum()),
             "short_count": int((pd.to_numeric(g.get("adj_signal", 0), errors="coerce") == -1).sum()),
             "last_signal": int(last.get("adj_signal", 0) or 0),
@@ -1216,8 +1230,10 @@ with dash_tab4:
             display_shadow["影子胜率"] = display_shadow["win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
             display_shadow["累计影子ROE"] = display_shadow["total_pnl"].apply(lambda x: f"{x:+.2%}")
             display_shadow["平均单次ROE"] = display_shadow["avg_pnl"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:+.2%}")
+            display_shadow["最大回撤"] = display_shadow["max_drawdown"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.2%}")
             display_shadow["未加宏观胜率"] = display_shadow["raw_win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
             display_shadow["未加宏观累计"] = display_shadow["raw_total_pnl"].apply(lambda x: f"{x:+.2%}")
+            display_shadow["未加宏观回撤"] = display_shadow["raw_max_drawdown"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.2%}")
             display_shadow["最近信号"] = display_shadow.apply(
                 lambda r: "多" if int(r["last_signal"]) == 1 else ("空" if int(r["last_signal"]) == -1 else "无"),
                 axis=1,
@@ -1230,7 +1246,7 @@ with dash_tab4:
                 display_shadow[[
                     "experiment_id", "Live权重", "inference_count", "shadow_trade_count",
                     "settled_trade_count", "pending_trade_count", "影子胜率",
-                    "累计影子ROE", "平均单次ROE", "未加宏观胜率", "未加宏观累计",
+                    "累计影子ROE", "平均单次ROE", "最大回撤", "未加宏观胜率", "未加宏观累计", "未加宏观回撤",
                     "long_count", "short_count", "最近信号", "last_tier", "最近概率"
                 ]],
                 hide_index=True,
