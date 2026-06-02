@@ -1192,6 +1192,7 @@ def _load_symbol_runtime(symbol, cfg):
         "cached_model_details": [],
         "cached_macro_score": 0.0,
         "last_macro_ts": "0",
+        "last_signal_evaluated_ts": 0.0,
         "last_trade_hour": 0,
         "latest_closed_ts": 0,
         "last_inventory_guard_mode": "flat",
@@ -1379,6 +1380,7 @@ def run_live():
                 target_signal = 0
                 target_tier = 0
                 dynamic_leverage = 0.0
+                reverse_signal_ignored = False
                 if adj_up_top1 > th['up_top_1']:
                     target_signal = 1; target_tier = 3; dynamic_leverage = LEVERAGE_3
                 elif adj_up_top5 > th['up_top_5']:
@@ -1392,6 +1394,9 @@ def run_live():
                 elif adj_down_top10 > th['down_top_10']:
                     target_signal = -1; target_tier = 1; dynamic_leverage = LEVERAGE_1
 
+                if needs_evaluation_log:
+                    rt["last_signal_evaluated_ts"] = current_time
+
                 actual_signal = 0
                 if forced_exit_lock.get("active"):
                     actual_signal = 0
@@ -1404,7 +1409,7 @@ def run_live():
                         if target_tier > position_tier_state["highest_tier"]:
                             actual_signal = target_signal
                     else:
-                        actual_signal = target_signal
+                        reverse_signal_ignored = True
 
                 if needs_evaluation_log:
                     action_str = "按兵不动"
@@ -1412,6 +1417,8 @@ def run_live():
                         action_str = "强制退出冷却中，等待下一根1h K线闭合后再评估"
                     elif inventory_guard["block_new_orders"]:
                         action_str = "异常库存隔离中，主引擎禁止继续下单"
+                    elif reverse_signal_ignored:
+                        action_str = "反向入场信号忽略，交由右脑按原始概率 Top-1 规则评估退出"
                     elif actual_signal == 1:
                         action_str = f"触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
                     elif actual_signal == -1:
@@ -1498,6 +1505,7 @@ def run_live():
                         "target_tier": int(target_tier),
                         "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
                         "last_inferred_hour": int(rt["last_inferred_hour"]),
+                        "last_signal_evaluated_ts": float(rt["last_signal_evaluated_ts"]),
                         "last_trade_hour": int(rt["last_trade_hour"])
                     },
                     "position_tier_state": {

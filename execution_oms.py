@@ -599,7 +599,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
         exchange_private = global_gate
 
         # ---------------------------------------------------------
-        # 1. 仓位互斥锁与反转引擎：支持同向升档到目标绝对杠杆，拦截反向信号交由右脑
+        # 1. 仓位互斥锁：支持同向升档到目标绝对杠杆，反向信号统一交由右脑评估
         # ---------------------------------------------------------
         order_sent = False 
         has_existing_same_side = False
@@ -612,16 +612,10 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                 current_pos_side = str(pos.get('side', '')).lower()
                 
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
-                    msg = f"🔄 [紧急反转] 检测到反向信号，主引擎强制唤醒右脑执行清仓！"
-                    print("🚨", msg)
-                    log_system_alert("🚨 强制平仓", symbol, msg)
-                    
-                    # 💡 直接从这里导入并调用右脑的执行函数，不再等待下一秒的轮询
-                    from risk_manager import execute_bailout
-                    p = pos # 获取当前仓位信息对象
-                    execute_bailout(exchange_private, symbol, p, "AI信号强制反转", current_price)
-                    
-                    return False, 0.0 # 平仓后依然返回 False，防止在本轮循环立即反向开仓（符合回测冷却逻辑）
+                    msg = "检测到反向入场请求，OMS 已忽略；由右脑按原始概率 Top-1 规则决定是否退出。"
+                    print("ℹ️", msg)
+                    log_system_alert("ℹ️ 反向信号忽略", symbol, msg)
+                    return False, 0.0
                 else:
                     has_existing_same_side = True
                     existing_contracts = pos_contracts

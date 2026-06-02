@@ -111,7 +111,7 @@ INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累
 BASE_RISK_BUDGET = 0.2              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
 
 # --- 右脑高频熔断参数 ---
-BAILOUT_ATR_MULTI = 3.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
+BAILOUT_ATR_MULTI = 3.0              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
 BAILOUT_VOL_MULTI = 4.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
 BAILOUT_MIN_PHYSICAL_DROP = 0.005    # 熔断最小物理跌幅过滤(0.5%)，防止微小波动误触
 BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确认为真瀑布)

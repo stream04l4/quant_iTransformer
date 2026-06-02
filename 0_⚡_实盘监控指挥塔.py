@@ -16,7 +16,7 @@ import requests  # 新增：用于发送 Webhook 请求
 from dotenv import load_dotenv
 load_dotenv()
 from quant_config.config import (
-    SYMBOL, DATA_DIR, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
+    SYMBOL, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
     FORECAST_HORIZON, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS
@@ -26,6 +26,34 @@ from quant_config.config import (
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _load_chandelier_state():
+    """读取右脑导出的 ATR 追踪状态。"""
+    state_path = os.path.join(LIVE_DATA_DIR, "chandelier_state.json")
+    if not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _calc_stop_roe(stop_px, entry_px, pos_side, leverage):
+    """将止损价格换算为带杠杆 ROE。"""
+    if stop_px <= 0 or entry_px <= 0:
+        return None
+    if pos_side == 'LONG':
+        return (stop_px - entry_px) / entry_px * leverage * 100
+    if pos_side == 'SHORT':
+        return (entry_px - stop_px) / entry_px * leverage * 100
+    return None
+
+
+def _format_stop_roe(stop_px, entry_px, pos_side, leverage, empty_text="未激活"):
+    roe = _calc_stop_roe(stop_px, entry_px, pos_side, leverage)
+    return f"{roe:+.2f}%" if roe is not None else empty_text
 
 
 def _normalize_model_specs(cfg):
@@ -593,29 +621,17 @@ def render_realtime_portfolio():
         
     with st.expander("🏦 Gate.io 仓位监控中心", expanded=True):
         try:
-            # 1. 提前读取吊灯内存，用于算全局保底
-            chandelier_mem = {}
-            if os.path.exists(os.path.join(LIVE_DATA_DIR, "chandelier_state.json")):
-                try:
-                    with open(os.path.join(LIVE_DATA_DIR, "chandelier_state.json"), "r") as f:
-                        chandelier_mem = json.load(f)
-                except Exception: 
-                    pass
-
             # 适配 CCXT 解析 Gate.io 余额的标准结构
             wallet_balance = float(balance.get('total', {}).get('USDT', 0))
             avail_margin = float(balance.get('free', {}).get('USDT', 0))
             
             unrealized_pnl = 0.0
             total_margin_used = 0.0
-            # 👇 合并为一个综合累加器
-            total_unified_min_pnl = 0.0  # 综合守底
+            total_oco_min_pnl = 0.0
             
             for p in positions:
                 p_info = p['info']
                 symbol_raw = p['symbol']
-                base_symbol = symbol_raw.split(':')[0]
-                
                 # 累加未实现盈亏
                 unrealized_pnl += float(p_info.get('unrealised_pnl', 0))
                 
@@ -632,9 +648,7 @@ def render_realtime_portfolio():
                 actual_margin = notional / leverage_used
                 total_margin_used += actual_margin
                 
-                # ==========================================
-                # 👇 新增核心：计算单仓保底盈亏金额 (最严防线距离 * 保证金杠杆)
-                # ==========================================
+                # 计算交易所当前 OCO 对应的真实保底盈亏金额。
                 pos_side = str(p.get('side', '')).upper()
                 entry_px = float(p_info.get('avgPx', p_info.get('entry_price', 0)))
                 mark_px = float(p_info.get('markPx', p_info.get('mark_price', 0)))
@@ -648,39 +662,25 @@ def render_realtime_portfolio():
                         if pos_side == 'LONG' and stop_px < mark_px: physical_sl_px = stop_px
                         elif pos_side == 'SHORT' and stop_px > mark_px: physical_sl_px = stop_px
                 
-                # 提取内存中的虚拟吊灯
-                virtual_sl_px = 0.0
-                if base_symbol in chandelier_mem and 'current_stop' in chandelier_mem[base_symbol]:
-                    virtual_sl_px = float(chandelier_mem[base_symbol]['current_stop'])
-                
-                # 👇 【UI重构：合并双防线，计算单仓综合守底金额并累加】
+                # 仅统计交易所已挂载的 OCO，避免把尚未落地的 ATR 目标线计入真实保底。
                 if entry_px > 0 and mark_px > 0:
                     coin_amount = notional / mark_px
-                    
-                    unified_sl_px = 0.0
-                    if pos_side == 'LONG':
-                        # 做多：取两者最高价（离现价最近的防线）
-                        unified_sl_px = max(physical_sl_px, virtual_sl_px)
-                    elif pos_side == 'SHORT':
-                        # 做空：过滤掉 0 之后，取两者最低价
-                        valid_stops = [s for s in [physical_sl_px, virtual_sl_px] if s > 0]
-                        unified_sl_px = min(valid_stops) if valid_stops else 0.0
-                        
-                    if unified_sl_px > 0:
+
+                    if physical_sl_px > 0:
                         if pos_side == 'LONG':
-                            unified_pnl = (unified_sl_px - entry_px) * coin_amount
+                            oco_pnl = (physical_sl_px - entry_px) * coin_amount
                         elif pos_side == 'SHORT':
-                            unified_pnl = (entry_px - unified_sl_px) * coin_amount
+                            oco_pnl = (entry_px - physical_sl_px) * coin_amount
                         else:
-                            unified_pnl = 0.0
-                        total_unified_min_pnl += unified_pnl
+                            oco_pnl = 0.0
+                        total_oco_min_pnl += oco_pnl
 
             # 账户总权益 = 真实钱包余额 + 浮动盈亏
             total_equity = wallet_balance + unrealized_pnl
 
         except Exception as e:
             # 异常时所有变量归零
-            total_equity, unrealized_pnl, avail_margin, wallet_balance, total_margin_used, total_unified_min_pnl = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            total_equity, unrealized_pnl, avail_margin, wallet_balance, total_margin_used, total_oco_min_pnl = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             st.warning(f"⚠️ 解析 Gate 资产列表出现异常: {e}")
 
         # 计算已实现盈亏与历史累计收益率
@@ -695,8 +695,7 @@ def render_realtime_portfolio():
         m_col1.metric("账户总权益", f"${total_equity:,.2f}", delta=f"累计收益率: {historical_roi:+.2%}", delta_color="normal" if historical_roi >= 0 else "inverse")
         m_col2.metric("已实现盈亏", f"${realized_pnl:,.2f}", delta="已落袋" if realized_pnl >= 0 else "已亏损", delta_color="normal" if realized_pnl >= 0 else "inverse")
         
-        # 👇 【核心呈现：综合保底收益金额展示】
-        delta_label = f"综合保底收益 {total_unified_min_pnl:+.2f}" if positions else "浮动中"
+        delta_label = f"交易所 OCO 保底 {total_oco_min_pnl:+.2f}" if positions else "浮动中"
         m_col3.metric("未实现盈亏", f"${unrealized_pnl:,.2f}", delta=delta_label, delta_color="normal" if unrealized_pnl >= 0 else "inverse")
         
         # 保持第四个卡片为战略预备队雷达
@@ -715,19 +714,13 @@ def render_realtime_portfolio():
         else:
             pos_data = []
             
-            # 在循环前，一次性读取后台硬盘里的吊灯黑匣子
-            chandelier_mem = {}
-            if os.path.exists(os.path.join(DATA_DIR, "chandelier_state.json")):
-                try:
-                    with open(os.path.join(DATA_DIR, "chandelier_state.json"), "r") as f:
-                        chandelier_mem = json.load(f)
-                except Exception:
-                    pass
+            # 在循环前，一次性读取右脑导出的 ATR 追踪状态。
+            chandelier_mem = _load_chandelier_state()
                     
             for p in positions:
                 info = p['info']
                 symbol_raw = p['symbol'] 
-                base_symbol = symbol_raw.split(':')[0]
+                base_symbol = _normalize_symbol_key(symbol_raw)
                 
                 real_tp, real_sl = "未挂载 ⚠️", "未挂载 ⚠️"
                 physical_sl_px = 0.0 # 👇 新增：用于数学计算的物理止损价
@@ -779,24 +772,21 @@ def render_realtime_portfolio():
                 if upl_ratio == 0.0 and actual_margin > 0:
                     upl_ratio = (upl / actual_margin) * 100
                 
-                # 从内存中提取该币种的实时吊灯线
-                virtual_sl = "初始化中 ⏳"
-                virtual_sl_px = 0.0 
-                if base_symbol in chandelier_mem and 'current_stop' in chandelier_mem[base_symbol]:
-                    virtual_sl_px = float(chandelier_mem[base_symbol]['current_stop'])
-                    virtual_sl = f"${virtual_sl_px:,.4f}"
+                # 从右脑状态中提取 ATR 动态线与不可回退利润地板。
+                trailing_state = chandelier_mem.get(base_symbol, {}) or {}
+                atr_target_sl_px = float(trailing_state.get('current_stop', 0.0) or 0.0)
+                profit_floor_px = float(trailing_state.get('profit_floor', 0.0) or 0.0)
+                trailing_active = bool(trailing_state.get('trailing_active', False))
+                atr_retrace_pct = float(trailing_state.get('atr_retrace_pct', 0.0) or 0.0)
+                atr_target_sl = f"${atr_target_sl_px:,.4f}" if atr_target_sl_px > 0 else "初始化中 ⏳"
+                profit_floor = f"${profit_floor_px:,.4f}" if profit_floor_px > 0 else "未激活"
+                trailing_status = f"已激活 | 回撤宽度 {atr_retrace_pct:.2%}" if trailing_active else "未激活"
                 
                 # ==========================================
-                # 👇 【核心重构】：分别计算双防线的独立保底收益率
-                # ==========================================
-                # 1. 计算底层物理 OCO 止损的保底 ROE
-                oco_min_roe_str = "未挂载 ⚠️"
-                if physical_sl_px > 0 and entry_px > 0:
-                    if pos_side == 'LONG':
-                        oco_roe = (physical_sl_px - entry_px) / entry_px * leverage_used * 100
-                    else:
-                        oco_roe = (entry_px - physical_sl_px) / entry_px * leverage_used * 100
-                    oco_min_roe_str = f"{oco_roe:+.2f}%"
+                # 分开展示：交易所真实 OCO、右脑 ATR 目标线、不可回退利润地板。
+                oco_min_roe_str = _format_stop_roe(physical_sl_px, entry_px, pos_side, leverage_used, "未挂载 ⚠️")
+                atr_target_roe_str = _format_stop_roe(atr_target_sl_px, entry_px, pos_side, leverage_used, "初始化中 ⏳")
+                profit_floor_roe_str = _format_stop_roe(profit_floor_px, entry_px, pos_side, leverage_used)
 
                 pos_data.append({
                     "交易对": symbol_raw,
@@ -807,9 +797,13 @@ def render_realtime_portfolio():
                     "防守止损 (SL)": real_sl,
                     "当前标记价": f"${float(info.get('markPx', info.get('mark_price', 0))):,.4f}",
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
-                    "收益率 (ROE)": f"{upl_ratio:+.2f}%", 
-                    # 👇 重组字段名，并将双防线保底收益移到表格最末端，方便横向对比
-                    "保底收益 (OCO)": oco_min_roe_str
+                    "收益率 (ROE)": f"{upl_ratio:+.2f}%",
+                    "ATR追踪状态": trailing_status,
+                    "ATR目标止损": atr_target_sl,
+                    "利润地板": profit_floor,
+                    "交易所保底 (OCO)": oco_min_roe_str,
+                    "ATR目标保底": atr_target_roe_str,
+                    "不可回退地板": profit_floor_roe_str,
                 })
             st.dataframe(pd.DataFrame(pos_data), hide_index=True, width='stretch')
             pass

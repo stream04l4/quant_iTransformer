@@ -342,6 +342,7 @@ def run_backtest(args=None):
     
     max_unrealized_phys_pnl = 0.0 
     trailing_active = False
+    trailing_floor_phys = None
     dynamic_sl_phys = -abs(HARD_SL)
     
     trade_count = 0
@@ -424,50 +425,68 @@ def run_backtest(args=None):
                 
                 max_unrealized_phys_pnl = 0.0   
                 trailing_active = False         
+                trailing_floor_phys = None
                 dynamic_sl_phys = -abs(HARD_SL) 
 
-            # 💡 情景 B: 同向持仓，且触发了更高的 Tier (补到目标绝对杠杆)
-            elif current_pos == target_pos and target_tier > current_tier:
-                # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
-                if current_pos == 1:
-                    absolute_sl_price = entry_price * (1 + dynamic_sl_phys)
-                else:
-                    absolute_sl_price = entry_price * (1 - dynamic_sl_phys)
-                    
-                # 【对齐实盘 OMS】：Tier 杠杆表示目标总杠杆，仅补足当前仓位与目标仓位之间的差额
-                old_notional = trade_start_equity * current_leverage
-                target_notional = trade_start_equity * target_leverage
-                added_notional = max(0.0, target_notional - old_notional)
-                if added_notional <= 1e-12:
-                    current_tier = target_tier
-                else:
-                    old_size = old_notional / entry_price
-                    new_size = added_notional / current_hour_open
-                    total_size = old_size + new_size
-                    
-                    # 重新计算加仓后的加权持仓均价
-                    avg_entry_price = target_notional / total_size
-                    
-                    # 扣除新增仓位的摩擦成本
-                    added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
-                    open_cost += added_open_cost
-                    equity -= added_open_cost 
-                    
-                    # 更新全局状态机
-                    entry_price = avg_entry_price
-                    current_leverage = target_leverage
-                    current_tier = target_tier
-                    
-                    # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
+            # 💡 情景 B: 任意同向信号都会刷新持仓计时；更高 Tier 额外补仓。
+            elif current_pos == target_pos:
+                hold_timer_mins = HOLD_PERIOD * 60
+
+                if target_tier > current_tier:
+                    # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
                     if current_pos == 1:
-                        new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
-                        max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
+                        absolute_sl_price = entry_price * (1 + dynamic_sl_phys)
+                        absolute_floor_price = (
+                            entry_price * (1 + trailing_floor_phys)
+                            if trailing_floor_phys is not None
+                            else None
+                        )
                     else:
-                        new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
-                        max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
+                        absolute_sl_price = entry_price * (1 - dynamic_sl_phys)
+                        absolute_floor_price = (
+                            entry_price * (1 - trailing_floor_phys)
+                            if trailing_floor_phys is not None
+                            else None
+                        )
+
+                    # 【对齐实盘 OMS】：Tier 杠杆表示目标总杠杆，仅补足当前仓位与目标仓位之间的差额
+                    old_notional = trade_start_equity * current_leverage
+                    target_notional = trade_start_equity * target_leverage
+                    added_notional = max(0.0, target_notional - old_notional)
+                    if added_notional <= 1e-12:
+                        current_tier = target_tier
+                    else:
+                        old_size = old_notional / entry_price
+                        new_size = added_notional / current_hour_open
+                        total_size = old_size + new_size
+
+                        # 重新计算加仓后的加权持仓均价
+                        avg_entry_price = target_notional / total_size
                         
-                    # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
-                    dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
+                        # 扣除新增仓位的摩擦成本
+                        added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
+                        open_cost += added_open_cost
+                        equity -= added_open_cost
+
+                        # 更新全局状态机
+                        entry_price = avg_entry_price
+                        current_leverage = target_leverage
+                        current_tier = target_tier
+
+                        # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
+                        if current_pos == 1:
+                            new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
+                            if absolute_floor_price is not None:
+                                trailing_floor_phys = max((absolute_floor_price - entry_price) / entry_price, -abs(HARD_SL))
+                            max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
+                        else:
+                            new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
+                            if absolute_floor_price is not None:
+                                trailing_floor_phys = max((entry_price - absolute_floor_price) / entry_price, -abs(HARD_SL))
+                            max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
+
+                        # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
+                        dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
                     
         # ------------------------------------------
         # 2. 1分钟级别显微镜追踪持仓
@@ -490,13 +509,14 @@ def run_backtest(args=None):
                 current_hour_open = opens_1h[exec_idx_1h]
                 current_phys_profit = (current_hour_open - entry_price) / entry_price if current_pos == 1 else (entry_price - current_hour_open) / entry_price
                 
-                if current_phys_profit < 0.005:
+                if current_phys_profit < 0.005 and not trailing_active:
                     close_position = True
                     actual_exit_pct = current_phys_profit * current_leverage
                     exit_reasons["REVERSAL_EXIT"] += 1 
                 else:
                     trailing_active = True
-                    dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
+                    trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), 0.005)
+                    dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
             
             if not close_position:
                 for m_idx in range(start_1m_idx, end_1m_idx):
@@ -542,7 +562,8 @@ def run_backtest(args=None):
                         
                     if max_unrealized_phys_pnl >= abs(HARD_TP) + 0.005:
                         trailing_active = True
-                        dynamic_sl_phys = max(dynamic_sl_phys, abs(HARD_TP))
+                        trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), abs(HARD_TP))
+                        dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
                         
                     if hold_timer_mins <= 0 and not trailing_active:
                         if close_return < 0.005:
@@ -552,10 +573,11 @@ def run_backtest(args=None):
                             break
                         else:
                             trailing_active = True
-                            dynamic_sl_phys = max(dynamic_sl_phys, 0.005)
+                            trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), 0.005)
+                            dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
                             
                     if trailing_active and trailing_retrace_phys > 0:
-                        dynamic_sl_phys = max(dynamic_sl_phys, max_unrealized_phys_pnl - trailing_retrace_phys)
+                        dynamic_sl_phys = max(trailing_floor_phys, max_unrealized_phys_pnl - trailing_retrace_phys)
 
                     if worst_intra <= dynamic_sl_phys:
                         close_position = True
