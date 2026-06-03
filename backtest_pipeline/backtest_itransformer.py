@@ -14,7 +14,7 @@ import json
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
-    SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
+    SYMBOL, PROCESSED_MAIN_DIR, PROCESSED_MAIN_ROOT, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
     EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, 
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
     TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
@@ -24,6 +24,16 @@ from historical_pipeline.train_itransformer import InvertedTransformer
 
 
 THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+
+
+def _find_training_matrix_files(horizon):
+    pattern = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_*.parquet"
+    candidate_dirs = [PROCESSED_MAIN_DIR, PROCESSED_MAIN_ROOT]
+    files = []
+    for directory in dict.fromkeys(candidate_dirs):
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    return sorted(set(files))
 
 
 def _parse_args():
@@ -269,7 +279,7 @@ def run_backtest(args=None):
     print(f"🧩 模型模式: {'Ensemble' if model_count > 1 else 'Single'} x{model_count} | {model_stack}")
 
     # 基于真实 horizon 精准匹配特征宽表
-    data_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"{SYMBOL}_Master_Training_Matrix_{ckpt_horizon}h_*.parquet")))
+    data_files = _find_training_matrix_files(ckpt_horizon)
     if not data_files:
         print(f"❌ 找不到对应 Horizon ({ckpt_horizon}h) 的数据文件！")
         return

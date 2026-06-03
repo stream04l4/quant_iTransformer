@@ -31,10 +31,36 @@ load_dotenv()
 MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
 
+THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+
 
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _normalize_model_specs(cfg):
+    raw_models = cfg.get("models")
+    if not raw_models:
+        raw_models = [{"experiment_id": cfg.get("experiment_id", EXPERIMENT_ID), "weight": cfg.get("weight", 1.0)}]
+
+    normalized = []
+    for raw_model in raw_models:
+        model_cfg = raw_model or {}
+        exp_id = str(model_cfg.get("experiment_id", cfg.get("experiment_id", EXPERIMENT_ID)))
+        weight = float(model_cfg.get("weight", 1.0))
+        if weight <= 0:
+            raise ValueError(f"模型权重必须为正数: experiment_id={exp_id}, weight={weight}")
+        normalized.append({
+            "name": str(model_cfg.get("name", exp_id)),
+            "experiment_id": exp_id,
+            "weight": weight,
+        })
+
+    total_weight = sum(m["weight"] for m in normalized)
+    for model_cfg in normalized:
+        model_cfg["normalized_weight"] = model_cfg["weight"] / total_weight
+    return normalized
 
 
 def _normalize_live_configs():
@@ -45,24 +71,52 @@ def _normalize_live_configs():
     for raw_symbol, cfg in raw_configs.items():
         sym_key = _normalize_symbol_key(raw_symbol)
         cfg = cfg or {}
-        normalized[sym_key] = {"experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID))}
+        normalized[sym_key] = {
+            "experiment_id": str(cfg.get("experiment_id", EXPERIMENT_ID)),
+            "models": _normalize_model_specs(cfg),
+        }
     return normalized
 
 
 LIVE_CONFIGS = _normalize_live_configs()
 
 
+def _load_thresholds_for_exp(exp_id):
+    json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+    with open(json_path, "r") as f:
+        config_data = json.load(f)
+    thresholds = config_data.get("thresholds", config_data)
+    missing_keys = [key for key in THRESHOLD_KEYS if key not in thresholds]
+    if missing_keys:
+        raise ValueError(f"{json_path.name} 缺少阈值字段: {missing_keys}")
+    return thresholds, json_path
+
+
+def _weighted_thresholds_for_models(model_specs):
+    weighted = {key: 0.0 for key in THRESHOLD_KEYS}
+    for model_cfg in model_specs:
+        model_thresholds, _ = _load_thresholds_for_exp(model_cfg["experiment_id"])
+        weight = float(model_cfg["normalized_weight"])
+        for key in THRESHOLD_KEYS:
+            weighted[key] += float(model_thresholds[key]) * weight
+    return weighted
+
+
 def _load_thresholds_by_symbol():
     thresholds = {}
     for sym_key, cfg in LIVE_CONFIGS.items():
-        exp_id = cfg.get("experiment_id", EXPERIMENT_ID)
-        json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
         try:
-            with open(json_path, "r") as f:
-                config_data = json.load(f)
-                thresholds[sym_key] = config_data.get("thresholds", config_data)
+            model_specs = cfg.get("models") or [
+                {"experiment_id": cfg.get("experiment_id", EXPERIMENT_ID), "normalized_weight": 1.0}
+            ]
+            thresholds[sym_key] = _weighted_thresholds_for_models(model_specs)
+            model_text = ", ".join(
+                f"{m['experiment_id']}@{float(m.get('normalized_weight', 1.0)):.2f}"
+                for m in model_specs
+            )
+            print(f"✅ 右脑加载 {sym_key} 加权阈值: {model_text}")
         except Exception as e:
-            print(f"❌ 右脑加载 {sym_key} 阈值文件失败 ({json_path.name}): {e}")
+            print(f"❌ 右脑加载 {sym_key} 阈值文件失败: {e}")
             thresholds[sym_key] = {}
     return thresholds
 

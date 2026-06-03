@@ -18,13 +18,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 from quant_config.config import (
-    TEMP_DIR, PROCESSED_MAIN_DIR, PROCESSED_AGGTRADES_DIR, SYMBOL, AUX_SYMBOLS,
+    TEMP_DIR, PROCESSED_MAIN_DIR, PROCESSED_AGGTRADES_DIR,
+    PROCESSED_AGGTRADES_ROOT, SYMBOL, AUX_SYMBOLS,
     DATA_START_MONTH, DATA_END_MONTH, FORECAST_HORIZON,
     BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_SPOT, BINANCE_BASE_URL_METRICS_DAILY,
     KLINE_COLS, FUNDING_COLS
 )
 
 PROCESSED_MAIN_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def find_symbol_aggtrade_files(symbol):
+    pattern = f"{symbol}_aggTrades_*.parquet"
+    candidate_dirs = [PROCESSED_AGGTRADES_DIR, PROCESSED_AGGTRADES_ROOT]
+    files = []
+    for directory in dict.fromkeys(candidate_dirs):
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    return sorted(set(files))
 
 # ==========================================
 # 1. 强化版数据下载引擎 (带详细日志与防错)
@@ -587,7 +598,7 @@ def build_features(horizon):
     )
 
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
-    symbol_agg_files = sorted(PROCESSED_AGGTRADES_DIR.glob(f"{SYMBOL}_aggTrades_*.parquet"))
+    symbol_agg_files = find_symbol_aggtrade_files(SYMBOL)
     if symbol_agg_files:
         # 🚨 致命缺陷修复：强行按时间去重，防范月度包与日线增量包交叉覆盖导致的行数爆炸
         # 日线增量通常比月度包更新，显式排序与优先级保证同一小时保留结果可复现。
