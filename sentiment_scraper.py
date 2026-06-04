@@ -538,10 +538,18 @@ def _redact_btc_price_mentions(text):
     if not re.search(r"(?i)(?:BTC|Bitcoin|比特币)", text):
         return text
 
+    price_expr = r"(?:[$€¥£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*[kmb])?|\b\d[\d,]*(?:\.\d+)?\s*(?:usd|usdt|dollars?|k|m|b|万|亿)\b)"
+    btc_expr = r"(?:BTC|Bitcoin|比特币)"
+
     redacted = re.sub(
-        r"(?i)(?:[$€¥£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*[kmb])?|\b\d[\d,]*(?:\.\d+)?\s*(?:usd|usdt|dollars?|k|m|b|万|亿)\b)",
-        "[PRICE_REDACTED]",
+        rf"(?i)({btc_expr}[^\d$€¥£，。,；;]{{0,24}}){price_expr}",
+        r"\1[PRICE_REDACTED]",
         text,
+    )
+    redacted = re.sub(
+        rf"(?i){price_expr}([^\d$€¥£，。,；;]{{0,24}}{btc_expr})",
+        r"[PRICE_REDACTED]\1",
+        redacted,
     )
     redacted = re.sub(r"(?i)\bprice\b", "price[REDACTED]", redacted)
     redacted = re.sub(r"(?i)\b(?:to|at|near|below|above|under|over)\s+\[PRICE_REDACTED\]", "", redacted)
@@ -572,6 +580,8 @@ def sanitize_marquee_text(text):
     )
     text = re.sub(r"(?i)\b(?:support|resistance)\b", "level", text)
     text = re.sub(r"(?i)(?:BTC|Bitcoin|比特币)[^，。,；;]*\[PRICE_REDACTED\][^，。,；;]*", "BTC走势承压", text)
+    text = re.sub(r"(?i)(Z[-\s]?Score)\s*[-:：]?\s*\[PRICE_REDACTED\]", r"\1", text)
+    text = text.replace("[PRICE_REDACTED]", "价格点位已脱敏")
     text = re.sub(r"(?:市场微观噪声已过滤[，。,；;\s]*)+", "市场微观噪声已过滤，", text)
     text = re.sub(r"\s+", " ", text).strip(" ，。,；;")
     return text or "宏观情绪中性，未见可广播的价格无关结论。"
