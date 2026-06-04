@@ -125,10 +125,18 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
 # 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
 BTCUSDT_LIVE_MODELS = [
-    {"experiment_id": "EXP_6ADB71DE", "weight": 0.4},
-    {"experiment_id": "EXP_A49047F0", "weight": 0.25},
-    {"experiment_id": "EXP_AA8D8236", "weight": 0.2},
-    {"experiment_id": "EXP_321B10D8", "weight": 0.15},
+    {"experiment_id": "EXP_321B10D8", "weight": 0.346},
+    {"experiment_id": "EXP_6ADB71DE", "weight": 0.25},
+    {"experiment_id": "EXP_A49047F0", "weight": 0.24},
+    {"experiment_id": "EXP_AA8D8236", "weight": 0.155},
+    {"experiment_id": "EXP_522EEE76", "weight": 0.002},
+    {"experiment_id": "EXP_809B7D5F", "weight": 0.001},
+    {"experiment_id": "EXP_9797F116", "weight": 0.001},
+    {"experiment_id": "EXP_002574A2", "weight": 0.001},
+    {"experiment_id": "EXP_F0EF9621", "weight": 0.001},
+    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.001},
+    {"experiment_id": "EXP_A4040585", "weight": 0.001},
+    {"experiment_id": "EXP_957E1908", "weight": 0.001},
 ]
 
 LIVE_SYMBOL_CONFIGS = {

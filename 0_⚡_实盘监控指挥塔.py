@@ -569,6 +569,86 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
     )
 
 
+def render_confidence_calibration(v_df_curr, shadow_df, model_stack):
+    st.markdown("###### ⚖️ AI 诚实度校准 (Confidence Calibration)")
+
+    cal_df = pd.DataFrame()
+    source_label = "实盘平仓"
+    if not v_df_curr.empty and "xgb_prob" in v_df_curr.columns:
+        prob = pd.to_numeric(v_df_curr["xgb_prob"], errors="coerce")
+        cal_df = pd.DataFrame({
+            "confidence": prob,
+            "win": pd.to_numeric(v_df_curr["real_roe"], errors="coerce") > 0,
+        }).dropna(subset=["confidence"])
+        cal_df = cal_df[cal_df["confidence"].between(0.0, 1.0, inclusive="both")]
+
+    if cal_df.empty and not shadow_df.empty:
+        source_label = "Live 子模型影子账本"
+        shadow_cal = shadow_df.copy()
+        current_exps = {str(m.get("experiment_id", "")) for m in model_stack if m.get("experiment_id")}
+        if current_exps and "experiment_id" in shadow_cal.columns:
+            shadow_cal = shadow_cal[shadow_cal["experiment_id"].astype(str).isin(current_exps)]
+
+        default_zero = pd.Series(0, index=shadow_cal.index)
+        default_nan = pd.Series(np.nan, index=shadow_cal.index)
+        settled = pd.to_numeric(shadow_cal.get("settled", default_zero), errors="coerce").fillna(0).astype(int) == 1
+        signal = pd.to_numeric(shadow_cal.get("adj_signal", default_zero), errors="coerce").fillna(0).astype(int)
+        pnl = pd.to_numeric(shadow_cal.get("adj_pnl", default_nan), errors="coerce")
+        p_up = pd.to_numeric(shadow_cal.get("adj_p_up", shadow_cal.get("p_up", default_nan)), errors="coerce")
+        p_down = pd.to_numeric(shadow_cal.get("adj_p_down", shadow_cal.get("p_down", default_nan)), errors="coerce")
+        confidence = np.where(signal == 1, p_up, np.where(signal == -1, p_down, np.nan))
+        cal_df = pd.DataFrame({
+            "confidence": confidence,
+            "win": pnl > 0,
+        }, index=shadow_cal.index)
+        cal_df = cal_df[settled & (signal != 0) & pnl.notna()]
+        cal_df = cal_df.dropna(subset=["confidence"])
+        cal_df = cal_df[cal_df["confidence"].between(0.0, 1.0, inclusive="both")]
+
+    if cal_df.empty:
+        st.info("⏳ 当前批次尚无可校准的已结算置信度样本。实盘旧表缺少 predictions 时，将使用下一批 Live 子模型影子账本自动补图。")
+        return
+
+    bin_edges = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    cal_df = cal_df.copy()
+    cal_df["prob_bin"] = pd.cut(cal_df["confidence"], bins=bin_edges, include_lowest=True)
+    cal_stats = (
+        cal_df.groupby("prob_bin", observed=True)
+        .agg(win_rate=("win", "mean"), sample_count=("win", "size"), avg_conf=("confidence", "mean"))
+        .reset_index()
+    )
+    cal_stats = cal_stats[cal_stats["sample_count"] > 0]
+    if cal_stats.empty:
+        st.info("⏳ 当前校准样本数量不足，等待更多已结算信号。")
+        return
+
+    fig_cal = go.Figure()
+    fig_cal.add_trace(go.Bar(
+        x=[f"{b.left*100:.0f}%-{b.right*100:.0f}%" for b in cal_stats["prob_bin"]],
+        y=cal_stats["win_rate"],
+        marker_color="#00FFAA",
+        text=[f"{w*100:.1f}%<br>n={int(n)}" for w, n in zip(cal_stats["win_rate"], cal_stats["sample_count"])],
+        textposition="auto",
+        name="实际胜率",
+    ))
+    fig_cal.add_trace(go.Scatter(
+        x=[f"{b.left*100:.0f}%-{b.right*100:.0f}%" for b in cal_stats["prob_bin"]],
+        y=cal_stats["avg_conf"],
+        mode="lines+markers",
+        line=dict(color="#FFD166", width=2),
+        marker=dict(size=7),
+        name="平均置信度",
+    ))
+    fig_cal.update_layout(
+        height=260, margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(tickformat=".0%", range=[0, 1.05]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_cal, width="stretch")
+    st.caption(f"*数据源：{source_label}；柱为该置信度区间的实际胜率，黄线为区间平均置信度。样本越多，这张图越能看出模型是否高估或低估自己。*")
+
+
 st.title("iTransformer 预测引擎")
 
 # ==========================================
@@ -1337,31 +1417,7 @@ with dash_tab4:
                     m4.metric("实盘理论年化 (预估)", "计算中 ⏳", delta="跨度不足 24h")
                     
             with col2:
-                st.markdown("###### ⚖️ AI 诚实度校准 (Confidence Calibration)")
-                bins = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-                v_df_cal = v_df_curr[pd.to_numeric(v_df_curr['xgb_prob'], errors='coerce').between(0.5, 1.0, inclusive='both')].copy()
-                if v_df_cal.empty:
-                    st.info("⏳ 当前批次平仓样本未记录有效置信度，暂时无法绘制校准诚实度柱状图。")
-                else:
-                    v_df_cal.loc[:, 'prob_bin'] = pd.cut(v_df_cal['xgb_prob'], bins=bins, include_lowest=True)
-                    cal_stats = v_df_cal.groupby('prob_bin', observed=False)['real_roe'].apply(
-                        lambda x: (x > 0).mean() if len(x) > 0 else 0
-                    ).fillna(0)
-                    
-                    fig_cal = go.Figure(data=[
-                        go.Bar(
-                            x=[f"{b.left*100:.0f}%-{b.right*100:.0f}%" for b in cal_stats.index],
-                            y=cal_stats.values, marker_color='#00FFAA',
-                            text=[f"{v*100:.1f}%" for v in cal_stats.values], textposition='auto'
-                        )
-                    ])
-                    fig_cal.update_layout(
-                        height=240, margin=dict(l=0,r=0,t=10,b=0),
-                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                        yaxis=dict(tickformat=".0%", range=[0, 1.1])
-                    )
-                    st.plotly_chart(fig_cal, width='stretch')
-                    st.caption("*(图解：完美的 AI 应该在预期胜率更高的区间，展现出对应的高物理胜率，即**极佳的校准诚实度**)*")
+                render_confidence_calibration(v_df_curr, shadow_df, model_stack)
 # ==========================================
 # 🚨 引擎底层警报与异常状态监控器 (挪至页末展示)
 # ==========================================
