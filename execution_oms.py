@@ -417,6 +417,26 @@ def _record_passive_close_to_db(symbol_key, position, close_side="exchange_close
         )
         conn.commit()
 
+    abs_profit, realized_roe = _estimate_close_pnl_from_position(position, exit_price=exit_price)
+    exit_reason = _infer_passive_exit_reason(position, abs_profit, realized_roe)
+    pos_side = str(position.get("side", info.get("side", "")) or "").upper()
+    dir_str = "LONG" if pos_side == "LONG" else "SHORT" if pos_side == "SHORT" else pos_side or "UNKNOWN"
+    pnl_parts = []
+    if abs_profit is not None:
+        pnl_parts.append(f"{abs_profit:+.2f} USDT")
+    if realized_roe is not None:
+        pnl_parts.append(f"ROE {realized_roe:+.2%}")
+    pnl_text = " | ".join(pnl_parts) if pnl_parts else "盈亏快照不足"
+    price_text = f"${exit_price:.4f}" if exit_price > 0 else "未知"
+    log_system_alert(
+        "🏁 被动出场",
+        symbol_key,
+        (
+            f"{dir_str} 仓位已从交易所快照消失 | "
+            f"估算平仓价: {price_text} | 数量: {contracts:g} 张 | {pnl_text} | {exit_reason}"
+        ),
+    )
+
 
 def is_gate_close_position_stop(stop_order):
     """识别 Gate 的“平全仓”条件单。"""

@@ -16,7 +16,7 @@ from execution_oms import (
 )
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
-    HARD_TP, HARD_SL, HOLD_PERIOD, 
+    HARD_TP, HARD_SL, HOLD_PERIOD,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1,
@@ -32,11 +32,30 @@ MY_GATE_API_KEY  = os.environ.get("GATE_DEMO_API_KEY", "")
 MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
 
 THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+PHYSICAL_TRAIL_STEP_PHYS = 0.005
 
 
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
+
+
+def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
+    """交易所物理保底棘轮：价格每多走 0.5%，保底同步抬高 0.5%，始终约保留 2% 空间。"""
+    hard_tp = abs(float(hard_tp))
+    if max_phys_pnl < hard_tp:
+        return None
+    step = PHYSICAL_TRAIL_STEP_PHYS
+    gap = max(hard_tp - step, 0.0)
+    raw_floor = max_phys_pnl - gap
+    stepped_floor = math.floor((raw_floor + 1e-12) / step) * step
+    return max(step, stepped_floor)
+
+
+def _stop_price_from_phys(entry_px, pos_side, stop_phys):
+    if stop_phys is None:
+        return None
+    return entry_px * (1 + stop_phys) if pos_side == 'LONG' else entry_px * (1 - stop_phys)
 
 
 def _normalize_model_specs(cfg):
@@ -474,7 +493,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
     pos_side = str(p.get('side', '')).upper()
     contracts = float(p.get('contracts', 0))
     entry_px = float(p.get('entryPrice', p['info'].get('entry_price', p['info'].get('avgPx', 0))))
-    
+
     print(f"\n🚨 [右脑介入] 侦测到 {base_sym} {reason}！执行市价核弹清仓 (数量: {contracts})...")
     try:
         # 1. 越权下发市价单
@@ -485,14 +504,14 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
         except Exception as e:
             print(f"   ⚠️ 交易所下单接口报错: {e}")
             # 即便下单报错也尝试继续执行落库，可能仓位已经由于 OCO 先一步平掉了
-        
+
         # 2. 扫清残余 OCO
         try:
             for o in ex.fetch_open_orders(gate_sym, params={'stop': True}):
                 try: ex.cancel_order(o['id'], gate_sym, params={'stop': True})
                 except: pass
         except: pass
-        
+
         # 3. 落库：历史本纪 (增加写入保障)
         db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_sym}.db")
         with sqlite3.connect(db_name, timeout=30.0, check_same_thread=False) as conn_log:
@@ -501,7 +520,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
                               (exec_ts TIMESTAMP PRIMARY KEY, order_id TEXT, side TEXT,
                                amount REAL, fill_price REAL, slippage REAL,
                                tp_price REAL, sl_price REAL, margin_used REAL, leverage REAL)''')
-            
+
             # 记录一笔平仓流水
             cursor.execute('''INSERT INTO live_trades (exec_ts, order_id, side, amount, fill_price, slippage, tp_price, sl_price, margin_used, leverage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                            (datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), 'bailout_panic_sell', 'bailout_close',
@@ -510,18 +529,26 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
             print(f"   💾 平仓记录已同步至本地数据库: {db_name}")
 
         _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=anchor_closed_ts)
-                    
-        # 5. 警报与推送
-        log_system_alert("🆘 主动风控", base_sym, f"{reason}，已下发市价平仓。")
-        
+
         pos_lev = float(p.get('leverage', p['info'].get('leverage', p['info'].get('lever', 1))))
         if pos_lev <= 0: pos_lev = 10.0
-        
+
         raw_pnl = (current_price - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_price) / entry_px
         realized_roe = raw_pnl * pos_lev
         contract_size = float(p.get('contractSize', 1))
         abs_profit = raw_pnl * (contracts * contract_size * entry_px)
-        
+
+        dir_str = "LONG" if pos_side == "LONG" else "SHORT" if pos_side == "SHORT" else pos_side or "UNKNOWN"
+        log_system_alert(
+            "🏁 主动出场",
+            base_sym,
+            (
+                f"{dir_str} 市价平仓已下发 | 原因: {reason} | "
+                f"估算平仓价: ${current_price:.4f} | 数量: {contracts:g} 张 | "
+                f"估算盈亏: {abs_profit:+.2f} USDT | ROE {realized_roe:+.2%}"
+            ),
+        )
+
         PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN")
         push_title = f"🧯 [Gate实盘] {base_sym} 主动风控平仓"
         dir_str = "做多 🟢" if pos_side == 'LONG' else "做空 🔴"
@@ -531,7 +558,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
             pnl_label = "🔴 估算亏损"
         else:
             pnl_label = "🟡 近似保本"
-        
+
         push_content = (
             f"<b>🔹 交易标的：</b>{base_sym} ({dir_str})<br>"
             f"<b>🔸 出场原因：</b>{reason}<br>"
@@ -542,7 +569,7 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
         )
         state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
         state.recent_pushes[base_sym] = time.time()
-        
+
     except Exception as e:
         print(f"   ⚠️ 右脑熔断清仓失败: {e}")
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
@@ -641,31 +668,31 @@ def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
     exact_size = int(round(float(pos_size)))
     if exact_size <= 0:
         return False
-        
+
     try:
         # 1. Gate.io 官方 API 规则对齐：多单止损需跌破触发(rule 2)
         rule = 2 if pos_side == 'LONG' else 1
         if not getattr(ex, "markets", None) or gate_symbol not in ex.markets:
             ex.load_markets(True)
         native_symbol = ex.market_id(gate_symbol)
-        
+
         # 🚨 修复 3：生成带有精确时间戳的唯一标识符
         unique_sl_text = f"tsl_{int(time.time()*1000)}"
-        
+
         # 2. 先建立新防线
         ex.private_futures_post_settle_price_orders({
             "settle": "usdt",
             "initial": build_gate_close_stop_initial(native_symbol, unique_sl_text, pos_side),
             "trigger": {
-                "strategy_type": 0, 
-                "price_type": 1, 
-                "price": str(ex.price_to_precision(gate_symbol, new_sl_price)), 
+                "strategy_type": 0,
+                "price_type": 1,
+                "price": str(ex.price_to_precision(gate_symbol, new_sl_price)),
                 "rule": rule
             }
         })
 
         # 3. 新单挂载成功后，确认 Gate 已经能查到新单，再撤除同方向旧防线。
-        time.sleep(0.5) 
+        time.sleep(0.5)
         stops = ex.fetch_open_orders(gate_symbol, params={'stop': True})
         if not any(_gate_stop_text(o).lower() == unique_sl_text for o in stops):
             print("   ⚠️ 新追踪止损已提交但尚未出现在查询结果中，保留旧防线等待下一轮收敛。")
@@ -677,7 +704,7 @@ def update_exchange_sl(ex, gate_symbol, pos_side, new_sl_price, pos_size):
             pos_side,
             stops,
         )
-                    
+
         return True
     except Exception as e:
         print(f"   ⚠️ 交易所追踪止损单刷新请求失败 (保留原防线兜底): {e}")
@@ -693,19 +720,19 @@ def bailout_worker():
         print("🔄 [右脑] Gate 市场静态规则已预加载。")
     except Exception as e:
         print(f"⚠️ [右脑] 启动预加载市场规则失败，将在补挂时重试: {e}")
-    
+
     # 🧠 物理水位状态机内存池
     tracking_mem = {}
     bailout_cooldown_locks = {}
     last_worker_error_ts = 0.0
-    
+
     thresholds_by_symbol = _load_thresholds_by_symbol()
 
     while True:
         try:
             with state.pos_lock:
                 current_positions = list(state.active_pos_map.values())
-                
+
             if not current_positions:
                 tracking_mem.clear()
                 # 清理 UI 显示文件
@@ -714,7 +741,7 @@ def bailout_worker():
                     except: pass
                 time.sleep(1)
                 continue
-            
+
             # 读取最新 AI 概率与前端硬参数
             live_status = {}
             if os.path.exists(os.path.join(LIVE_DATA_DIR, "live_status.json")):
@@ -722,12 +749,12 @@ def bailout_worker():
                     with open(os.path.join(LIVE_DATA_DIR, "live_status.json"), "r") as f:
                         live_status = json.load(f)
                 except: pass
-                
+
             hard_tp = HARD_TP   # K线物理止盈幅度（直接来自 config）
             hard_sl = HARD_SL   # K线物理底部止损幅度（直接来自 config）
-            
+
             export_ui_mem = {}
-            
+
             import concurrent.futures
             def fetch_snap(p):
                 base_sym = p['symbol'].split(':')[0].replace('/', '')
@@ -737,10 +764,10 @@ def bailout_worker():
                         return p, base_sym, resp.json()
                 except: pass
                 return p, base_sym, None
-                
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(5, len(current_positions))) as executor:
                 results = list(executor.map(fetch_snap, current_positions))
-                
+
             for p, base_sym, data in results:
                 try:
                     symbol_status = _status_for_symbol(live_status, base_sym)
@@ -774,22 +801,25 @@ def bailout_worker():
                     # 初始化该币种的内存追踪器
                     if base_sym not in tracking_mem:
                         entry_time = _resolve_position_entry_time(p, base_sym)
-                        
                         tracking_mem[base_sym] = {
                             'max_phys_pnl': 0.0,
-                            'dynamic_sl_phys': -abs(hard_sl),
+                            'physical_sl_phys': -abs(hard_sl),
+                            'atr_sl_phys': None,
                             'trailing_active': False,
-                            'trailing_floor_phys': None,
                             'entry_time': entry_time,
                             'last_same_signal_refresh_ts': 0.0,
                             'last_sl_update_px': 0.0,
-                            'last_entry_px': entry_px,  # 👈 补丁 1/2：必须记录首次进入右脑时的均价
+                            'last_entry_px': entry_px,
                             'last_contracts': position_contracts,
                             'last_stop_repair_ts': 0.0,
                             'last_snapshot_warn_ts': 0.0,
                         }
-                        
+
                     mem = tracking_mem[base_sym]
+                    if 'physical_sl_phys' not in mem:
+                        mem['physical_sl_phys'] = float(mem.get('dynamic_sl_phys', -abs(hard_sl)) or -abs(hard_sl))
+                    if 'atr_sl_phys' not in mem:
+                        mem['atr_sl_phys'] = None
                     # ---------------------------------------------------------
                     # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
                     # ---------------------------------------------------------
@@ -809,18 +839,18 @@ def bailout_worker():
                     if add_position_detected:
                         # 记住当时的物理绝对止损价格
                         if pos_side == 'LONG':
-                            abs_sl = mem['last_entry_px'] * (1 + mem['dynamic_sl_phys'])
-                            mem['dynamic_sl_phys'] = max((abs_sl - entry_px) / entry_px, -abs(hard_sl))
-                            if mem.get('trailing_floor_phys') is not None:
-                                abs_floor = mem['last_entry_px'] * (1 + mem['trailing_floor_phys'])
-                                mem['trailing_floor_phys'] = max((abs_floor - entry_px) / entry_px, -abs(hard_sl))
+                            abs_sl = mem['last_entry_px'] * (1 + mem['physical_sl_phys'])
+                            mem['physical_sl_phys'] = max((abs_sl - entry_px) / entry_px, -abs(hard_sl))
+                            if mem.get('atr_sl_phys') is not None:
+                                abs_atr_sl = mem['last_entry_px'] * (1 + mem['atr_sl_phys'])
+                                mem['atr_sl_phys'] = (abs_atr_sl - entry_px) / entry_px
                             mem['max_phys_pnl'] = (current_close - entry_px) / entry_px
                         else:
-                            abs_sl = mem['last_entry_px'] * (1 - mem['dynamic_sl_phys'])
-                            mem['dynamic_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
-                            if mem.get('trailing_floor_phys') is not None:
-                                abs_floor = mem['last_entry_px'] * (1 - mem['trailing_floor_phys'])
-                                mem['trailing_floor_phys'] = max((entry_px - abs_floor) / entry_px, -abs(hard_sl))
+                            abs_sl = mem['last_entry_px'] * (1 - mem['physical_sl_phys'])
+                            mem['physical_sl_phys'] = max((entry_px - abs_sl) / entry_px, -abs(hard_sl))
+                            if mem.get('atr_sl_phys') is not None:
+                                abs_atr_sl = mem['last_entry_px'] * (1 - mem['atr_sl_phys'])
+                                mem['atr_sl_phys'] = (entry_px - abs_atr_sl) / entry_px
                             mem['max_phys_pnl'] = (entry_px - current_close) / entry_px
 
                         mem['last_entry_px'] = entry_px
@@ -847,21 +877,21 @@ def bailout_worker():
                         th,
                     )
                     # ---------------------------------------------------------
-                    # 📈 轨道 1：动态物理状态机 (更新底层 OCO 止损单)
+                    # 📈 轨道 1：双轨追踪状态机
                     # ---------------------------------------------------------
                     current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
                     hold_hours = (time.time() - mem['entry_time']) / 3600.0
-                    
+
                     # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
                     # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
                     is_reversal = False
                     if pos_side == 'LONG' and raw_p_down > th.get('down_top_1', 1.0): is_reversal = True
                     if pos_side == 'SHORT' and raw_p_up > th.get('up_top_1', 1.0): is_reversal = True
-                    
+
                     need_market_close = False
                     close_reason = ""
-                    
+
                     # 触发器 1 & 3：反转 或 超过配置中的持仓时长上限
                     if is_reversal or hold_hours >= HOLD_PERIOD:
                         if current_phys_pnl < 0.005 and not mem['trailing_active']:
@@ -870,25 +900,20 @@ def bailout_worker():
                             close_reason += " (利润不足0.5%立即斩仓)"
                         else:
                             mem['trailing_active'] = True
-                            current_floor = mem.get('trailing_floor_phys')
-                            mem['trailing_floor_phys'] = max(current_floor if current_floor is not None else -abs(hard_sl), 0.005)
-                            mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['trailing_floor_phys'])
-                            
+                            mem['physical_sl_phys'] = max(mem['physical_sl_phys'], PHYSICAL_TRAIL_STEP_PHYS)
+
                     # 触发器 2：触及止盈线
-                    if mem['max_phys_pnl'] >= hard_tp + 0.005:
+                    if mem['max_phys_pnl'] >= hard_tp:
                         mem['trailing_active'] = True
-                        current_floor = mem.get('trailing_floor_phys')
-                        mem['trailing_floor_phys'] = max(current_floor if current_floor is not None else -abs(hard_sl), hard_tp)
-                        mem['dynamic_sl_phys'] = max(mem['dynamic_sl_phys'], mem['trailing_floor_phys'])
-                        
-                    # 追踪算法应用：ATR 防线可双向移动，但不会跌破激活时的利润地板。
+                        ratchet_floor = _calc_physical_ratchet_phys(mem['max_phys_pnl'], hard_tp)
+                        if ratchet_floor is not None:
+                            mem['physical_sl_phys'] = max(mem['physical_sl_phys'], ratchet_floor)
+
+                    # ATR 是内存状态机，不刷新交易所物理单；它可随 ATR 扩张/收缩上下移动。
                     trailing_retrace_phys = 0.0
                     if mem['trailing_active'] and trailing_atr_price > 0:
                         trailing_retrace_phys = TRAILING_ATR_MULTI * trailing_atr_price / entry_px
-                        mem['dynamic_sl_phys'] = max(
-                            mem['trailing_floor_phys'],
-                            mem['max_phys_pnl'] - trailing_retrace_phys,
-                        )
+                        mem['atr_sl_phys'] = mem['max_phys_pnl'] - trailing_retrace_phys
 
                     if need_market_close:
                         execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)
@@ -896,24 +921,24 @@ def bailout_worker():
                         del tracking_mem[base_sym]
                         continue
 
-                    target_sl_px = entry_px * (1 + mem['dynamic_sl_phys']) if pos_side == 'LONG' else entry_px * (1 - mem['dynamic_sl_phys'])
-                    trailing_floor_phys = mem.get('trailing_floor_phys')
-                    profit_floor_px = None
-                    if trailing_floor_phys is not None:
-                        profit_floor_px = (
-                            entry_px * (1 + trailing_floor_phys)
-                            if pos_side == 'LONG'
-                            else entry_px * (1 - trailing_floor_phys)
-                        )
+                    physical_sl_px = _stop_price_from_phys(entry_px, pos_side, mem['physical_sl_phys'])
+                    atr_target_sl_px = (
+                        _stop_price_from_phys(entry_px, pos_side, mem.get('atr_sl_phys'))
+                        if mem['trailing_active'] and mem.get('atr_sl_phys') is not None
+                        else None
+                    )
                     export_ui_mem[base_sym] = {
-                        'current_stop': target_sl_px,
+                        'current_stop': atr_target_sl_px,
+                        'exchange_stop': physical_sl_px,
                         'trailing_active': bool(mem['trailing_active']),
-                        'profit_floor': profit_floor_px,
+                        'profit_floor': physical_sl_px if mem['trailing_active'] else None,
                         'atr_retrace_pct': trailing_retrace_phys,
                         'max_phys_pnl': mem['max_phys_pnl'],
+                        'physical_sl_phys': mem['physical_sl_phys'],
+                        'atr_sl_phys': mem.get('atr_sl_phys'),
                     }
 
-                    if mem['trailing_active'] and _is_stop_line_crossed(pos_side, target_sl_px, current_close):
+                    if atr_target_sl_px is not None and _is_stop_line_crossed(pos_side, atr_target_sl_px, current_close):
                         live_position_status, live_position = _fetch_live_same_side_position(
                             bailout_ex,
                             gate_sym,
@@ -924,15 +949,15 @@ def bailout_worker():
                                 bailout_ex,
                                 base_sym,
                                 live_position,
-                                "ATR追踪防线已触发",
+                                "ATR内存追踪防线已触发",
                                 current_close,
                             )
                             bailout_cooldown_locks[base_sym] = time.time()
                             del tracking_mem[base_sym]
                         elif live_position_status == "flat":
-                            print(f"ℹ️ [{base_sym}] ATR 追踪防线已触发，交易所仓位已消失，等待供货线程确认平仓。")
+                            print(f"ℹ️ [{base_sym}] ATR 内存追踪防线已触发，交易所仓位已消失，等待供货线程确认平仓。")
                         else:
-                            print(f"⚠️ [{base_sym}] ATR 追踪防线已触发，但实时仓位复核失败，保留交易所现有 OCO 并等待下一轮。")
+                            print(f"⚠️ [{base_sym}] ATR 内存追踪防线已触发，但实时仓位复核失败，保留交易所现有 OCO 并等待下一轮。")
                         continue
 
                     if data is None:
@@ -960,10 +985,10 @@ def bailout_worker():
                                     bailout_ex,
                                     gate_sym,
                                     pos_side,
-                                    target_sl_px,
+                                    physical_sl_px,
                                 )
                                 if cancelled_count:
-                                    repair_msg = f"[{base_sym}] 检测到重复止损，已撤销 {cancelled_count} 张旧单并保留最接近当前 ATR 防线的条件单。"
+                                    repair_msg = f"[{base_sym}] 检测到重复止损，已撤销 {cancelled_count} 张旧单并保留最接近当前物理保底的条件单。"
                                     print(f"🩹 {repair_msg}")
                                     log_system_alert("🩹 收敛重复止损", base_sym, repair_msg)
                             except Exception as e:
@@ -987,12 +1012,12 @@ def bailout_worker():
 
                             live_info = (live_position or {}).get("info", {}) or {}
                             pos_size = abs(float(live_info.get("size", (live_position or {}).get("contracts", position_contracts)) or position_contracts))
-                            repaired = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
+                            repaired = update_exchange_sl(bailout_ex, gate_sym, pos_side, physical_sl_px, pos_size)
                             if repaired:
-                                mem['last_sl_update_px'] = target_sl_px
+                                mem['last_sl_update_px'] = physical_sl_px
                                 repair_msg = (
-                                    f"[{base_sym}] 检测到止损缺口，已按当前防线补挂止损 | "
-                                    f"status={stop_coverage['status']} | stop=${target_sl_px:.4f}"
+                                    f"[{base_sym}] 检测到止损缺口，已按当前物理保底补挂止损 | "
+                                    f"status={stop_coverage['status']} | stop=${physical_sl_px:.4f}"
                                 )
                                 print(f"🩹 {repair_msg}")
                                 log_system_alert("🩹 补挂止损", base_sym, repair_msg)
@@ -1003,26 +1028,29 @@ def bailout_worker():
                                 )
                                 print(f"⚠️ {fail_msg}")
                                 log_system_alert("⚠️ 止损补挂失败", base_sym, fail_msg)
-                    
+
                     if mem['trailing_active'] and not stop_repair_attempted:
-                        diff_pct = abs(target_sl_px - mem['last_sl_update_px']) / (entry_px + 1e-9)
-                        if diff_pct > 0.001: 
+                        diff_pct = abs(physical_sl_px - mem['last_sl_update_px']) / (entry_px + 1e-9)
+                        if diff_pct > 0.001:
                             pos_size = abs(float(info.get('size', p.get('contracts', 0)) or 0.0))
-                            success = update_exchange_sl(bailout_ex, gate_sym, pos_side, target_sl_px, pos_size)
+                            success = update_exchange_sl(bailout_ex, gate_sym, pos_side, physical_sl_px, pos_size)
                             if success:
                                 previous_sl_px = mem['last_sl_update_px']
-                                mem['last_sl_update_px'] = target_sl_px
+                                mem['last_sl_update_px'] = physical_sl_px
                                 is_tightening = (
-                                    target_sl_px > previous_sl_px
+                                    physical_sl_px > previous_sl_px
                                     if pos_side == 'LONG'
-                                    else previous_sl_px <= 0 or target_sl_px < previous_sl_px
+                                    else previous_sl_px <= 0 or physical_sl_px < previous_sl_px
                                 )
-                                action = "收紧" if is_tightening else "放宽"
-                                print(
-                                    f"📍 [{base_sym}] {pos_side} 追踪止损已{action}至 ${target_sl_px:.4f} "
-                                    f"(ATR 防线: {mem['dynamic_sl_phys']*100:+.2f}% | "
-                                    f"利润地板: {mem['trailing_floor_phys']*100:+.2f}%)"
+                                action = "收紧" if is_tightening else "初始化"
+                                ratchet_msg = (
+                                    f"{pos_side} 物理保底止损已{action}至 ${physical_sl_px:.4f} | "
+                                    f"保底: {mem['physical_sl_phys']*100:+.2f}% | "
+                                    f"ATR内存线: {(mem.get('atr_sl_phys') or 0.0)*100:+.2f}% | "
+                                    f"最高浮盈: {mem['max_phys_pnl']*100:+.2f}%"
                                 )
+                                print(f"📍 [{base_sym}] {ratchet_msg}")
+                                log_system_alert("📍 棘轮调整", base_sym, ratchet_msg)
 
                     # ---------------------------------------------------------
                     # 🆘 轨道 2：高频瀑布插针熔断 (主动雷达逃生)
@@ -1034,10 +1062,10 @@ def bailout_worker():
                         current_high = max(float(ohlcv_1m[-1][2]), current_close)
                         current_low = min(float(ohlcv_1m[-1][3]), current_close)
                         current_vol = float(ohlcv_1m[-1][5])
-                        
+
                         past_vols = [x[5] for x in ohlcv_1m[:-1]]
                         avg_vol = sum(past_vols) / len(past_vols) if past_vols else 1e-8
-                        
+
                         recent_15 = ohlcv_1m[-15:]
                         tr_list = []
                         for i in range(1, len(recent_15)):
@@ -1046,19 +1074,19 @@ def bailout_worker():
                             curr_l = float(recent_15[i][3])
                             tr = max(curr_h - curr_l, abs(curr_h - prev_close), abs(curr_l - prev_close))
                             tr_list.append(tr)
-                            
+
                         atr_1m = sum(tr_list) / len(tr_list) if tr_list else 0
-                        
+
                         if atr_1m > 0:
                             dyn_atr_multi = BAILOUT_ATR_MULTI
                             dyn_vol_multi = BAILOUT_VOL_MULTI
-                            
+
                             is_flash_crash = False
                             is_flash_surge = False
                             min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
                             adverse_for_long = current_close < min(prev_minute_close, current_open)
                             adverse_for_short = current_close > max(prev_minute_close, current_open)
-                            
+
                             if pos_side == 'LONG':
                                 drop_amt = current_high - current_close
                                 if adverse_for_long and drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
@@ -1067,16 +1095,16 @@ def bailout_worker():
                                 surge_amt = current_close - current_low
                                 if adverse_for_short and surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
                                     is_flash_surge = True
-                                    
+
                             if (is_flash_crash or is_flash_surge) and ('orderbook' in data):
                                 actual_vol_multi = current_vol / (avg_vol + 1e-8)
                                 if actual_vol_multi >= dyn_vol_multi:
                                     ob = data['orderbook']
                                     bid_vol = sum([float(o[0]) * float(o[1]) for o in ob['bids'][:20]])
                                     ask_vol = sum([float(o[0]) * float(o[1]) for o in ob['asks'][:20]])
-                                    
+
                                     obi_thresh = BAILOUT_OBI_THRESH
-                                    
+
                                     if pos_side == 'LONG' and is_flash_crash:
                                         obi = bid_vol / (ask_vol + 1e-8)
                                         if obi < obi_thresh:
@@ -1084,7 +1112,7 @@ def bailout_worker():
                                             bailout_cooldown_locks[base_sym] = time.time()
                                             del tracking_mem[base_sym]
                                             continue
-                                            
+
                                     elif pos_side == 'SHORT' and is_flash_surge:
                                         obi = ask_vol / (bid_vol + 1e-8)
                                         if obi < obi_thresh:
@@ -1104,7 +1132,7 @@ def bailout_worker():
                     json.dump(export_ui_mem, f)
                 os.replace(tmp_path, os.path.join(LIVE_DATA_DIR, "chandelier_state.json"))
             except: pass
-                
+
         except Exception as loop_e:
             if time.time() - last_worker_error_ts >= 30.0:
                 msg = f"右脑主循环异常: {loop_e}"

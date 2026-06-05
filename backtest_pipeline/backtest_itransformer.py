@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, PROCESSED_MAIN_ROOT, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
-    EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL, 
+    EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
     TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
     normalize_symbol
@@ -24,6 +24,7 @@ from historical_pipeline.train_itransformer import InvertedTransformer
 
 
 THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5", "down_top_10"]
+PHYSICAL_TRAIL_STEP_PHYS = 0.005
 
 
 def _find_training_matrix_files(horizon):
@@ -34,6 +35,23 @@ def _find_training_matrix_files(horizon):
         if directory.exists():
             files.extend(directory.glob(pattern))
     return sorted(set(files))
+
+
+def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
+    hard_tp = abs(float(hard_tp))
+    if max_phys_pnl < hard_tp:
+        return None
+    step = PHYSICAL_TRAIL_STEP_PHYS
+    gap = max(hard_tp - step, 0.0)
+    raw_floor = max_phys_pnl - gap
+    stepped_floor = np.floor((raw_floor + 1e-12) / step) * step
+    return max(step, stepped_floor)
+
+
+def _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active):
+    if trailing_active and atr_sl_phys is not None:
+        return max(physical_sl_phys, atr_sl_phys)
+    return physical_sl_phys
 
 
 def _parse_args():
@@ -258,7 +276,7 @@ def run_backtest(args=None):
         args = _parse_args()
 
     DEVICE = torch.device("cuda")  # 明确 H100 环境
-    
+
     # 1. 优先定位模型权重文件，一切以它保存的元数据为准。
     # 默认仍是 EXPERIMENT_ID 单模型；只有显式 --models / --use-live-models 才进入 ensemble。
     try:
@@ -288,19 +306,19 @@ def run_backtest(args=None):
     # === 1. 独立加载特征空间与执行空间 ===
     df = pl.read_parquet(data_path)
     timestamps = df.select("hour_timestamp").to_series().to_numpy()
-    
+
     # 🚨 防呆机制 2：彻底消灭时空错位。使用各模型 seq_len 独立预热，对齐同一个测试集原点
     split_idx = int(df.height * 0.8) + ckpt_horizon
     max_seq_len = max(int(component["seq_len"]) for component in model_components)
     warmup_start_idx = split_idx - max_seq_len + 1
-    
+
     if warmup_start_idx < 0:
         print(f"❌ 数据量不足以支撑最大 seq_len={max_seq_len} 的预热！")
         return
 
     test_timestamps = timestamps[split_idx:]
-    valid_timestamps = test_timestamps.tolist() 
-    
+    valid_timestamps = test_timestamps.tolist()
+
     print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
     predictions_probs = _generate_weighted_probabilities(df, model_components, split_idx, DEVICE)
 
@@ -317,7 +335,7 @@ def run_backtest(args=None):
     ts_1h = df_1h["timestamp"].to_numpy().astype('datetime64[s]').astype(np.int64)
     opens_1h = df_1h["open"].to_numpy()
     closes_1h = df_1h["close"].to_numpy()
-    
+
     ts_1m = df_1m["timestamp"].to_numpy().astype('datetime64[s]').astype(np.int64)
     highs_1m = df_1m["high"].to_numpy()
     lows_1m = df_1m["low"].to_numpy()
@@ -331,67 +349,67 @@ def run_backtest(args=None):
     # ==========================================
     # 🚨 防呆机制 3：多模型时动态分位数阈值跟随概率 ensemble 做同权重融合。
     th = _weighted_thresholds(model_components)
-        
+
     print("📥 已成功加载动态分位数阈值。")
-    
-    equity = 1.0             
+
+    equity = 1.0
     equity_curve = []
     benchmark_prices = []
-    
-    current_pos = 0          
+
+    current_pos = 0
     current_tier = 0         # 👈 新增：记录当前阶梯水位
-    hold_timer_mins = 0      
-    entry_price = 0.0     
-    trade_start_equity = 1.0 
-    current_leverage = 0.0   
+    hold_timer_mins = 0
+    entry_price = 0.0
+    trade_start_equity = 1.0
+    current_leverage = 0.0
     entry_time = None
-    
+
     # 🚨 引入严格的财务账本变量
-    cumulative_funding = 0.0 
+    cumulative_funding = 0.0
     open_cost = 0.0
-    
-    max_unrealized_phys_pnl = 0.0 
+
+    max_unrealized_phys_pnl = 0.0
     trailing_active = False
-    trailing_floor_phys = None
-    dynamic_sl_phys = -abs(HARD_SL)
-    
+    physical_sl_phys = -abs(HARD_SL)
+    atr_sl_phys = None
+
     trade_count = 0
     win_count = 0
-    liquidated = False       
-    
+    liquidated = False
+
     long_trades = 0
     short_trades = 0
     gross_profit = 0.0
     gross_loss = 0.0
-    
+
     print("\n⚔️ 正在执行工业级撮合 (1h 决策开仓 + 1m 盘中悲观碰撞)...")
-    
-    SLIPPAGE = 0.0002 
-    HOURLY_FUNDING_COST = 0.0001 / 8 
+
+    SLIPPAGE = 0.0002
+    HOURLY_FUNDING_COST = 0.0001 / 8
 
     exit_reasons = {
-        "REVERSAL_EXIT": 0,    
-        "HARD_SL_EXIT": 0,     
-        "TRAILING_EXIT": 0,    
+        "REVERSAL_EXIT": 0,
+        "HARD_SL_EXIT": 0,
+        "TRAILING_EXIT": 0,
         "TIME_LIMIT_EXIT": 0,
         "LIQUIDATION_EXIT": 0,
     }
-    pnl_list = [] 
+    pnl_list = []
 
     for i in range(len(predictions_probs)):
         if i > 0 and i % 1000 == 0:
             print(f"   ⏳ 已撮合 {i} / {len(predictions_probs)} 小时...")
-            
+
         if liquidated:
             equity_curve.append(0)
             if benchmark_prices: benchmark_prices.append(benchmark_prices[-1])
             continue
-            
+
         p_down, p_flat, p_up = predictions_probs[i]
-        signal_time = valid_timestamps_sec[i] 
+        signal_time = valid_timestamps_sec[i]
         exec_time = signal_time + 3600
         exec_idx_1h = np.searchsorted(ts_1h, exec_time)
-        
+
         if exec_idx_1h < len(closes_1h):
             benchmark_prices.append(closes_1h[exec_idx_1h])
         else:
@@ -414,29 +432,29 @@ def run_backtest(args=None):
 
         if target_pos != 0 and exec_idx_1h < len(opens_1h):
             current_hour_open = opens_1h[exec_idx_1h]
-            
+
             # 💡 情景 A: 绝对空仓，首次建仓
             if current_pos == 0:
                 current_pos = target_pos
                 current_tier = target_tier
                 current_leverage = target_leverage
-                hold_timer_mins = HOLD_PERIOD * 60 
-                
-                entry_price = current_hour_open 
+                hold_timer_mins = HOLD_PERIOD * 60
+
+                entry_price = current_hour_open
                 entry_time = ts_1h[exec_idx_1h]
-                
-                trade_start_equity = equity 
+
+                trade_start_equity = equity
                 open_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
-                equity = trade_start_equity - open_cost 
-                cumulative_funding = 0.0  
-                
+                equity = trade_start_equity - open_cost
+                cumulative_funding = 0.0
+
                 if target_pos == 1: long_trades += 1
                 if target_pos == -1: short_trades += 1
-                
-                max_unrealized_phys_pnl = 0.0   
-                trailing_active = False         
-                trailing_floor_phys = None
-                dynamic_sl_phys = -abs(HARD_SL) 
+
+                max_unrealized_phys_pnl = 0.0
+                trailing_active = False
+                physical_sl_phys = -abs(HARD_SL)
+                atr_sl_phys = None
 
             # 💡 情景 B: 任意同向信号都会刷新持仓计时；更高 Tier 额外补仓。
             elif current_pos == target_pos:
@@ -445,17 +463,17 @@ def run_backtest(args=None):
                 if target_tier > current_tier:
                     # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
                     if current_pos == 1:
-                        absolute_sl_price = entry_price * (1 + dynamic_sl_phys)
-                        absolute_floor_price = (
-                            entry_price * (1 + trailing_floor_phys)
-                            if trailing_floor_phys is not None
+                        absolute_sl_price = entry_price * (1 + physical_sl_phys)
+                        absolute_atr_sl_price = (
+                            entry_price * (1 + atr_sl_phys)
+                            if atr_sl_phys is not None
                             else None
                         )
                     else:
-                        absolute_sl_price = entry_price * (1 - dynamic_sl_phys)
-                        absolute_floor_price = (
-                            entry_price * (1 - trailing_floor_phys)
-                            if trailing_floor_phys is not None
+                        absolute_sl_price = entry_price * (1 - physical_sl_phys)
+                        absolute_atr_sl_price = (
+                            entry_price * (1 - atr_sl_phys)
+                            if atr_sl_phys is not None
                             else None
                         )
 
@@ -472,7 +490,7 @@ def run_backtest(args=None):
 
                         # 重新计算加仓后的加权持仓均价
                         avg_entry_price = target_notional / total_size
-                        
+
                         # 扣除新增仓位的摩擦成本
                         added_open_cost = added_notional * (FEE_RATE + SLIPPAGE)
                         open_cost += added_open_cost
@@ -485,19 +503,19 @@ def run_backtest(args=None):
 
                         # 重新锚定防线：用旧的绝对止损价反推距离新均价的百分比距离
                         if current_pos == 1:
-                            new_dyn_sl = (absolute_sl_price - entry_price) / entry_price
-                            if absolute_floor_price is not None:
-                                trailing_floor_phys = max((absolute_floor_price - entry_price) / entry_price, -abs(HARD_SL))
+                            new_physical_sl = (absolute_sl_price - entry_price) / entry_price
+                            if absolute_atr_sl_price is not None:
+                                atr_sl_phys = (absolute_atr_sl_price - entry_price) / entry_price
                             max_unrealized_phys_pnl = (current_hour_open - entry_price) / entry_price
                         else:
-                            new_dyn_sl = (entry_price - absolute_sl_price) / entry_price
-                            if absolute_floor_price is not None:
-                                trailing_floor_phys = max((entry_price - absolute_floor_price) / entry_price, -abs(HARD_SL))
+                            new_physical_sl = (entry_price - absolute_sl_price) / entry_price
+                            if absolute_atr_sl_price is not None:
+                                atr_sl_phys = (entry_price - absolute_atr_sl_price) / entry_price
                             max_unrealized_phys_pnl = (entry_price - current_hour_open) / entry_price
 
                         # 兜底：如果均价恶化太多导致防线变得离谱，用硬止损兜底
-                        dynamic_sl_phys = max(new_dyn_sl, -abs(HARD_SL))
-                    
+                        physical_sl_phys = max(new_physical_sl, -abs(HARD_SL))
+
         # ------------------------------------------
         # 2. 1分钟级别显微镜追踪持仓
         # ------------------------------------------
@@ -505,37 +523,36 @@ def run_backtest(args=None):
             start_1m_idx = np.searchsorted(ts_1m, entry_time)
             chunk_end_time = exec_time + 3600
             end_1m_idx = np.searchsorted(ts_1m, chunk_end_time)
-            
+
             close_position = False
             actual_exit_pct = 0.0
-            close_pnl_pct = 0.0 
+            close_pnl_pct = 0.0
             close_return = 0.0
-            
+
             is_reversal = False
             if current_pos == 1 and p_down > th["down_top_1"]: is_reversal = True
             elif current_pos == -1 and p_up > th["up_top_1"]: is_reversal = True
-                
+
             if is_reversal:
                 current_hour_open = opens_1h[exec_idx_1h]
                 current_phys_profit = (current_hour_open - entry_price) / entry_price if current_pos == 1 else (entry_price - current_hour_open) / entry_price
-                
+
                 if current_phys_profit < 0.005 and not trailing_active:
                     close_position = True
                     actual_exit_pct = current_phys_profit * current_leverage
-                    exit_reasons["REVERSAL_EXIT"] += 1 
+                    exit_reasons["REVERSAL_EXIT"] += 1
                 else:
                     trailing_active = True
-                    trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), 0.005)
-                    dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
-            
+                    physical_sl_phys = max(physical_sl_phys, PHYSICAL_TRAIL_STEP_PHYS)
+
             if not close_position:
                 for m_idx in range(start_1m_idx, end_1m_idx):
                     if m_idx >= len(closes_1m): break
-                    
+
                     m_high = highs_1m[m_idx]
                     m_low = lows_1m[m_idx]
                     m_close = closes_1m[m_idx]
-                    
+
                     if current_pos == 1:
                         worst_intra = (m_low - entry_price) / entry_price
                         best_intra = (m_high - entry_price) / entry_price
@@ -559,22 +576,24 @@ def run_backtest(args=None):
                     if trade_start_equity - open_cost - (trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)) + (trade_start_equity * worst_pnl_pct) <= 0:
                         liquidated = True
                         break
-                        
-                    if worst_intra <= dynamic_sl_phys:
+
+                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active)
+                    if worst_intra <= active_stop_phys:
                         close_position = True
-                        actual_exit_pct = dynamic_sl_phys * current_leverage
+                        actual_exit_pct = active_stop_phys * current_leverage
                         if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
                         else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
 
                     if best_intra > max_unrealized_phys_pnl:
                         max_unrealized_phys_pnl = best_intra
-                        
-                    if max_unrealized_phys_pnl >= abs(HARD_TP) + 0.005:
+
+                    if max_unrealized_phys_pnl >= abs(HARD_TP):
                         trailing_active = True
-                        trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), abs(HARD_TP))
-                        dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
-                        
+                        ratchet_floor = _calc_physical_ratchet_phys(max_unrealized_phys_pnl, HARD_TP)
+                        if ratchet_floor is not None:
+                            physical_sl_phys = max(physical_sl_phys, ratchet_floor)
+
                     if hold_timer_mins <= 0 and not trailing_active:
                         if close_return < 0.005:
                             close_position = True
@@ -583,15 +602,15 @@ def run_backtest(args=None):
                             break
                         else:
                             trailing_active = True
-                            trailing_floor_phys = max(trailing_floor_phys if trailing_floor_phys is not None else -abs(HARD_SL), 0.005)
-                            dynamic_sl_phys = max(dynamic_sl_phys, trailing_floor_phys)
-                            
-                    if trailing_active and trailing_retrace_phys > 0:
-                        dynamic_sl_phys = max(trailing_floor_phys, max_unrealized_phys_pnl - trailing_retrace_phys)
+                            physical_sl_phys = max(physical_sl_phys, PHYSICAL_TRAIL_STEP_PHYS)
 
-                    if worst_intra <= dynamic_sl_phys:
+                    if trailing_active and trailing_retrace_phys > 0:
+                        atr_sl_phys = max_unrealized_phys_pnl - trailing_retrace_phys
+
+                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active)
+                    if worst_intra <= active_stop_phys:
                         close_position = True
-                        actual_exit_pct = dynamic_sl_phys * current_leverage
+                        actual_exit_pct = active_stop_phys * current_leverage
                         if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
                         else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
@@ -609,26 +628,26 @@ def run_backtest(args=None):
                 exit_reasons["LIQUIDATION_EXIT"] += 1
                 pnl_list.append(-1.0)
                 continue
-                
+
             if close_position:
                 # 🚨 财务修复 2：统一严谨结算（本金 + 收益 - 开仓摩擦 - 平仓摩擦 - 累计资金费）
                 close_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
                 final_pnl = trade_start_equity * actual_exit_pct
-                
+
                 equity = trade_start_equity + final_pnl - open_cost - close_cost - cumulative_funding
-                
+
                 trade_pnl = equity - trade_start_equity
-                if trade_pnl > 0: 
+                if trade_pnl > 0:
                     win_count += 1
                     gross_profit += trade_pnl
                 else:
                     gross_loss += abs(trade_pnl)
-                
+
                 trade_count += 1
-                current_pos = 0 
+                current_pos = 0
                 current_tier = 0
                 current_leverage = 0.0
-                
+
                 pnl_list.append(trade_pnl / trade_start_equity)
             else:
                 # 🚨 财务修复 3：跨小时浮动结算，同样严格遵守完整公式，防止资金幽灵恢复
@@ -636,7 +655,7 @@ def run_backtest(args=None):
                 floating_pnl = trade_start_equity * close_pnl_pct
                 equity = trade_start_equity + floating_pnl - open_cost - cumulative_funding
                 entry_time = chunk_end_time
-                
+
         equity_curve.append(equity)
 
     equity_curve = np.array(equity_curve)
@@ -663,14 +682,14 @@ def run_backtest(args=None):
     years = curve_len / 8760
     annualized_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
     calmar = (annualized_return / (abs(max_drawdown)/100)) if max_drawdown < 0 else float('inf')
-    
+
     if len(benchmark_prices) > 0: benchmark_curve = benchmark_prices / benchmark_prices[0]
     else: benchmark_curve = np.ones(curve_len)
 
     win_rate = (win_count / trade_count) * 100 if trade_count > 0 else 0.0
-        
+
     returns_series = pd.Series(equity_curve).pct_change().fillna(0).to_numpy()
-    returns_series[0] = 0 
+    returns_series[0] = 0
     sharpe = (np.mean(returns_series) / np.std(returns_series)) * np.sqrt(8760) if np.std(returns_series) != 0 else 0.0
 
     avg_win = np.mean([p for p in pnl_list if p > 0]) if any(p > 0 for p in pnl_list) else 0
@@ -681,12 +700,12 @@ def run_backtest(args=None):
     print("\n" + "="*50)
     print(f" 📜 TimesFM 引擎终极回测审计报告 | {SYMBOL}")
     print("="*50)
-    
+
     print(f"【1. 基础战况】")
     print(f" ▪ 总回测时长 : {curve_len} 小时")
     print(f" ▪ 撮合交易数 : {trade_count} 笔 (多:{long_trades} | 空:{short_trades})")
     print(f" ▪ 最终净值   : {equity_curve[-1]:.4f}")
-    
+
     print(f"\n【2. 核心绩效】")
     print(f" ▪ 胜率 (WR)  : {win_rate:.2f}%")
     print(f" ▪ 盈亏比 (PF): {profit_factor:.2f}")
@@ -710,14 +729,14 @@ def run_backtest(args=None):
     plt.plot(valid_timestamps, equity_curve, label='iTransformer Probabilistic Engine', color='#00ff88', linewidth=2)
     plt.axhline(y=1.0, color='red', linestyle='--', alpha=0.3)
     plt.title('True OOS Equity: 3-Class Probabilistic Strategy with Dynamic Leverage', fontsize=16, color='white')
-    
+
     plt.gca().set_facecolor('#1e1e1e')
     plt.gcf().patch.set_facecolor('#121212')
     plt.ylabel('Equity Multiplier (1.0 = 100%)', color='white')
     plt.tick_params(colors='white')
     plt.legend(facecolor='#1e1e1e', labelcolor='white')
     plt.grid(True, alpha=0.1, color='white')
-    
+
     plot_path = MODEL_DIR / f"backtest_probabilistic_{EXPERIMENT_ID}.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='#121212')
     print(f"\n📈 最终资金曲线已生成: {plot_path}")

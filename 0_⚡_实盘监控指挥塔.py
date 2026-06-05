@@ -1,4 +1,4 @@
-import numpy as np  
+import numpy as np
 import json
 import os
 import sys
@@ -109,7 +109,7 @@ ALL_SYMBOLS = list(LIVE_CONFIGS.keys())
 
 # --- UI 页面配置与高频轮询开关 ---
 st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
- 
+
 # --- 🧠 按实盘配置加载概率门槛 ---
 def _load_thresholds_for_experiment(exp_id):
     json_path = os.path.join(MODEL_DIR, f"dynamic_thresholds_{exp_id}.json")
@@ -186,7 +186,7 @@ _run_every = f"{refresh_interval}s" if enable_refresh and refresh_interval > 0 e
 @st.fragment(run_every=_run_every)
 def render_status_dashboard():
     # 彻底删除了内部冗余的大标题，直接渲染监控灯泡，让视觉高度统一
-    
+
     # --- 1. 核心进程存活检查 ---
     engine_alive = False
     engine_status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
@@ -209,26 +209,26 @@ def render_status_dashboard():
     gpu_pct = 0.0
     try:
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         current_used = info.used / 1024**3
         total = info.total / 1024**3
-        
+
         # 10 分钟滚动峰值记录器
         peak_file = os.path.join(LIVE_DATA_DIR, "gpu_peak_mem.json")
         mem_history = []
         now_ts = time.time()
-        
+
         if os.path.exists(peak_file):
             try:
                 with open(peak_file, 'r') as f:
                     mem_history = json.load(f)
             except: pass
-            
+
         mem_history = [item for item in mem_history if (now_ts - item[0]) <= 600]
         mem_history.append([now_ts, current_used])
         peak_used = max([item[1] for item in mem_history])
-        
+
         try:
             with open(f"{peak_file}.tmp", 'w') as f:
                 json.dump(mem_history, f)
@@ -258,17 +258,17 @@ def render_status_dashboard():
         st.status("🟢 引擎" if engine_alive else "🔴 引擎", state="complete" if engine_alive else "error")
     with c2:
         st.status("🟢 网关" if ws_alive else "🔴 网关", state="complete" if ws_alive else "error")
-    
+
     # 纵向堆叠三大硬件进度条
-    st.caption(f"💾 L4 显存占用: {gpu_mem_text}") 
-    st.progress(min(gpu_pct, 1.0))              
-    
+    st.caption(f"💾 L4 显存占用: {gpu_mem_text}")
+    st.progress(min(gpu_pct, 1.0))
+
     st.caption(f"⚙️ CPU 核心负载: {cpu_pct * 100:.1f}%")
     st.progress(min(max(cpu_pct, 0.0), 1.0))
-    
+
     st.caption(f"🧠 系统内存 (RAM): {ram_text}")
     st.progress(min(ram_pct, 1.0))
-    
+
     st.divider()
 
 # 👇 【核心修复】：在调用时，从外部将其推入侧边栏
@@ -298,12 +298,12 @@ def get_gate_portfolio():
     try:
         with open(state_file, 'r') as f:
             state = json.load(f)
-        
+
         balance = state.get('balance', {})
         positions = state.get('positions', [])
         open_stops = state.get('open_stops', [])
         updated_at = float(state.get('updated_at', 0) or 0)
-        
+
         active_positions = [p for p in positions if abs(float(p.get('contracts', 0) or 0)) > 1e-8]
         cached = st.session_state.get(cache_key)
         cached_positions = cached.get('positions', []) if cached else []
@@ -349,9 +349,9 @@ def load_trade_history_for_symbol(symbol):
 
             # 自动升级旧表结构，确保所有列存在
             for col in ['leverage', 'margin_used', 'order_id']:
-                try: 
+                try:
                     cursor.execute(f"ALTER TABLE live_trades ADD COLUMN {col} REAL")
-                except sqlite3.OperationalError: 
+                except sqlite3.OperationalError:
                     pass
 
             # 读取时使用 fillna 填充缺失值，防止计算崩溃
@@ -662,7 +662,7 @@ try:
             m_row = m_cur.fetchone()
             if m_row:
                 m_score, m_text, m_urgency, m_ts = m_row
-                
+
                 # 根据紧急程度和得分决定渐变背景色
                 if m_urgency == "high":
                     bg_color = "linear-gradient(90deg, #4b0000 0%, #800000 50%, #4b0000 100%)" if m_score < 0 else "linear-gradient(90deg, #004b00 0%, #008000 50%, #004b00 100%)"
@@ -672,7 +672,7 @@ try:
                     bg_color = "linear-gradient(90deg, #1E1E1E 0%, #2A2A2A 50%, #1E1E1E 100%)"
                     border_color = "#444"
                     icon = "📻 [DeepSeek 宏观播报]"
-                
+
                 # 注入 HTML 跑马灯
                 st.markdown(
                     f"""
@@ -684,7 +684,7 @@ try:
                             </marquee>
                         </div>
                     </div>
-                    """, 
+                    """,
                     unsafe_allow_html=True
                 )
 except Exception:
@@ -698,23 +698,23 @@ def render_realtime_portfolio():
     if balance is None:
         st.warning("⏳ 正在等待后台量化引擎启动并同步资产快照...")
         return
-        
+
     with st.expander("🏦 Gate.io 仓位监控中心", expanded=True):
         try:
             # 适配 CCXT 解析 Gate.io 余额的标准结构
             wallet_balance = float(balance.get('total', {}).get('USDT', 0))
             avail_margin = float(balance.get('free', {}).get('USDT', 0))
-            
+
             unrealized_pnl = 0.0
             total_margin_used = 0.0
             total_oco_min_pnl = 0.0
-            
+
             for p in positions:
                 p_info = p['info']
                 symbol_raw = p['symbol']
                 # 累加未实现盈亏
                 unrealized_pnl += float(p_info.get('unrealised_pnl', 0))
-                
+
                 # 算占用保证金
                 notional = float(p.get('notional', p_info.get('value', 0)))
                 if notional == 0:
@@ -722,17 +722,17 @@ def render_realtime_portfolio():
                     mark_px = float(p_info.get('markPx', p_info.get('mark_price', 0)))
                     contract_size = float(p.get('contractSize', 1))
                     notional = contracts * contract_size * mark_px
-                    
+
                 leverage_used = float(p_info.get('lever', p_info.get('leverage', '1')))
                 if leverage_used <= 0: leverage_used = 1.0
                 actual_margin = notional / leverage_used
                 total_margin_used += actual_margin
-                
+
                 # 计算交易所当前 OCO 对应的真实保底盈亏金额。
                 pos_side = str(p.get('side', '')).upper()
                 entry_px = float(p_info.get('avgPx', p_info.get('entry_price', 0)))
                 mark_px = float(p_info.get('markPx', p_info.get('mark_price', 0)))
-                
+
                 # 从统一拉取的内存列表中，过滤出该币种的物理止损
                 physical_sl_px = 0.0
                 symbol_stops = [o for o in all_open_stops if o['symbol'] == symbol_raw]
@@ -741,7 +741,7 @@ def render_realtime_portfolio():
                     if stop_px > 0 and mark_px > 0:
                         if pos_side == 'LONG' and stop_px < mark_px: physical_sl_px = stop_px
                         elif pos_side == 'SHORT' and stop_px > mark_px: physical_sl_px = stop_px
-                
+
                 # 仅统计交易所已挂载的 OCO，避免把尚未落地的 ATR 目标线计入真实保底。
                 if entry_px > 0 and mark_px > 0:
                     coin_amount = notional / mark_px
@@ -774,16 +774,16 @@ def render_realtime_portfolio():
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         m_col1.metric("账户总权益", f"${total_equity:,.2f}", delta=f"累计收益率: {historical_roi:+.2%}", delta_color="normal" if historical_roi >= 0 else "inverse")
         m_col2.metric("已实现盈亏", f"${realized_pnl:,.2f}", delta="已落袋" if realized_pnl >= 0 else "已亏损", delta_color="normal" if realized_pnl >= 0 else "inverse")
-        
+
         delta_label = f"交易所 OCO 保底 {total_oco_min_pnl:+.2f}" if positions else "浮动中"
         m_col3.metric("未实现盈亏", f"${unrealized_pnl:,.2f}", delta=delta_label, delta_color="normal" if unrealized_pnl >= 0 else "inverse")
-        
+
         # 保持第四个卡片为战略预备队雷达
         m_col4.metric("资金使用率", f"{margin_utilization:.1%}")
-        
+
         # 👇 【UI 修复】：让进度条回归真实的 0~100% 绝对物理刻度
         st.progress(
-            min(margin_utilization, 1.0), 
+            min(margin_utilization, 1.0),
             text=f"🛡️ 场内已用资金: {total_margin_used:,.2f} USDT | 可用保证金: {avail_margin:,.2f} USDT"
         )
         pass
@@ -793,38 +793,38 @@ def render_realtime_portfolio():
             st.info("📭 当前无任何持仓。引擎正在等待完美击球点...")
         else:
             pos_data = []
-            
+
             # 在循环前，一次性读取右脑导出的 ATR 追踪状态。
             chandelier_mem = _load_chandelier_state()
-                    
+
             for p in positions:
                 info = p['info']
-                symbol_raw = p['symbol'] 
+                symbol_raw = p['symbol']
                 base_symbol = _normalize_symbol_key(symbol_raw)
-                
+
                 real_tp, real_sl = "未挂载 ⚠️", "未挂载 ⚠️"
                 physical_sl_px = 0.0 # 👇 新增：用于数学计算的物理止损价
-                
+
                 try:
                     # 👇 从 engine.py 传过来的全量订单列表中，瞬间过滤出当前币种的条件单
                     open_orders = [o for o in all_open_stops if o['symbol'] == symbol_raw]
                     mark_px = float(info.get('markPx', info.get('mark_price', 0)))
                     pos_side = str(p.get('side', '')).upper()
                     entry_px = float(info.get('avgPx', info.get('entry_price', 0)))
-                    
+
                     for o in open_orders:
                         stop_px = float(o.get('stopPrice', o['info'].get('stopPrice', o['info'].get('stop_price', 0))))
                         if stop_px > 0 and mark_px > 0:
                             if pos_side == 'LONG':
-                                if stop_px > mark_px: 
+                                if stop_px > mark_px:
                                     real_tp = f"${stop_px:,.4f}"
-                                else: 
+                                else:
                                     real_sl = f"${stop_px:,.4f}"
                                     physical_sl_px = stop_px
                             elif pos_side == 'SHORT':
-                                if stop_px < mark_px: 
+                                if stop_px < mark_px:
                                     real_tp = f"${stop_px:,.4f}"
-                                else: 
+                                else:
                                     real_sl = f"${stop_px:,.4f}"
                                     physical_sl_px = stop_px
                 except Exception:
@@ -832,7 +832,7 @@ def render_realtime_portfolio():
 
                 upl_raw = info.get('unrealised_pnl')
                 upl = float(upl_raw) if upl_raw is not None else 0.0
-                
+
                 pct_raw = p.get('percentage')
                 if pct_raw is None: pct_raw = info.get('uplRatio')
                 upl_ratio = float(pct_raw) if pct_raw is not None else 0.0
@@ -842,7 +842,7 @@ def render_realtime_portfolio():
                 if notional == 0:
                     contracts = abs(float(info.get('pos', info.get('contracts', 0))))
                     mark_px = float(info.get('markPx', info.get('mark_price', 0)))
-                    contract_size = p.get('contractSize', 1) 
+                    contract_size = p.get('contractSize', 1)
                     notional = contracts * contract_size * mark_px
 
                 leverage_used = float(info.get('lever', info.get('leverage', '1')))
@@ -851,19 +851,21 @@ def render_realtime_portfolio():
 
                 if upl_ratio == 0.0 and actual_margin > 0:
                     upl_ratio = (upl / actual_margin) * 100
-                
-                # 从右脑状态中提取 ATR 动态线与不可回退利润地板。
+
+                # 从右脑状态中提取 ATR 内存线与交易所物理棘轮目标。
                 trailing_state = chandelier_mem.get(base_symbol, {}) or {}
                 atr_target_sl_px = float(trailing_state.get('current_stop', 0.0) or 0.0)
-                profit_floor_px = float(trailing_state.get('profit_floor', 0.0) or 0.0)
+                profit_floor_px = float(
+                    trailing_state.get('exchange_stop', trailing_state.get('profit_floor', 0.0)) or 0.0
+                )
                 trailing_active = bool(trailing_state.get('trailing_active', False))
                 atr_retrace_pct = float(trailing_state.get('atr_retrace_pct', 0.0) or 0.0)
                 atr_target_sl = f"${atr_target_sl_px:,.4f}" if atr_target_sl_px > 0 else "初始化中 ⏳"
                 profit_floor = f"${profit_floor_px:,.4f}" if profit_floor_px > 0 else "未激活"
                 trailing_status = f"已激活 | 回撤宽度 {atr_retrace_pct:.2%}" if trailing_active else "未激活"
-                
+
                 # ==========================================
-                # 分开展示：交易所真实 OCO、右脑 ATR 目标线、不可回退利润地板。
+                # 分开展示：交易所真实 OCO、右脑 ATR 内存线、物理棘轮目标。
                 oco_min_roe_str = _format_stop_roe(physical_sl_px, entry_px, pos_side, leverage_used, "未挂载 ⚠️")
                 atr_target_roe_str = _format_stop_roe(atr_target_sl_px, entry_px, pos_side, leverage_used, "初始化中 ⏳")
                 profit_floor_roe_str = _format_stop_roe(profit_floor_px, entry_px, pos_side, leverage_used)
@@ -873,17 +875,17 @@ def render_realtime_portfolio():
                     "方向": "🟢 做多" if pos_side == 'LONG' else "🔴 做空",
                     "杠杆": f"{leverage_used:.0f}x",
                     "占用保证金": f"${actual_margin:,.2f}",
-                    "开仓均价": f"${entry_px:,.4f}",                    
+                    "开仓均价": f"${entry_px:,.4f}",
                     "防守止损 (SL)": real_sl,
                     "当前标记价": f"${float(info.get('markPx', info.get('mark_price', 0))):,.4f}",
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
                     "收益率 (ROE)": f"{upl_ratio:+.2f}%",
                     "ATR追踪状态": trailing_status,
                     "ATR目标止损": atr_target_sl,
-                    "利润地板": profit_floor,
+                    "物理棘轮目标": profit_floor,
                     "交易所保底 (OCO)": oco_min_roe_str,
                     "ATR目标保底": atr_target_roe_str,
-                    "不可回退地板": profit_floor_roe_str,
+                    "物理目标ROE": profit_floor_roe_str,
                 })
             st.dataframe(pd.DataFrame(pos_data), hide_index=True, width='stretch')
             pass
@@ -912,25 +914,25 @@ df_closed_trades = pd.DataFrame()
 if hist_data:
     combined_hist = pd.concat(hist_data, ignore_index=True)
     combined_hist.sort_values(by='exec_ts', ascending=True, inplace=True)
-    
+
     # 预处理 ROE 和持仓时间
     closed_records = []
     target_info_list = []
-    entry_memory = {} 
-    rev_flags = [] 
+    entry_memory = {}
+    rev_flags = []
     is_closing_list = [] # 👈 新增：标记是否为平仓动作
-    
+
     for idx, row in combined_hist.iterrows():
         sym = row['交易对']
         side = row['side']
         px = float(row['fill_price'])
         ts = pd.to_datetime(row['exec_ts'])
-        
+
         # 智能识别逻辑：如果当前有持仓且动作相反，则判定为平仓
         mem = entry_memory.get(sym)
         is_opening = side in ['buy', 'sell']
         is_closing_action = side in ['close_long', 'close_short', 'exchange_close', 'bailout_close', 'bailout_panic_sell']
-        
+
         real_is_closing = False
         if is_closing_action:
             real_is_closing = True
@@ -949,7 +951,7 @@ if hist_data:
                     raw_pnl = (px - entry_px) / entry_px
                 else:
                     raw_pnl = (entry_px - px) / entry_px
-                
+
                 real_roe = raw_pnl * mem['lev']
                 closed_records.append({
                     'exec_ts': ts,
@@ -971,10 +973,10 @@ if hist_data:
             # 执行开仓逻辑
             is_closing_list.append(False)
             entry_memory[sym] = {
-                'px': px, 
-                'side': side, 
-                'lev': float(row.get('leverage', 1.0)), 
-                'ts': ts, 
+                'px': px,
+                'side': side,
+                'lev': float(row.get('leverage', 1.0)),
+                'ts': ts,
                 'margin': float(row.get('margin_used', 100.0)),
                 'version': row.get('trade_version', 'v1.0'),
                 'xgb_prob': row.get('xgb_prob', 0.5)
@@ -987,13 +989,13 @@ if hist_data:
             is_closing_list.append(False)
             target_info_list.append("-")
             rev_flags.append(False)
-            
+
     if not combined_hist.empty:
         # 补齐长度
         while len(target_info_list) < len(combined_hist): target_info_list.append("-")
         while len(rev_flags) < len(combined_hist): rev_flags.append(False)
         while len(is_closing_list) < len(combined_hist): is_closing_list.append(False)
-        
+
         combined_hist['预期/实际收益'] = target_info_list[:len(combined_hist)]
         combined_hist['is_ai_rev'] = rev_flags[:len(combined_hist)]
         combined_hist['is_closing_trade'] = is_closing_list[:len(combined_hist)] # 👈 写入标记
@@ -1013,14 +1015,14 @@ with st.expander("查看由机器人自动执行的历史订单记录", expanded
             'fill_price': '执行时成交价',
             'slippage': '滑点损耗'
         })
-            
+
         # 兼容旧数据表：如果字段存在则重命名并格式化，不存在则补空
         if 'margin_used' in display_hist.columns:
             display_hist.rename(columns={'margin_used': '开仓保证金'}, inplace=True)
             display_hist['开仓保证金'] = display_hist['开仓保证金'].apply(lambda x: f"${float(x):,.2f}" if pd.notnull(x) and float(x) > 0 else "-")
         else:
             display_hist['开仓保证金'] = "-"
-            
+
         def map_side(row):
             x = row['方向']
             is_closing = row.get('is_closing_trade', False)
@@ -1035,15 +1037,15 @@ with st.expander("查看由机器人自动执行的历史订单记录", expanded
             if x == 'bailout_panic_sell': return "🆘 右脑紧急熔断"
             if x == 'exchange_close': return "🏁 交易所 OCO 触发"
             return x
-            
+
         # 👇 【终极修复：先翻译中文方向，再根据中文方向决定是否显示胜率】
         display_hist['方向'] = display_hist.apply(map_side, axis=1)
-        
+
         display_hist['滑点损耗'] = display_hist['滑点损耗'].apply(lambda x: f"{x:.3%}")
         display_hist['执行时成交价'] = display_hist['执行时成交价'].apply(lambda x: f"${float(x):,.4f}" if pd.notnull(x) else "N/A")
         st.dataframe(display_hist[['执行时间', '交易对', '方向', '开仓保证金', '执行时成交价', '预期/实际收益', '滑点损耗']], hide_index=True, width='stretch')
     else:
-        st.info("📭 本地数据库暂无机器人的自动开仓记录，请耐心等待首单信号。")  
+        st.info("📭 本地数据库暂无机器人的自动开仓记录，请耐心等待首单信号。")
 # ==========================================
 # 📊 策略分析驾驶舱 (Analytics Dashboard)
 # ==========================================
@@ -1055,7 +1057,7 @@ if not df_closed_trades.empty:
     # 提取历史数据中的最早和最晚日期作为日历边界
     min_date = df_closed_trades['exec_ts'].min().date()
     max_date = df_closed_trades['exec_ts'].max().date()
-    
+
     # 使用两列布局，让日期选择器在左侧，留出呼吸空间
     filter_col1, filter_col2 = st.columns([1, 2])
     with filter_col1:
@@ -1066,14 +1068,14 @@ if not df_closed_trades.empty:
             max_value=max_date,
             key="ui_date_filter"
         )
-    
+
     # 只有当用户确实选取了两个完整的日期时，才执行切片
     if len(selected_dates) == 2:
         start_date, end_date = selected_dates
         # 将日期格式转换为 datetime，并确保结束日期包含当天到 23:59:59
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-        
+
         # 🔪 核心动作：在送给图表渲染之前，直接切断底层 DataFrame
         df_closed_trades = df_closed_trades[(df_closed_trades['exec_ts'] >= start_dt) & (df_closed_trades['exec_ts'] <= end_dt)]
 
@@ -1083,31 +1085,31 @@ with dash_tab1:
     if not df_closed_trades.empty:
         df_closed_trades = df_closed_trades.sort_values('exec_ts')
         df_closed_trades['cum_roe'] = df_closed_trades['account_impact'].cumsum()
-        df_closed_trades['equity'] = 1 + df_closed_trades['cum_roe'] 
+        df_closed_trades['equity'] = 1 + df_closed_trades['cum_roe']
         df_closed_trades['max_equity'] = df_closed_trades['equity'].cummax()
         df_closed_trades['drawdown'] = (df_closed_trades['equity'] / df_closed_trades['max_equity']) - 1
-        
+
         from plotly.subplots import make_subplots
         fig_eq = make_subplots(specs=[[{"secondary_y": True}]])
-        
+
         # 资金主线 (平滑曲线 + 幽灵透明填充)
         fig_eq.add_trace(go.Scatter(
             x=df_closed_trades['exec_ts'], y=df_closed_trades['equity'],
-            name="账户净值", mode='lines', 
+            name="账户净值", mode='lines',
             line=dict(color='#00E5FF', width=2.5, shape='spline'), # spline 平滑过渡
             fill='tozeroy', fillcolor='rgba(0, 229, 255, 0.05)', # 极微弱的赛博蓝底色
             hovertemplate="时间: %{x}<br>净值: <b>%{y:.4f}</b><extra></extra>"
         ), secondary_y=False)
-        
+
         # 水下回撤面积图 (去除边框，只留血红色的深渊填充)
         fig_eq.add_trace(go.Scatter(
             x=df_closed_trades['exec_ts'], y=df_closed_trades['drawdown'],
-            name="水下回撤", mode='lines', fill='tozeroy', 
+            name="水下回撤", mode='lines', fill='tozeroy',
             line=dict(color='rgba(255, 51, 102, 0)'), # 隐藏线条本身
             fillcolor='rgba(255, 51, 102, 0.2)', # 机构级半透明血红色
             hovertemplate="回撤: <b>%{y:.2%}</b><extra></extra>"
         ), secondary_y=True)
-        
+
         fig_eq.update_layout(
             height=400, margin=dict(l=0, r=0, t=30, b=0),
             paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', # 彻底透明化背景
@@ -1116,7 +1118,7 @@ with dash_tab1:
             showlegend=False,
             spikedistance=-1 # 十字准星全局贯穿
         )
-        
+
         # 计算自适应的 Y 轴动态范围 (上下预留 10% 的视觉呼吸空间)
         eq_min = df_closed_trades['equity'].min()
         eq_max = df_closed_trades['equity'].max()
@@ -1126,24 +1128,24 @@ with dash_tab1:
         fig_eq.update_xaxes(showgrid=False, showspikes=True, spikemode="across", spikesnap="cursor", showline=False, spikedash="dot", spikecolor="#666666", spikethickness=1)
         fig_eq.update_yaxes(title_text="账户净值 (Equity)", secondary_y=False, tickformat=".4f", showgrid=True, gridcolor='rgba(255,255,255,0.05)', zeroline=False, range=[eq_min - y_padding, eq_max + y_padding])
         fig_eq.update_yaxes(title_text="历史回撤幅度", secondary_y=True, tickformat=".0%", range=[-0.6, 0], showgrid=False, zeroline=False)
-        
+
         st.plotly_chart(fig_eq, width='stretch')
     else:
         st.info("💡 暂无历史平仓数据，等待第一笔交易完结后在此生成全景资金曲线。")
-        
+
 with dash_tab2:
     if not df_closed_trades.empty:
         # 1. 按天聚合盈亏
         df_daily = df_closed_trades.resample('D', on='exec_ts')['account_impact'].sum().reset_index()
-        
+
         # 2. 提取日历坐标：X轴为绝对日期，Y轴为星期几
         df_daily['weekday'] = df_daily['exec_ts'].dt.weekday # 0=周一, 6=周日
         df_daily['date_str'] = df_daily['exec_ts'].dt.strftime('%Y-%m-%d')
-        
+
         # 👇 【核心修复】：计算该日期所在周的“周一”作为统一的 X 轴坐标
         # 这样同一周的 7 天就会被完美挤在同一列里！
         df_daily['week_start'] = df_daily['exec_ts'] - pd.to_timedelta(df_daily['weekday'], unit='d')
-        
+
         # 3. 绘制 GitHub 风格的方块热力图
         import plotly.graph_objects as go
         fig_cal = go.Figure(data=go.Scatter(
@@ -1162,7 +1164,7 @@ with dash_tab2:
             text=df_daily.apply(lambda row: f"日期: {row['date_str']}<br>全账户净收益: {row['account_impact']:+.2%}", axis=1),
             hoverinfo='text'
         ))
-        
+
         # 4. 优化坐标轴视觉
         fig_cal.update_layout(
             yaxis=dict(
@@ -1179,18 +1181,18 @@ with dash_tab2:
             margin=dict(l=40, r=20, t=40, b=20),
             title="📅 GitHub 风格日度盈亏热力阵列"
         )
-        
+
         st.plotly_chart(fig_cal, width='stretch')
     else:
         st.info("💡 暂无数据生成日度盈亏日历。")
-        
+
 with dash_tab3:
     if not df_closed_trades.empty and len(df_closed_trades) >= 2:
         # 颜色映射：盈利为绿，亏损为红
         colors = np.where(df_closed_trades['real_roe'] > 0, '#2ECC71', '#E74C3C')
-        
+
         fig_scatter = go.Figure()
-        
+
         # 绘制散点图
         fig_scatter.add_trace(go.Scatter(
             x=df_closed_trades['hold_hours'],
@@ -1206,28 +1208,28 @@ with dash_tab3:
             customdata=np.stack((df_closed_trades['exec_ts'].dt.strftime('%Y-%m-%d %H:%M'),), axis=-1),
             hovertemplate="<b>%{text}</b><br>平仓时间: %{customdata[0]}<br>持仓时间: <b>%{x:.2f} 小时</b><br>最终盈亏: <b>%{y:.2%}</b><extra></extra>"
         ))
-        
+
         fig_scatter.update_layout(
             height=380, margin=dict(l=0, r=0, t=20, b=0),
             paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
             hovermode="closest", # 散点图使用 closest 悬浮模式最精确
             hoverlabel=dict(bgcolor="#1E1E1E", font_size=13, font_family="Courier New")
         )
-        
+
         # 坐标轴美化 (强化零轴，形成明确的“四大象限”)
         fig_scatter.update_xaxes(
-            title_text="持仓时间 (Hours)", 
-            showgrid=True, gridcolor='rgba(255,255,255,0.05)', 
+            title_text="持仓时间 (Hours)",
+            showgrid=True, gridcolor='rgba(255,255,255,0.05)',
             zeroline=False
         )
         fig_scatter.update_yaxes(
-            title_text="最终收益率 (ROE)", tickformat=".1%", 
-            showgrid=True, gridcolor='rgba(255,255,255,0.05)', 
+            title_text="最终收益率 (ROE)", tickformat=".1%",
+            showgrid=True, gridcolor='rgba(255,255,255,0.05)',
             zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=1.5 # 粗体零轴分界
         )
-        
+
         st.plotly_chart(fig_scatter, width='stretch')
-        
+
         # 在图表下方追加一个极简的系统级诊断统计
         win_rate = (df_closed_trades['real_roe'] > 0).mean()
         avg_hold = df_closed_trades['hold_hours'].mean()
@@ -1236,7 +1238,7 @@ with dash_tab3:
         # 👇 【新增功能】：各币种独立表现考核排行榜
         # ==========================================
         st.markdown("##### 🗄️ 各币种独立表现考核排行榜")
-        
+
         # 使用 Pandas 的 groupby 进行多维聚合统计
         coin_stats = df_closed_trades.groupby('symbol').agg(
             出手次数=('symbol', 'count'),
@@ -1400,22 +1402,22 @@ with dash_tab4:
                 v_win_rate_curr = (v_df_curr['real_roe'] > 0).mean()
                 v_total_pnl_curr = v_df_curr['account_impact'].sum()
                 v_total_usdt_curr = v_total_pnl_curr * initial_cap
-                
+
                 span_days = (v_df_curr['exec_ts'].max() - v_df_curr['exec_ts'].min()).total_seconds() / 86400.0
                 safe_span = max(1.0, span_days)
                 annual_roi = v_total_pnl_curr * (365.0 / safe_span)
-                
+
                 m1, m2 = st.columns(2)
                 m1.metric("服役期间实盘胜率", f"{v_win_rate_curr:.1%}", delta=f"总发车 {len(v_df_curr)} 次")
                 m2.metric("累计创造利润", f"{v_total_usdt_curr:+.2f} USDT", delta=f"账户净值折算 {v_total_pnl_curr:+.2%}", delta_color="normal" if v_total_usdt_curr > 0 else "inverse")
-                
+
                 m3, m4 = st.columns(2)
                 m3.metric("平均持仓时间", f"{v_df_curr['hold_hours'].mean():.1f} 小时")
                 if span_days > 0:
                     m4.metric("实盘理论年化 (预估)", f"{annual_roi:+.2%}", delta=f"基于 {span_days:.1f} 天外推", delta_color="normal" if annual_roi > 0 else "inverse")
                 else:
                     m4.metric("实盘理论年化 (预估)", "计算中 ⏳", delta="跨度不足 24h")
-                    
+
             with col2:
                 render_confidence_calibration(v_df_curr, shadow_df, model_stack)
 # ==========================================
@@ -1432,34 +1434,34 @@ def render_bottom_alerts():
                 with sqlite3.connect(log_db_path, timeout=5.0) as conn:
                     # 👇 修改 1：把底层提取池扩大到 800 条，确保去重后还能剩下足够的日志
                     df_alerts = pd.read_sql("SELECT log_ts, level, symbol, message FROM system_alerts ORDER BY log_ts DESC LIMIT 500", conn)
-                    
+
                     if not df_alerts.empty:
                         df_alerts['log_ts'] = pd.to_datetime(df_alerts['log_ts'], format='mixed')
-                        
+
                         filtered_logs = []
                         seen_signatures = {}
-                        
+
                         # 【改动2】：智能去重算法 (时间窗口：30分钟 / 1800秒)
                         for _, r in df_alerts.iterrows():
                             # 定义“重复”的指纹：同一个币，同一种级别，同一个报错内容
                             sig = f"{r['symbol']}_{r['level']}_{r['message']}"
                             current_ts = r['log_ts']
-                            
+
                             if sig in seen_signatures:
                                 # 因为是按时间倒序遍历，seen_signatures 存的是最新一次发生的时间
                                 time_diff = seen_signatures[sig] - current_ts
                                 if time_diff.total_seconds() < 1800:
                                     # 距离该错误最新一次发生不到半小时，视为“噪音刷屏”，直接丢弃旧的
-                                    continue 
-                                    
+                                    continue
+
                             seen_signatures[sig] = current_ts
                             filtered_logs.append(r)
-                            
+
                         # 【改动3】：紧凑型固定高度滚动框 (剔除臃肿的 st.error/warning)
                         if filtered_logs:
                             # 👇 修改 2：放开展示上限，展示前 200 条精华日志
-                            display_logs = filtered_logs[:200] 
-                            
+                            display_logs = filtered_logs[:200]
+
                             # 👇 修改 3：稍微拉长一点容器的高度（比如从 350 改为 450），方便你在 200 条数据里舒展地滚动查看
                             with st.container(height=450):
                                 for r in display_logs:
@@ -1467,7 +1469,7 @@ def render_bottom_alerts():
                                     sym = r['symbol']
                                     lvl = r['level']
                                     msg = r['message']
-                                    
+
                                     # 智能颜色映射，保留视觉警示力
                                     if "🚨" in lvl or "❌" in lvl:
                                         color = "#ff4b4b" # 血红色
@@ -1475,7 +1477,7 @@ def render_bottom_alerts():
                                         color = "#ffa421" # 警告橙
                                     else:
                                         color = "#21c354" # 成功绿
-                                        
+
                                     # 使用原生 HTML 渲染极简小字体，极大提升同屏信息密度
                                     st.markdown(
                                         f"<div style='font-size: 0.82em; margin-bottom: 8px; line-height: 1.35;'>"
@@ -1555,7 +1557,7 @@ def render_market_radar():
     active_radar_symbols = ALL_SYMBOLS
     if isinstance(active_radar_symbols, str):
         active_radar_symbols = [active_radar_symbols]
-    
+
     if not active_radar_symbols:
         st.warning("暂无激活的监控币种。")
         return
@@ -1566,7 +1568,7 @@ def render_market_radar():
     col_sel, col_blank = st.columns([1, 3])
     with col_sel:
         target_symbol = st.selectbox(
-            "🎯 选择要深度透视的雷达目标", 
+            "🎯 选择要深度透视的雷达目标",
             options=active_radar_symbols,
             key="ui_radar_target"
         )
@@ -1586,7 +1588,7 @@ def render_market_radar():
 
         current_price = snap_data.get("current_price", 0.0)
         ohlcv_1h = snap_data.get("ohlcv_1h", [])
-        
+
         # 🛡️ 容错处理：如果 API 挂了或没数据，直接穿透到本地 SQLite 硬盘存储 (兜底)
         if not ohlcv_1h or current_price == 0:
             db_path = os.path.join(LIVE_DATA_DIR, "gateway_state.db")
@@ -1595,7 +1597,7 @@ def render_market_radar():
                     with sqlite3.connect(db_path, timeout=5.0) as conn:
                         # 查找该币种最近的 168 根 1h K 线 (一周)
                         df_db = pd.read_sql(
-                            f"SELECT timestamp as ts, open, high, low, close, volume FROM memory_1h WHERE symbol = '{target_symbol}' ORDER BY timestamp DESC LIMIT 168", 
+                            f"SELECT timestamp as ts, open, high, low, close, volume FROM memory_1h WHERE symbol = '{target_symbol}' ORDER BY timestamp DESC LIMIT 168",
                             conn
                         )
                         if not df_db.empty:
@@ -1612,7 +1614,7 @@ def render_market_radar():
             df_actual['ts'] = pd.to_datetime(df_actual['ts'], unit='ms')
             # 🎯 仅保留最近一周 (168 小时) 的数据，防止图表过于拥挤
             df_actual = df_actual.tail(168)
-            
+
         # 2. 从 live_status.json 读取 AI 推理状态 (适配全新的嵌套结构树)
         status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
         status_data = {}
@@ -1622,17 +1624,17 @@ def render_market_radar():
                     status_data = json.load(f)
             except: pass
         status_data = (status_data.get("symbols", {}) or {}).get(target_symbol, status_data)
-            
+
         # 填充展示指标 (优先使用根节点的 timestamp，适配新 Payload)
         last_update_ts = status_data.get("timestamp", time.time())
         last_update = datetime.fromtimestamp(last_update_ts).strftime("%Y-%m-%d %H:%M:%S")
-        
+
         macro_score = status_data.get("macro_score", 0.0)
-        
+
         # 安全提取嵌套的 model_inference 数据
         inference_data = status_data.get("model_inference", {})
         configured_model_stack = resolve_current_serving_model(target_symbol).get("model_stack", [])
-        
+
         p_up = inference_data.get("raw_prob_up", 0.33)
         p_down = inference_data.get("raw_prob_down", 0.33)
         p_flat = inference_data.get("raw_prob_flat", max(0.0, 1.0 - p_up - p_down))
@@ -1651,27 +1653,27 @@ def render_market_radar():
                 }
                 for m in configured_model_stack
             ]
-        
+
         adj_p_up = inference_data.get("adj_prob_up_tier1", p_up)
         adj_p_down = inference_data.get("adj_prob_down_tier1", p_down)
-        
+
         is_uptrend_proxy = current_price > (df_actual['close'].mean() if not df_actual.empty else current_price)
         ema_macro_slope = 0.001 if is_uptrend_proxy else -0.001
-        
+
         up_prob = adj_p_up if adj_p_up > adj_p_down else (1.0 - adj_p_down)
         auto_leverage = 8.0  # 默认保底杠杆率 8x
         tp_pct = 0.08
         sl_pct = 0.04
-        
+
         st.caption(f"⏱️ 引擎状态最后同步: `{last_update}` (基于 {target_symbol} 极速快照)")
-        
+
         # ==========================================
         # 🧠 第一行：iTransformer 大模型预测概率
         # ==========================================
         model_title = f"iTransformer 加权多模型概率分布 x{model_count}" if model_count > 1 else "iTransformer 大模型概率分布"
         st.markdown(f"##### {model_title}")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        
+
         c1.metric("当前标的价格", f"${current_price:,.4f}")
         c2.metric("宏观情绪加成", f"{macro_score:+.2f}", delta_color="normal" if macro_score != 0 else "off")
         c3.metric("看涨概率 (p_up)", f"{adj_p_up:.2%}", f"原始: {p_up:.2%}")
@@ -1708,8 +1710,8 @@ def render_market_radar():
         fig = go.Figure()
         if not df_actual.empty and 'open' in df_actual.columns:
             fig.add_trace(go.Candlestick(x=df_actual['ts'], open=df_actual['open'], high=df_actual['high'], low=df_actual['low'], close=df_actual['close'], name="实时1h K 线"))
-        
-        fig.update_layout(title=f"{target_symbol} 实时盘口K线与推演", yaxis_title="Price (USDT)", 
+
+        fig.update_layout(title=f"{target_symbol} 实时盘口K线与推演", yaxis_title="Price (USDT)",
                         template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, width='stretch')
 
