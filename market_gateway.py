@@ -1688,6 +1688,7 @@ async def get_market_snapshot(symbol: str):
         response.update({
             "taker_stats_1h": data.get("taker_stats_1h", {}),
             "ohlcv_1m": safe_1m,
+            "orderbook": data.get("orderbook", {"bids": [], "asks": []}),
             "premium_history": data.get("premium_history", []),
             "funding_history": data.get("funding_history", []),
             "oi_history": data.get("oi_history", [])

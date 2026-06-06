@@ -24,7 +24,8 @@ from quant_config.config import (
     MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA,
     MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
     TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
-    GATE_SANDBOX_MODE
+    GATE_SANDBOX_MODE, RIGHT_BRAIN_SNAPSHOT_TIMEOUT,
+    RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -760,16 +761,20 @@ def bailout_worker():
             def fetch_snap(p):
                 base_sym = p['symbol'].split(':')[0].replace('/', '')
                 try:
-                    resp = requests.get(f"http://127.0.0.1:8000/api/snapshot/{base_sym}", timeout=1.0)
+                    resp = requests.get(
+                        f"http://127.0.0.1:8000/api/snapshot/{base_sym}",
+                        timeout=RIGHT_BRAIN_SNAPSHOT_TIMEOUT,
+                    )
                     if resp.status_code == 200:
-                        return p, base_sym, resp.json()
-                except: pass
-                return p, base_sym, None
+                        return p, base_sym, resp.json(), ""
+                    return p, base_sym, None, f"HTTP {resp.status_code}: {resp.text[:160]}"
+                except Exception as e:
+                    return p, base_sym, None, f"{type(e).__name__}: {e}"
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(5, len(current_positions))) as executor:
                 results = list(executor.map(fetch_snap, current_positions))
 
-            for p, base_sym, data in results:
+            for p, base_sym, data, snapshot_error in results:
                 try:
                     symbol_status = _status_for_symbol(live_status, base_sym)
                     inference_data = symbol_status.get("model_inference", {}) or {}
@@ -962,10 +967,13 @@ def bailout_worker():
                         continue
 
                     if data is None:
-                        snapshot_warn_cooldown = 60.0
                         since_last_warn = time.time() - float(mem.get('last_snapshot_warn_ts', 0.0) or 0.0)
-                        if since_last_warn >= snapshot_warn_cooldown:
-                            msg = f"[{base_sym}] 右脑未取到本地行情快照，已退化使用交易所 mark_price=${mark_px:.4f} 维持止损托管。"
+                        if since_last_warn >= RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN:
+                            reason_text = snapshot_error or "未知原因"
+                            msg = (
+                                f"[{base_sym}] 右脑未取到本地行情快照，已退化使用交易所 mark_price=${mark_px:.4f} "
+                                f"维持止损托管。原因: {reason_text}"
+                            )
                             print(f"⚠️ {msg}")
                             log_system_alert("⚠️ 右脑快照缺失", base_sym, msg)
                             mem['last_snapshot_warn_ts'] = time.time()

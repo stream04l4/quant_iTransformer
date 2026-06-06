@@ -148,6 +148,8 @@ BAILOUT_ATR_MULTI = 3.5              # 价格瀑布触发阈值(ATR倍数)：1�
 BAILOUT_VOL_MULTI = 4.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
 BAILOUT_MIN_PHYSICAL_DROP = 0.005    # 熔断最小物理跌幅过滤(0.5%)，防止微小波动误触
 BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确认为真瀑布)
+RIGHT_BRAIN_SNAPSHOT_TIMEOUT = float(os.environ.get("RIGHT_BRAIN_SNAPSHOT_TIMEOUT", 3.0))
+RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN = float(os.environ.get("RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN", 60.0))
 
 # ==========================================
 # 6. 模型架构与训练超参数 (全参环境变量动态注入区)
