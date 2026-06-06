@@ -156,6 +156,31 @@ def get_macro_sentiment_info():
     return 0.0, "0"
 
 
+def _parse_macro_decision_ts(macro_ts):
+    """解析宏观库里的 UTC 时间戳，返回 epoch 秒；解析失败返回 0。"""
+    text = str(macro_ts or "").strip()
+    if not text or text == "0":
+        return 0.0
+    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=None).timestamp()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00").replace(" UTC", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _macro_covers_closed_hour(macro_ts, latest_closed_ts):
+    """宏观分必须晚于该闭合K线的收盘时刻，才允许触发本小时推理。"""
+    try:
+        closed_hour_end_sec = (int(latest_closed_ts) / 1000.0) + 3600.0
+    except (TypeError, ValueError):
+        return False
+    return _parse_macro_decision_ts(macro_ts) >= closed_hour_end_sec
+
+
 def _extract_closed_hour_anchor(snapshot, latest_closed_ts):
     """返回最新闭合1h K线的整点价格锚点，即该闭合K线 close。"""
     try:
@@ -1254,6 +1279,8 @@ def _load_symbol_runtime(symbol, cfg):
         "last_inference_trigger": "",
         "startup_price_guard_pending": True,
         "startup_price_guard_active": False,
+        "last_macro_wait_hour": 0,
+        "last_macro_wait_log_ts": 0.0,
         "last_signal_evaluated_ts": 0.0,
         "last_trade_hour": 0,
         "latest_closed_ts": 0,
@@ -1344,16 +1371,28 @@ def run_live():
 
                     if latest_closed_ts != rt["last_inferred_hour"]:
                         current_minute = datetime.utcnow().minute
-                        if current_minute < 2:
-                            if int(current_time) % 30 == 0:
-                                print(f"⏳ [{symbol}] 检测到新K线，等待整点第2分钟同步宏观分 (当前: {current_minute}分)...")
+                        macro_ready_for_hour = _macro_covers_closed_hour(current_macro_ts, latest_closed_ts)
+                        if not macro_ready_for_hour:
+                            should_log_macro_wait = (
+                                latest_closed_ts != rt.get("last_macro_wait_hour")
+                                or current_time - float(rt.get("last_macro_wait_log_ts", 0.0) or 0.0) >= 30.0
+                            )
+                            if should_log_macro_wait:
+                                closed_hour_end = datetime.utcfromtimestamp((int(latest_closed_ts) / 1000.0) + 3600.0)
+                                print(
+                                    f"⏳ [{symbol}] 新K线已闭合，等待宏观刷新后立即推理 | "
+                                    f"K线收盘: {closed_hour_end.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
+                                    f"当前宏观TS: {current_macro_ts}"
+                                )
+                                rt["last_macro_wait_hour"] = latest_closed_ts
+                                rt["last_macro_wait_log_ts"] = current_time
                         else:
                             is_startup_inference = bool(rt.get("startup_price_guard_pending", False))
                             startup_guard_should_apply = is_startup_inference and current_minute > 5
                             trigger_label = (
-                                f"冷启动首轮推理-第{current_minute}分钟"
+                                f"冷启动首轮推理-宏观已刷新-第{current_minute}分钟"
                                 if is_startup_inference else
-                                f"整点第{current_minute}分钟"
+                                f"宏观刷新就绪-第{current_minute}分钟"
                             )
                             print(f"\n🔄 [{symbol}] {trigger_label}，开始模型推理 (TS: {latest_closed_ts})...")
                             aux_symbols = rt["aux_symbols"]
