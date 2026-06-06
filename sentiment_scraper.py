@@ -255,7 +255,22 @@ class TradFiScraper:
 # ==========================================
 # 🧠 V3 大脑：DeepSeek 宏观情绪裁判
 # ==========================================
-def calibrate_macro_score(raw_score, marquee_text="", urgency="low"):
+def _is_weekend_utc(timestamp_text):
+    try:
+        dt = datetime.strptime(str(timestamp_text or ""), "%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError):
+        dt = datetime.utcnow()
+    return dt.weekday() >= 5
+
+
+def _all_macro_assets_stale(current_context):
+    macro = (current_context or {}).get("us_macro_equities", {}) or {}
+    if not macro:
+        return False
+    return all(not bool(asset_data.get("is_fresh")) for asset_data in macro.values())
+
+
+def calibrate_macro_score(raw_score, marquee_text="", urgency="low", current_context=None):
     """把大模型的自然语言判断压回交易系统可解释的强度标尺。"""
     try:
         score = float(raw_score)
@@ -280,6 +295,18 @@ def calibrate_macro_score(raw_score, marquee_text="", urgency="low"):
 
     if is_neutral_text and not has_extreme_text:
         cap = 0.40 if urgency == "medium" else 0.30
+        score = max(-cap, min(cap, score))
+
+    current_context = current_context or {}
+    is_weekend = _is_weekend_utc(current_context.get("timestamp"))
+    all_macro_stale = _all_macro_assets_stale(current_context)
+
+    if all_macro_stale:
+        cap = 0.55 if urgency == "high" and has_extreme_text else 0.40
+        score = max(-cap, min(cap, score))
+
+    if is_weekend:
+        cap = 0.60 if urgency == "high" and has_extreme_text else 0.45
         score = max(-cap, min(cap, score))
 
     return round(score, 2)
@@ -350,6 +377,7 @@ class DeepSeekMacroAgent:
              * 10年期美债收益率 (^TNX) 与 美元指数 (DXY)：仅当该资产【数据新鲜】且 Z-Score > +1.5 且 24H 涨幅为正，代表全球流动性剧烈收紧，对 Crypto 构成【毁灭性打击】；反之为【利好】。
              * 纳斯达克 (NQ=F)：仅当该资产【数据新鲜】且 Z-Score < -1.5 且 24H 涨幅显著为负（例如跌幅超过 1%），代表风险资产崩盘溢出，对 Crypto 是【重大利空】；反之为【利好】。
            - ⚠️ 数据时效与休市逻辑（严格执行）：40% 的满额权重只给【新鲜资产】。某个资产陈旧，不代表整个宏观模块完全失效；你必须逐资产降权，而不是整组一刀切。
+           - ⚠️ 周末/休市低流动性约束：若当前是周六或周日 UTC，或 `us_macro_equities` 全部 `is_fresh=false`，不得把 TradFi 的 `price_z_score` 当作实时极端冲击；除非新闻中存在明确黑天鹅，否则 |score| 不应超过 0.60。
 
         2. 权重 30%：Crypto 核心基本面与机构资金 (Institutional Crypto Fundamentals)
            - 数据源：`hot_news`。
@@ -485,6 +513,7 @@ class DeepSeekMacroAgent:
                     float(decision.get("score", 0.00)),
                     marquee_text,
                     urgency,
+                    current_context,
                 )
 
                 return {
