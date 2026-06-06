@@ -14,7 +14,11 @@ from ccxt.base.errors import NetworkError, ExchangeError, RequestTimeout
 from state_manager import state
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR,
-    MAX_NOTIONAL_BTC, MAX_NOTIONAL_ALTS
+    MAX_NOTIONAL_BTC, MAX_NOTIONAL_ALTS,
+    GATE_TRADING_MODE, LIVE_TRADING_ARMED, GATE_SANDBOX_MODE,
+    GATE_REQUIRE_ISOLATED_MARGIN, MAX_MARGIN_PER_TRADE_USDT,
+    MAX_BALANCE_RISK_PCT, MIN_FREE_USDT_AFTER_ORDER,
+    DAILY_MAX_LOSS_USDT,
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,10 +28,10 @@ MY_GATE_SECRET   = os.environ.get("GATE_DEMO_SECRET", "")
 PUSHPLUS_TOKEN   = os.environ.get("PUSHPLUS_TOKEN", "")
 
 global_gate = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
-global_gate.set_sandbox_mode(True)
+global_gate.set_sandbox_mode(GATE_SANDBOX_MODE)
 
 sync_ex = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
-sync_ex.set_sandbox_mode(True)
+sync_ex.set_sandbox_mode(GATE_SANDBOX_MODE)
 
 # 👇 【核心重构 1：异步推送队列】
 def push_worker():
@@ -85,6 +89,193 @@ def acquire_process_lock(lock_name):
     except OSError:
         os.close(lock_fd)
         return None
+
+
+def _balance_number(balance, bucket, currency="USDT"):
+    try:
+        return float((balance.get(bucket, {}) or {}).get(currency, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_usdt_balance(balance):
+    """Return free and total USDT from a CCXT balance payload."""
+    free_usdt = _balance_number(balance, "free")
+    total_usdt = _balance_number(balance, "total")
+    if total_usdt <= 0:
+        total_usdt = free_usdt
+    return free_usdt, total_usdt
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _check_daily_loss_guard(balance):
+    """UTC-day equity drawdown guard; blocks new entries after configured loss."""
+    if DAILY_MAX_LOSS_USDT <= 0:
+        if LIVE_TRADING_ARMED:
+            return False, "live 模式未配置 DAILY_MAX_LOSS_USDT，拒绝真实资金开仓"
+        return True, "日内亏损熔断未启用"
+
+    _, total_usdt = _extract_usdt_balance(balance)
+    if total_usdt <= 0:
+        return False, "无法读取有效 USDT 总权益，日内亏损熔断拒绝开仓"
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    state_path = os.path.join(LIVE_DATA_DIR, "live_risk_guard_state.json")
+    guard_state = _read_json_file(state_path)
+    start_equity = _safe_float(guard_state.get("start_equity_usdt"), 0.0)
+
+    if guard_state.get("utc_day") != today or start_equity <= 0:
+        guard_state = {
+            "utc_day": today,
+            "start_equity_usdt": float(total_usdt),
+            "last_equity_usdt": float(total_usdt),
+            "daily_loss_usdt": 0.0,
+            "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        atomic_write_json(guard_state, state_path)
+        return True, f"日内权益基准已初始化: {total_usdt:.4f} USDT"
+
+    daily_loss = max(0.0, start_equity - total_usdt)
+    guard_state.update({
+        "last_equity_usdt": float(total_usdt),
+        "daily_loss_usdt": float(daily_loss),
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    atomic_write_json(guard_state, state_path)
+
+    if daily_loss >= DAILY_MAX_LOSS_USDT:
+        return (
+            False,
+            f"日内亏损熔断触发: loss={daily_loss:.4f} >= limit={DAILY_MAX_LOSS_USDT:.4f} USDT",
+        )
+    return True, f"日内亏损检查通过: loss={daily_loss:.4f}/{DAILY_MAX_LOSS_USDT:.4f} USDT"
+
+
+def _apply_pretrade_cap(exchange, symbol, requested_margin):
+    """Apply live confirmation, balance, per-order cap, and daily loss guard."""
+    try:
+        requested_margin = float(requested_margin or 0.0)
+    except (TypeError, ValueError):
+        requested_margin = 0.0
+
+    if requested_margin <= 0:
+        return False, 0.0, "保证金预算无效，拒绝开仓"
+
+    if GATE_TRADING_MODE == "live" and not LIVE_TRADING_ARMED:
+        return (
+            False,
+            0.0,
+            "GATE_TRADING_MODE=live 但 LIVE_TRADING_ENABLED 未设置为 I_UNDERSTAND_REAL_MONEY",
+        )
+
+    if not LIVE_TRADING_ARMED:
+        return True, requested_margin, "sandbox 模式跳过真实余额硬闸"
+
+    if MAX_MARGIN_PER_TRADE_USDT <= 0:
+        return False, 0.0, "live 模式未配置 MAX_MARGIN_PER_TRADE_USDT，拒绝真实资金开仓"
+    if MAX_BALANCE_RISK_PCT <= 0:
+        return False, 0.0, "MAX_BALANCE_RISK_PCT 必须为正数"
+
+    try:
+        balance = exchange.fetch_balance()
+    except Exception as e:
+        return False, 0.0, f"真实余额读取失败，拒绝开仓: {e}"
+
+    free_usdt, total_usdt = _extract_usdt_balance(balance)
+    if free_usdt <= 0:
+        return False, 0.0, f"可用 USDT 余额不足: free={free_usdt:.4f}"
+
+    daily_ok, daily_reason = _check_daily_loss_guard(balance)
+    if not daily_ok:
+        return False, 0.0, daily_reason
+
+    free_after_reserve = max(0.0, free_usdt - max(0.0, MIN_FREE_USDT_AFTER_ORDER))
+    balance_cap = free_usdt * MAX_BALANCE_RISK_PCT
+    hard_cap = min(MAX_MARGIN_PER_TRADE_USDT, balance_cap, free_after_reserve)
+    if hard_cap <= 0:
+        return (
+            False,
+            0.0,
+            f"余额保护后无可用保证金: free={free_usdt:.4f}, reserve={MIN_FREE_USDT_AFTER_ORDER:.4f}",
+        )
+
+    capped_margin = min(requested_margin, hard_cap)
+    if capped_margin < requested_margin:
+        msg = (
+            f"{symbol} 保证金预算由 {requested_margin:.4f} 压降至 {capped_margin:.4f} USDT | "
+            f"free={free_usdt:.4f}, total={total_usdt:.4f}, {daily_reason}"
+        )
+        return True, capped_margin, msg
+
+    return True, capped_margin, f"余额硬闸通过 | free={free_usdt:.4f}, total={total_usdt:.4f}, {daily_reason}"
+
+
+def _margin_mode_text(position):
+    if not position:
+        return ""
+    info = position.get("info", {}) or {}
+    candidates = [
+        position.get("marginMode"),
+        position.get("margin_mode"),
+        info.get("margin_mode"),
+        info.get("marginMode"),
+        info.get("margin_type"),
+        info.get("marginType"),
+    ]
+    for raw in candidates:
+        text = str(raw or "").strip().lower()
+        if text:
+            return text
+    return ""
+
+
+def _ensure_isolated_margin(exchange, gate_symbol):
+    if not GATE_REQUIRE_ISOLATED_MARGIN:
+        return True, "逐仓校验未启用"
+
+    try:
+        exchange.set_margin_mode("isolated", gate_symbol)
+        set_ok = True
+        set_msg = "已请求交易所切换/保持逐仓"
+    except Exception as e:
+        err_text = str(e).lower()
+        already_isolated = any(
+            token in err_text
+            for token in ("no_change", "not change", "already", "same", "isolated")
+        )
+        set_ok = already_isolated
+        set_msg = "交易所返回已处于逐仓/无需修改" if already_isolated else f"逐仓设置失败: {e}"
+        if LIVE_TRADING_ARMED and not already_isolated:
+            return False, set_msg
+
+    try:
+        positions = exchange.fetch_positions([gate_symbol])
+    except Exception as e:
+        if LIVE_TRADING_ARMED:
+            return False, f"逐仓校验读取仓位失败: {e}"
+        return True, f"{set_msg}；sandbox 仓位校验失败但不阻断: {e}"
+
+    active_positions = [p for p in positions if _position_contracts(p) > 1e-8]
+    if not active_positions:
+        return True, set_msg if set_ok else f"{set_msg}；当前无仓位可二次校验"
+
+    for pos in active_positions:
+        mode_text = _margin_mode_text(pos)
+        if "cross" in mode_text:
+            return False, f"{gate_symbol} 当前仓位为全仓模式 ({mode_text})，拒绝继续加仓"
+        if "isolated" in mode_text:
+            return True, f"{gate_symbol} 逐仓校验通过 ({mode_text})"
+
+    if LIVE_TRADING_ARMED:
+        return False, f"{gate_symbol} 无法从交易所返回字段确认逐仓模式，拒绝真实资金加仓"
+    return True, f"{gate_symbol} 未能明确校验逐仓；sandbox 模式放行"
 
 def portfolio_sync_worker():
     """ 
@@ -676,6 +867,21 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             
         market = markets[gate_symbol]
         contract_size = float(market['contractSize'])
+
+        guard_ok, risk_margin_usd, guard_reason = _apply_pretrade_cap(
+            exchange_private,
+            symbol,
+            risk_margin_usd,
+        )
+        if not guard_ok:
+            msg = f"❌ 实盘安全闸拒绝开仓: {guard_reason}"
+            print("⚠️", msg)
+            log_system_alert("❌ 实盘安全闸", symbol, msg)
+            return False, 0.0
+        if guard_reason:
+            print(f"🧯 [实盘安全闸] {guard_reason}")
+            log_system_alert("🧯 实盘安全闸", symbol, guard_reason)
+
         target_notional = risk_margin_usd * leverage
         
         # 👇 【智能修复 1：动态风险限额压降 (Risk Limit Capping)】
@@ -720,6 +926,16 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             print("⚠️", msg)
             log_system_alert("❌ 资金不足", symbol, msg)
             return False, 0.0
+
+        margin_ok, margin_reason = _ensure_isolated_margin(exchange_private, gate_symbol)
+        if not margin_ok:
+            msg = f"❌ 逐仓保护拒绝开仓: {margin_reason}"
+            print("⚠️", msg)
+            log_system_alert("❌ 逐仓保护", symbol, msg)
+            return False, 0.0
+        if margin_reason:
+            print(f"🧯 [逐仓保护] {margin_reason}")
+            log_system_alert("🧯 逐仓保护", symbol, margin_reason)
 
         # 统一绝对杠杆语义：无论首次开仓还是同向升档，都先把交易所杠杆对齐到 Tier 目标值。
         if abs(current_exchange_leverage - leverage) > 0.05:

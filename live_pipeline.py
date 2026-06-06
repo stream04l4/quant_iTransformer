@@ -6,7 +6,7 @@ import torch
 import json
 from pathlib import Path
 from historical_pipeline.train_itransformer import InvertedTransformer
-from execution_oms import execute_gate_trade, get_gate_stop_coverage_size, log_system_alert
+from execution_oms import execute_gate_trade, get_gate_stop_coverage_size, log_system_alert, acquire_process_lock
 from risk_manager import bailout_worker
 import threading
 from state_manager import state
@@ -22,7 +22,9 @@ from quant_config.config import (
     MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
-    LIVE_SYMBOL_CONFIGS
+    LIVE_SYMBOL_CONFIGS, GATE_TRADING_MODE, LIVE_TRADING_ARMED, GATE_SANDBOX_MODE,
+    MAX_MARGIN_PER_TRADE_USDT, MAX_BALANCE_RISK_PCT, MIN_FREE_USDT_AFTER_ORDER,
+    DAILY_MAX_LOSS_USDT
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -1302,7 +1304,23 @@ def _compact_stop_coverage(stop_coverage):
 
 
 def run_live():
+    lock_fd = acquire_process_lock("live_pipeline.lock")
+    if lock_fd is None:
+        msg = "检测到已有 live_pipeline 主引擎实例持有锁，本进程退出以避免重复发单。"
+        print(f"🛑 [单实例保护] {msg}")
+        log_system_alert("🛑 单实例保护", "SYSTEM", msg)
+        return
+    run_live.lock_fd = lock_fd
+
     print(f"🚀 极速实盘预测引擎启动 (多模型模式: {', '.join(LIVE_MAIN_SYMBOLS)})...")
+    mode_msg = (
+        f"交易模式: {GATE_TRADING_MODE} | sandbox={GATE_SANDBOX_MODE} | "
+        f"live_armed={LIVE_TRADING_ARMED} | max_margin={MAX_MARGIN_PER_TRADE_USDT:.4f} | "
+        f"balance_risk={MAX_BALANCE_RISK_PCT:.2%} | reserve={MIN_FREE_USDT_AFTER_ORDER:.4f} | "
+        f"daily_loss_limit={DAILY_MAX_LOSS_USDT:.4f}"
+    )
+    print(f"🧯 [实盘安全配置] {mode_msg}")
+    log_system_alert("🧯 实盘安全配置", "SYSTEM", mode_msg)
     threading.Thread(target=bailout_worker, daemon=True).start()
 
     runtimes = {}
@@ -1335,6 +1353,12 @@ def run_live():
         state.dynamic_settings["bailout_vol_multi"] = BAILOUT_VOL_MULTI
         state.dynamic_settings["trailing_atr_period"] = TRAILING_ATR_PERIOD
         state.dynamic_settings["trailing_atr_multi"] = TRAILING_ATR_MULTI
+        state.dynamic_settings["gate_trading_mode"] = GATE_TRADING_MODE
+        state.dynamic_settings["live_trading_armed"] = LIVE_TRADING_ARMED
+        state.dynamic_settings["gate_sandbox_mode"] = GATE_SANDBOX_MODE
+        state.dynamic_settings["max_margin_per_trade_usdt"] = MAX_MARGIN_PER_TRADE_USDT
+        state.dynamic_settings["max_balance_risk_pct"] = MAX_BALANCE_RISK_PCT
+        state.dynamic_settings["daily_max_loss_usdt"] = DAILY_MAX_LOSS_USDT
 
         dynamic_margin_usd = INITIAL_CAPITAL * BASE_RISK_BUDGET
         dynamic_sl = HARD_SL
@@ -1709,6 +1733,15 @@ def run_live():
         live_state_payload = {
             "timestamp": time.time(),
             "mode": "multi_symbol",
+            "trading_safety": {
+                "gate_trading_mode": GATE_TRADING_MODE,
+                "live_trading_armed": bool(LIVE_TRADING_ARMED),
+                "gate_sandbox_mode": bool(GATE_SANDBOX_MODE),
+                "max_margin_per_trade_usdt": float(MAX_MARGIN_PER_TRADE_USDT),
+                "max_balance_risk_pct": float(MAX_BALANCE_RISK_PCT),
+                "min_free_usdt_after_order": float(MIN_FREE_USDT_AFTER_ORDER),
+                "daily_max_loss_usdt": float(DAILY_MAX_LOSS_USDT),
+            },
             "active_symbols": list(runtimes.keys()),
             "symbols": symbol_payloads,
         }

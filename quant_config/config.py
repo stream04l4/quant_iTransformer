@@ -5,6 +5,12 @@ from dotenv import load_dotenv
 # Ensure environment variables are loaded before configuration parsing
 load_dotenv()
 
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 # ==========================================
 # 1. 目录结构配置 (Directory Paths)
 # ==========================================
@@ -110,6 +116,32 @@ MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
 # --- 账户资金管理参数 ---
 INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累计收益率
 BASE_RISK_BUDGET = 0.5              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
+
+# --- 实盘安全开关与小账户硬风控 ---
+# 默认永远走 sandbox。只有同时满足：
+#   GATE_TRADING_MODE=live
+#   LIVE_TRADING_ENABLED=I_UNDERSTAND_REAL_MONEY
+# 才会关闭 ccxt sandbox 并允许真实资金下单。
+GATE_TRADING_MODE = os.environ.get("GATE_TRADING_MODE", "sandbox").strip().lower()
+LIVE_TRADING_CONFIRMATION = "I_UNDERSTAND_REAL_MONEY"
+LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "").strip()
+LIVE_TRADING_ARMED = (
+    GATE_TRADING_MODE == "live"
+    and LIVE_TRADING_ENABLED == LIVE_TRADING_CONFIRMATION
+)
+GATE_SANDBOX_MODE = not LIVE_TRADING_ARMED
+
+# 实盘下单前强制逐仓；无法设置/校验时拒绝开新仓。
+GATE_REQUIRE_ISOLATED_MARGIN = _env_bool("GATE_REQUIRE_ISOLATED_MARGIN", True)
+
+# 真实余额硬闸。MAX_MARGIN_PER_TRADE_USDT <= 0 表示 sandbox 可不限制；
+# live 模式下必须配置为正数，否则 OMS 会拒绝开仓。
+MAX_MARGIN_PER_TRADE_USDT = float(os.environ.get("MAX_MARGIN_PER_TRADE_USDT", 0.0))
+MAX_BALANCE_RISK_PCT = float(os.environ.get("MAX_BALANCE_RISK_PCT", 0.20))
+MIN_FREE_USDT_AFTER_ORDER = float(os.environ.get("MIN_FREE_USDT_AFTER_ORDER", 0.0))
+
+# UTC 自然日日内亏损熔断。live 模式下必须配置为正数才允许新开仓。
+DAILY_MAX_LOSS_USDT = float(os.environ.get("DAILY_MAX_LOSS_USDT", 0.0))
 
 # --- 右脑高频熔断参数 ---
 BAILOUT_ATR_MULTI = 3.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发

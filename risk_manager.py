@@ -23,7 +23,8 @@ from quant_config.config import (
     MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE, MACRO_LOGIT_TAIL_SCORE,
     MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA,
     MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
-    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
+    GATE_SANDBOX_MODE
 )
 from dotenv import load_dotenv
 load_dotenv()
@@ -714,7 +715,7 @@ def bailout_worker():
     """右脑主循环：双轨制 (物理高水位状态机 + ATR 主动熔断)"""
     print("🛡️ [右脑] 高频双轨制风控已启动 (追踪止盈 OCO + ATR 主动熔断)...")
     bailout_ex = ccxt.gate({'apiKey': MY_GATE_API_KEY, 'secret': MY_GATE_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
-    bailout_ex.set_sandbox_mode(True)
+    bailout_ex.set_sandbox_mode(GATE_SANDBOX_MODE)
     try:
         bailout_ex.load_markets(True)
         print("🔄 [右脑] Gate 市场静态规则已预加载。")
