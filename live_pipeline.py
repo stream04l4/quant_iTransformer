@@ -37,6 +37,8 @@ GATEWAY_DEGRADED_AFTER = 2
 GATEWAY_ALERT_COOLDOWN = 60.0
 GATEWAY_SESSION = requests.Session()
 gateway_request_state = {}
+LIVE_INFERENCE_SYNC_MINUTE = int(os.environ.get("LIVE_INFERENCE_SYNC_MINUTE", 2))
+LIVE_INFERENCE_LATE_CUTOFF_MINUTE = int(os.environ.get("LIVE_INFERENCE_LATE_CUTOFF_MINUTE", 5))
 
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
@@ -154,6 +156,67 @@ def get_macro_sentiment_info():
         print(f"⚠️ [宏观雷达] 读取情绪详情失败: {e}")
         
     return 0.0, "0"
+
+
+def _is_hourly_inference_window(now_dt=None):
+    """只在整点后的同步窗口内跑新K线推理，避免重启后用半途价格直接发车。"""
+    now_dt = now_dt or datetime.utcnow()
+    minute = int(now_dt.minute)
+    return LIVE_INFERENCE_SYNC_MINUTE <= minute <= LIVE_INFERENCE_LATE_CUTOFF_MINUTE
+
+
+def _extract_closed_hour_anchor(snapshot, latest_closed_ts):
+    """返回最新闭合1h K线的整点价格锚点，即该闭合K线 close。"""
+    try:
+        latest_closed_ts = int(latest_closed_ts)
+        for row in reversed(snapshot.get("ohlcv_1h", []) or []):
+            if int(row[0]) == latest_closed_ts:
+                return float(row[4])
+    except Exception:
+        return None
+    return None
+
+
+def _build_execution_price_guard(signal, current_price, anchor_price, anchor_ts):
+    """
+    延迟推理/宏观突击重估时，下单价必须优于整点锚点：
+    - 做多：当前价 <= 整点价
+    - 做空：当前价 >= 整点价
+    """
+    try:
+        signal = int(signal)
+        current_price = float(current_price)
+        anchor_price = float(anchor_price)
+    except (TypeError, ValueError):
+        return {
+            "allowed": False,
+            "reason": "缺少有效整点价格锚点，拒绝用漂移价格下单",
+            "anchor_price": None,
+            "price_delta_pct": None,
+        }
+
+    if signal == 1:
+        allowed = current_price <= anchor_price
+        direction_text = "做多需当前价不高于整点价"
+    elif signal == -1:
+        allowed = current_price >= anchor_price
+        direction_text = "做空需当前价不低于整点价"
+    else:
+        allowed = True
+        direction_text = "无入场信号"
+
+    delta_pct = (current_price / anchor_price - 1.0) if anchor_price else None
+    return {
+        "allowed": bool(allowed),
+        "reason": (
+            "价格优于整点锚点，允许执行"
+            if allowed else
+            f"价格劣于整点锚点，{direction_text}"
+        ),
+        "anchor_price": anchor_price,
+        "anchor_ts": int(anchor_ts or 0),
+        "price_delta_pct": None if delta_pct is None else float(delta_pct),
+    }
 # ==========================================
 # 2. 特征工程构建器 (严禁补零，严格对齐)
 # ==========================================
@@ -1195,6 +1258,11 @@ def _load_symbol_runtime(symbol, cfg):
         "cached_model_details": [],
         "cached_macro_score": 0.0,
         "last_macro_ts": "0",
+        "inference_anchor_price": None,
+        "inference_anchor_ts": 0,
+        "last_inference_trigger": "",
+        "last_deferred_inference_hour": 0,
+        "last_deferred_inference_log_ts": 0.0,
         "last_signal_evaluated_ts": 0.0,
         "last_trade_hour": 0,
         "latest_closed_ts": 0,
@@ -1223,6 +1291,12 @@ def run_live():
     for symbol, cfg in LIVE_CONFIGS.items():
         runtimes[symbol] = _load_symbol_runtime(symbol, cfg)
     print("✅ 多币种模型与阈值加载成功。")
+
+    startup_macro_score, startup_macro_ts = get_macro_sentiment_info()
+    for rt in runtimes.values():
+        rt["cached_macro_score"] = startup_macro_score
+        rt["last_macro_ts"] = startup_macro_ts
+    print(f"📡 启动宏观锚点已记录: {startup_macro_score:+.2f} (TS: {startup_macro_ts})")
 
     print("⏳ 正在同步交易所账户状态 (资金/仓位/委托)...")
     wait_start = time.time()
@@ -1263,18 +1337,44 @@ def run_live():
 
                 needs_evaluation_log = False
                 trigger_reason = ""
+                inference_price_guard = {
+                    "allowed": True,
+                    "reason": "尚未产生入场信号",
+                    "anchor_price": rt.get("inference_anchor_price"),
+                    "anchor_ts": int(rt.get("inference_anchor_ts", 0) or 0),
+                    "price_delta_pct": None,
+                }
+                current_macro_score, current_macro_ts = get_macro_sentiment_info()
+                macro_ts_changed = current_macro_ts != rt["last_macro_ts"]
 
                 if len(snapshot['ohlcv_1h']) >= 2:
                     latest_closed_ts = snapshot['ohlcv_1h'][-2][0]
                     rt["latest_closed_ts"] = latest_closed_ts
 
                     if latest_closed_ts != rt["last_inferred_hour"]:
-                        current_minute = datetime.utcnow().minute
-                        if current_minute < 2:
-                            if int(current_time) % 30 == 0:
-                                print(f"⏳ [{symbol}] 检测到新K线，等待整点第2分钟同步宏观分 (当前: {current_minute}分)...")
+                        now_utc = datetime.utcnow()
+                        current_minute = now_utc.minute
+                        in_sync_window = _is_hourly_inference_window(now_utc)
+                        allow_macro_refresh_inference = macro_ts_changed and rt["last_inferred_hour"] == 0
+                        if not in_sync_window and not allow_macro_refresh_inference:
+                            should_log_defer = (
+                                latest_closed_ts != rt.get("last_deferred_inference_hour")
+                                or current_time - float(rt.get("last_deferred_inference_log_ts", 0.0) or 0.0) >= 60.0
+                            )
+                            if should_log_defer:
+                                print(
+                                    f"⏳ [{symbol}] 检测到未处理闭合K线，但当前为整点第{current_minute}分钟，"
+                                    f"已跳过半途推理；等待下一次 {LIVE_INFERENCE_SYNC_MINUTE}-{LIVE_INFERENCE_LATE_CUTOFF_MINUTE} 分钟窗口"
+                                    f"或新的宏观刷新。"
+                                )
+                                rt["last_deferred_inference_hour"] = latest_closed_ts
+                                rt["last_deferred_inference_log_ts"] = current_time
                         else:
-                            print(f"\n🔄 [{symbol}] 进入整点第{current_minute}分钟，开始模型推理 (TS: {latest_closed_ts})...")
+                            if allow_macro_refresh_inference and not in_sync_window:
+                                trigger_label = f"宏观刷新触发补算 (TS: {current_macro_ts})"
+                            else:
+                                trigger_label = f"整点同步窗口第{current_minute}分钟"
+                            print(f"\n🔄 [{symbol}] {trigger_label}，开始模型推理 (TS: {latest_closed_ts})...")
                             aux_symbols = rt["aux_symbols"]
                             aux_reference_snap = fetch_gateway_snapshot(_resolve_aux_request_symbol(aux_symbols[0])) if len(aux_symbols) >= 1 else None
                             direct_cross_snap = fetch_gateway_snapshot(_resolve_aux_request_symbol(aux_symbols[1])) if len(aux_symbols) >= 2 else None
@@ -1298,7 +1398,10 @@ def run_live():
 
                             rt["cached_p_down"], rt["cached_p_flat"], rt["cached_p_up"] = probs[0], probs[1], probs[2]
                             rt["cached_model_details"] = model_details
-                            rt["cached_macro_score"], rt["last_macro_ts"] = get_macro_sentiment_info()
+                            rt["cached_macro_score"], rt["last_macro_ts"] = current_macro_score, current_macro_ts
+                            rt["inference_anchor_price"] = _extract_closed_hour_anchor(snapshot, latest_closed_ts)
+                            rt["inference_anchor_ts"] = int(latest_closed_ts)
+                            rt["last_inference_trigger"] = trigger_label
                             _record_solo_model_shadow_decisions(
                                 symbol,
                                 rt,
@@ -1323,16 +1426,15 @@ def run_live():
 
                             rt["last_inferred_hour"] = latest_closed_ts
                             needs_evaluation_log = True
-                            trigger_reason = "新K线闭合推理并联动宏观评分"
+                            trigger_reason = f"新K线闭合推理并联动宏观评分 | {trigger_label}"
 
                 if not needs_evaluation_log and rt["cached_p_up"] + rt["cached_p_down"] > 0:
-                    new_macro_score, new_macro_ts = get_macro_sentiment_info()
-                    if new_macro_ts != rt["last_macro_ts"]:
-                        rt["cached_macro_score"] = new_macro_score
-                        rt["last_macro_ts"] = new_macro_ts
+                    if macro_ts_changed:
+                        rt["cached_macro_score"] = current_macro_score
+                        rt["last_macro_ts"] = current_macro_ts
                         needs_evaluation_log = True
-                        trigger_reason = f"宏观哨兵突击，监测到情报异动 (TS: {new_macro_ts})"
-                        print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 宏观突袭重估: {new_macro_score:+.2f}")
+                        trigger_reason = f"宏观哨兵突击，监测到情报异动 (TS: {current_macro_ts})"
+                        print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] [{symbol}] 宏观突袭重估: {current_macro_score:+.2f}")
 
                 _settle_solo_model_shadow_decisions(symbol, snapshot.get('ohlcv_1h', []))
 
@@ -1341,6 +1443,11 @@ def run_live():
                 cached_p_flat = rt["cached_p_flat"]
                 cached_macro_score = rt["cached_macro_score"]
                 th = rt["thresholds"]
+                signal_cache_stale = (
+                    int(rt.get("last_inferred_hour", 0) or 0) > 0
+                    and int(rt.get("latest_closed_ts", 0) or 0) > 0
+                    and int(rt.get("latest_closed_ts", 0) or 0) != int(rt.get("last_inferred_hour", 0) or 0)
+                )
 
                 adj_up_top1 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_1)
                 adj_up_top5 = apply_logit_fusion(cached_p_up, cached_macro_score, MACRO_ALPHA_TOP_5)
@@ -1405,6 +1512,8 @@ def run_live():
                     actual_signal = 0
                 elif inventory_guard["block_new_orders"]:
                     actual_signal = 0
+                elif signal_cache_stale:
+                    actual_signal = 0
                 elif target_signal != 0:
                     if position_tier_state["side"] == 0:
                         actual_signal = target_signal
@@ -1414,14 +1523,37 @@ def run_live():
                     else:
                         reverse_signal_ignored = True
 
+                price_gate_blocked = False
+                if actual_signal != 0:
+                    inference_price_guard = _build_execution_price_guard(
+                        actual_signal,
+                        current_price,
+                        rt.get("inference_anchor_price"),
+                        rt.get("inference_anchor_ts"),
+                    )
+                    if not inference_price_guard["allowed"]:
+                        price_gate_blocked = True
+                        actual_signal = 0
+
                 if needs_evaluation_log:
                     action_str = "按兵不动"
                     if forced_exit_lock.get("active"):
                         action_str = "强制退出冷却中，等待下一根1h K线闭合后再评估"
                     elif inventory_guard["block_new_orders"]:
                         action_str = "异常库存隔离中，主引擎禁止继续下单"
+                    elif signal_cache_stale:
+                        action_str = "上一轮概率缓存已过期，等待本小时整点同步窗口完成新推理"
                     elif reverse_signal_ignored:
                         action_str = "反向入场信号忽略，交由右脑按原始概率 Top-1 规则评估退出"
+                    elif price_gate_blocked:
+                        anchor_price = inference_price_guard.get("anchor_price")
+                        delta_pct = inference_price_guard.get("price_delta_pct")
+                        anchor_text = "未知" if anchor_price is None else f"{anchor_price:.4f}"
+                        delta_text = "未知" if delta_pct is None else f"{delta_pct:+.2%}"
+                        action_str = (
+                            f"信号通过但价格门禁拦截 | {inference_price_guard['reason']} | "
+                            f"整点锚点: {anchor_text} | 当前偏离: {delta_text}"
+                        )
                     elif actual_signal == 1:
                         action_str = f"触发做多 (Tier-{target_tier}, 杠杆: {dynamic_leverage}x)"
                     elif actual_signal == -1:
@@ -1442,6 +1574,8 @@ def run_live():
                         f"【模型架构】加权Ensemble x{rt['model_count']} | {model_stack_text}\n"
                         f"【原始概率】多:{cached_p_up:.4f} | 平:{cached_p_flat:.4f} | 空:{cached_p_down:.4f}\n"
                         f"【融合概率(入场级Tier1)】多:{adj_up_top10:.4f} | 空:{adj_down_top10:.4f} (宏观分:{cached_macro_score:+.2f})\n"
+                        f"【价格锚点】整点价:{inference_price_guard.get('anchor_price')} | "
+                        f"偏离:{inference_price_guard.get('price_delta_pct')} | {inference_price_guard.get('reason')}\n"
                         f"【引擎决策】{action_str} | 状态机: {position_tier_state} | 来源: {position_state_meta['source']} | "
                         f"仓位同步新鲜: {'是' if position_state_meta['sync_fresh'] else '否'}\n"
                         f"【库存守卫】模式: {inventory_guard['mode']} | 当前杠杆: {inventory_guard['current_leverage']:.2f}x | "
@@ -1508,6 +1642,21 @@ def run_live():
                         "target_tier": int(target_tier),
                         "dynamic_leverage": float(dynamic_leverage) if actual_signal != 0 else 0.0,
                         "last_inferred_hour": int(rt["last_inferred_hour"]),
+                        "signal_cache_stale": bool(signal_cache_stale),
+                        "inference_anchor_ts": int(rt.get("inference_anchor_ts", 0) or 0),
+                        "inference_anchor_price": (
+                            None if rt.get("inference_anchor_price") is None
+                            else float(rt.get("inference_anchor_price"))
+                        ),
+                        "last_inference_trigger": rt.get("last_inference_trigger", ""),
+                        "price_gate": {
+                            "allowed": bool(inference_price_guard.get("allowed", True)),
+                            "reason": inference_price_guard.get("reason", ""),
+                            "anchor_price": inference_price_guard.get("anchor_price"),
+                            "anchor_ts": int(inference_price_guard.get("anchor_ts", 0) or 0),
+                            "price_delta_pct": inference_price_guard.get("price_delta_pct"),
+                            "blocked_signal": bool(price_gate_blocked),
+                        },
                         "last_signal_evaluated_ts": float(rt["last_signal_evaluated_ts"]),
                         "last_trade_hour": int(rt["last_trade_hour"])
                     },
