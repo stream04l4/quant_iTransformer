@@ -18,7 +18,7 @@ from quant_config.config import (
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, HARD_TP, HARD_SL,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1, HEARTBEAT_INTERVAL,
     MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE, MACRO_LOGIT_TAIL_SCORE,
-    MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA,
+    MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA, MACRO_MAX_PROB_SHIFT,
     MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
     INITIAL_CAPITAL, BASE_RISK_BUDGET, BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     EXPERIMENT_ID, TRAIN_DATA_DIR, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
@@ -428,6 +428,7 @@ def apply_logit_fusion(base_prob, macro_score, alpha):
     - 中段对 Tier-1 仅产生小幅概率扰动。
     - 黑天鹅/大波动区间凸性放大，Tier-1 可直接推动信号越线。
     - alpha 仍表示档位权重：Tier-1(top10) 最大，Tier-3(top1) 最小。
+    - 最终概率位移被限制在 0%~5% 区间：|macro_score|=1 时 Tier-1 最多移动 5 个百分点。
     """
     epsilon = 1e-7
     p_safe = np.clip(float(base_prob or 0.0), epsilon, 1.0 - epsilon)
@@ -459,7 +460,9 @@ def apply_logit_fusion(base_prob, macro_score, alpha):
         ) * (x ** MACRO_LOGIT_EXTREME_POWER)
 
     adjusted_logit = logit + (sign * macro_delta * tier_scale)
-    return float(1.0 / (1.0 + np.exp(-adjusted_logit)))
+    adjusted_prob = float(1.0 / (1.0 + np.exp(-adjusted_logit)))
+    max_shift = max(0.0, float(MACRO_MAX_PROB_SHIFT)) * abs_score * tier_scale
+    return float(np.clip(adjusted_prob, p_safe - max_shift, p_safe + max_shift))
 
 # ==========================================
 # 3. 实盘主循环

@@ -98,6 +98,7 @@ MACRO_LOGIT_TAIL_SCORE = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_SCORE", 0.80
 MACRO_LOGIT_MID_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_MID_DELTA", 0.075))
 MACRO_LOGIT_TAIL_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_DELTA", 0.420))
 MACRO_LOGIT_MAX_DELTA = float(os.environ.get("OPT_MACRO_LOGIT_MAX_DELTA", 0.550))
+MACRO_MAX_PROB_SHIFT = float(os.environ.get("OPT_MACRO_MAX_PROB_SHIFT", 0.05))
 MACRO_LOGIT_MID_POWER = float(os.environ.get("OPT_MACRO_LOGIT_MID_POWER", 1.35))
 MACRO_LOGIT_TAIL_POWER = float(os.environ.get("OPT_MACRO_LOGIT_TAIL_POWER", 3.0))
 MACRO_LOGIT_EXTREME_POWER = float(os.environ.get("OPT_MACRO_LOGIT_EXTREME_POWER", 1.5))
@@ -108,7 +109,7 @@ MAX_NOTIONAL_BTC = 100000            # 实盘BTC/ETH最大notional(USDT)
 
 # --- 账户资金管理参数 ---
 INITIAL_CAPITAL = 5000.0            # 账户起始资本(USDT)，用于统计累计收益率
-BASE_RISK_BUDGET = 0.2              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
+BASE_RISK_BUDGET = 0.5              # 单笔风险预算(拨备率)，保证金 = INITIAL_CAPITAL × BASE_RISK_BUDGET
 
 # --- 右脑高频熔断参数 ---
 BAILOUT_ATR_MULTI = 3.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
@@ -125,18 +126,18 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
 # 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
 BTCUSDT_LIVE_MODELS = [
-    {"experiment_id": "EXP_321B10D8", "weight": 0.346},
-    {"experiment_id": "EXP_6ADB71DE", "weight": 0.25},
-    {"experiment_id": "EXP_A49047F0", "weight": 0.24},
-    {"experiment_id": "EXP_AA8D8236", "weight": 0.155},
-    {"experiment_id": "EXP_522EEE76", "weight": 0.002},
-    {"experiment_id": "EXP_809B7D5F", "weight": 0.001},
-    {"experiment_id": "EXP_9797F116", "weight": 0.001},
-    {"experiment_id": "EXP_002574A2", "weight": 0.001},
-    {"experiment_id": "EXP_F0EF9621", "weight": 0.001},
-    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.001},
-    {"experiment_id": "EXP_A4040585", "weight": 0.001},
-    {"experiment_id": "EXP_957E1908", "weight": 0.001},
+    {"experiment_id": "EXP_321B10D8", "weight": 0.280},  # 老模型最强，进攻主力 (28.0%)
+    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.220},  # 当前综合最强新模型 (22.0%)
+    {"experiment_id": "EXP_522EEE76", "weight": 0.200},  # 新模型主力，表现稳定 (20.0%)
+    {"experiment_id": "EXP_A4040585", "weight": 0.150},  # 稳健主力，回撤较低 (15.0%)
+    {"experiment_id": "EXP_F0EF9621", "weight": 0.100},  # 进攻辅助，收益强但回撤偏大 (10.0%)
+    {"experiment_id": "EXP_809B7D5F", "weight": 0.010},  # 候选观察 (1.0%)
+    {"experiment_id": "EXP_9797F116", "weight": 0.010},  # 候选观察 (1.0%)
+    {"experiment_id": "EXP_957E1908", "weight": 0.008},  # 候选观察 (0.8%)
+    {"experiment_id": "EXP_002574A2", "weight": 0.005},  # 低权重观察 (0.5%)
+    {"experiment_id": "EXP_A49047F0", "weight": 0.005},  # 旧模型降级观察 (0.5%)
+    {"experiment_id": "EXP_6ADB71DE", "weight": 0.005},  # 旧核心降级观察，主要因低频和近期弱 (0.5%)
+    {"experiment_id": "EXP_AA8D8236", "weight": 0.005},  # 旧模型降级观察 (0.5%)
 ]
 
 LIVE_SYMBOL_CONFIGS = {

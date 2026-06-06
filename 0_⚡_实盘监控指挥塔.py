@@ -72,6 +72,10 @@ def _normalize_model_specs(cfg):
             "name": str(model_cfg.get("name", exp_id)),
             "experiment_id": exp_id,
             "weight": weight,
+            "cohort_month": model_cfg.get("cohort_month"),
+            "role": model_cfg.get("role"),
+            "live_since": model_cfg.get("live_since", model_cfg.get("shadow_since")),
+            "created_at": model_cfg.get("created_at"),
         })
 
     if not normalized:
@@ -161,6 +165,58 @@ for _sym, _cfg in LIVE_CONFIGS.items():
     _th, _meta = _load_weighted_thresholds(_cfg.get("models", []))
     THRESHOLDS_BY_SYMBOL[_sym] = _th
     THRESHOLD_SOURCE_BY_SYMBOL[_sym] = _meta
+
+
+def _safe_timestamp(value):
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    try:
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_convert(None)
+    except Exception:
+        pass
+    return ts
+
+
+def _month_label_from_ts(value):
+    ts = _safe_timestamp(value)
+    return ts.strftime("%Y-%m") if not pd.isna(ts) else ""
+
+
+def _model_file_mtime(symbol, exp_id):
+    model_file = os.path.join(MODEL_DIR, f"itransformer_{_normalize_symbol_key(symbol)}_best_{exp_id}.pth")
+    if not os.path.exists(model_file):
+        return pd.NaT
+    return pd.to_datetime(os.path.getmtime(model_file), unit="s")
+
+
+def _infer_shadow_role(weight, configured_role=None, in_current_stack=True):
+    role = str(configured_role or "").strip().lower()
+    if role in {"main", "candidate", "observe", "retired"}:
+        return role
+    if not in_current_stack:
+        return "retired"
+    if weight >= 0.05:
+        return "main"
+    if weight >= 0.01:
+        return "candidate"
+    return "observe"
+
+
+def _format_pct_or_wait(value, signed=False):
+    if pd.isna(value):
+        return "待结算"
+    sign = "+" if signed else ""
+    return f"{float(value):{sign}.2%}"
+
+
+def _format_factor(value):
+    if pd.isna(value):
+        return "待结算"
+    if np.isinf(value):
+        return "∞"
+    return f"{float(value):.2f}"
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -414,26 +470,46 @@ def resolve_current_serving_model(symbol):
     curr_m_data_version = current_inf_version
     curr_m_name = "未命名"
     curr_m_created_at = pd.NaT
-    model_stack = [
-        {
-            "experiment_id": m.get("experiment_id", "unknown"),
-            "weight": float(m.get("normalized_weight", m.get("weight", 1.0))),
-        }
-        for m in model_specs
-    ]
-
+    registry_data = {}
     registry_file = os.path.join(MODEL_DIR, "model_registry.json")
     if os.path.exists(registry_file):
         try:
             with open(registry_file, "r", encoding="utf-8") as f:
-                reg_data = json.load(f)
-            reg_item = reg_data.get(primary_exp_id, {})
-            if reg_item:
-                curr_m_data_version = reg_item.get('data_version', curr_m_data_version) or curr_m_data_version
-                curr_m_name = reg_item.get('name', curr_m_name) or curr_m_name
-                curr_m_created_at = pd.to_datetime(reg_item.get('created_at'), errors='coerce')
+                registry_data = json.load(f)
         except Exception:
-            pass
+            registry_data = {}
+
+    model_stack = []
+    for m in model_specs:
+        exp_id = str(m.get("experiment_id", "unknown"))
+        weight = float(m.get("normalized_weight", m.get("weight", 1.0)))
+        reg_item = registry_data.get(exp_id, {}) if isinstance(registry_data, dict) else {}
+        created_at = (
+            _safe_timestamp(m.get("created_at"))
+            if m.get("created_at") is not None
+            else _safe_timestamp(reg_item.get("created_at"))
+        )
+        if pd.isna(created_at):
+            created_at = _model_file_mtime(sym_key, exp_id)
+        live_since = _safe_timestamp(m.get("live_since"))
+        cohort_month = str(m.get("cohort_month") or reg_item.get("cohort_month") or "").strip()
+        if not cohort_month:
+            cohort_month = _month_label_from_ts(created_at)
+        model_stack.append({
+            "name": m.get("name", exp_id),
+            "experiment_id": exp_id,
+            "weight": weight,
+            "cohort_month": cohort_month,
+            "role": _infer_shadow_role(weight, m.get("role"), in_current_stack=True),
+            "live_since": live_since,
+            "created_at": created_at,
+        })
+
+    reg_item = registry_data.get(primary_exp_id, {}) if isinstance(registry_data, dict) else {}
+    if reg_item:
+        curr_m_data_version = reg_item.get('data_version', curr_m_data_version) or curr_m_data_version
+        curr_m_name = reg_item.get('name', curr_m_name) or curr_m_name
+        curr_m_created_at = _safe_timestamp(reg_item.get('created_at'))
 
     model_file = os.path.join(MODEL_DIR, f"itransformer_{symbol}_best_{primary_exp_id}.pth")
     if os.path.exists(model_file):
@@ -523,12 +599,36 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
         return pd.DataFrame()
 
     rows = []
-    weight_by_exp = {
-        str(m.get("experiment_id", "")): float(m.get("weight", 0.0) or 0.0)
-        for m in model_stack
-    }
+    model_meta_by_exp = {str(m.get("experiment_id", "")): m for m in model_stack}
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
 
     for exp_id, g in audit_df.groupby("experiment_id"):
+        exp_id = str(exp_id)
+        configured_meta = model_meta_by_exp.get(exp_id, {})
+        in_current_stack = exp_id in model_meta_by_exp
+        live_weight = float(
+            configured_meta.get(
+                "weight",
+                float(g["live_weight"].iloc[0]) if "live_weight" in g and len(g) else 0.0,
+            )
+            or 0.0
+        )
+
+        decision_time = pd.to_datetime(g.get("decision_ts", pd.Series(dtype=float)), unit="ms", errors="coerce")
+        first_shadow_ts = decision_time.min() if not decision_time.empty else pd.NaT
+        model_started_at = configured_meta.get("live_since", pd.NaT)
+        if pd.isna(model_started_at):
+            model_started_at = first_shadow_ts
+        if pd.isna(model_started_at):
+            model_started_at = configured_meta.get("created_at", pd.NaT)
+        model_age_days = int(max(0, (now_ts - model_started_at).days)) if not pd.isna(model_started_at) else np.nan
+
+        cohort_month = str(configured_meta.get("cohort_month") or "").strip()
+        if not cohort_month:
+            cohort_month = _month_label_from_ts(configured_meta.get("created_at", pd.NaT))
+        if not cohort_month:
+            cohort_month = _month_label_from_ts(first_shadow_ts)
+
         settled = g[pd.to_numeric(g.get("settled", 0), errors="coerce").fillna(0).astype(int) == 1].copy()
         adj_trades = g[pd.to_numeric(g.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0]
         settled_adj = settled[pd.to_numeric(settled.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0].copy()
@@ -538,11 +638,32 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
         raw_pnl = pd.to_numeric(settled_raw.get("raw_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
         settled_adj_chrono = settled_adj.sort_values("decision_ts")
         settled_raw_chrono = settled_raw.sort_values("decision_ts")
+        recent_adj_chrono = settled_adj_chrono.tail(20)
+        recent_adj_pnl = pd.to_numeric(recent_adj_chrono.get("adj_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        long_pnl = pd.to_numeric(
+            settled_adj[pd.to_numeric(settled_adj.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) == 1].get("adj_pnl", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        short_pnl = pd.to_numeric(
+            settled_adj[pd.to_numeric(settled_adj.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) == -1].get("adj_pnl", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        gross_profit = float(adj_pnl[adj_pnl > 0].sum()) if len(adj_pnl) else 0.0
+        gross_loss = float(adj_pnl[adj_pnl < 0].sum()) if len(adj_pnl) else 0.0
+        if gross_loss < 0:
+            profit_factor = gross_profit / abs(gross_loss)
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = np.nan
         last = g.sort_values("decision_ts").iloc[-1]
 
         rows.append({
             "experiment_id": exp_id,
-            "live_weight": weight_by_exp.get(str(exp_id), float(g["live_weight"].iloc[0]) if "live_weight" in g else 0.0),
+            "cohort_month": cohort_month or "unknown",
+            "model_age_days": model_age_days,
+            "role": _infer_shadow_role(live_weight, configured_meta.get("role"), in_current_stack=in_current_stack),
+            "live_weight": live_weight,
             "inference_count": len(g),
             "shadow_trade_count": len(adj_trades),
             "settled_trade_count": len(adj_pnl),
@@ -551,6 +672,15 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
             "avg_pnl": float(adj_pnl.mean()) if len(adj_pnl) else np.nan,
             "total_pnl": float(adj_pnl.sum()) if len(adj_pnl) else 0.0,
             "max_drawdown": _calc_shadow_max_drawdown(settled_adj_chrono.get("adj_pnl", pd.Series(dtype=float))),
+            "roe_20t": float(recent_adj_pnl.sum()) if len(recent_adj_pnl) else np.nan,
+            "win_rate_20t": float((recent_adj_pnl > 0).mean()) if len(recent_adj_pnl) else np.nan,
+            "max_dd_20t": _calc_shadow_max_drawdown(recent_adj_chrono.get("adj_pnl", pd.Series(dtype=float))),
+            "profit_factor_live": profit_factor,
+            "expectancy_live": float(adj_pnl.mean()) if len(adj_pnl) else np.nan,
+            "signal_rate": float(len(adj_trades) / len(g)) if len(g) else np.nan,
+            "long_win_rate": float((long_pnl > 0).mean()) if len(long_pnl) else np.nan,
+            "short_win_rate": float((short_pnl > 0).mean()) if len(short_pnl) else np.nan,
+            "macro_net_contribution": float(adj_pnl.sum() - raw_pnl.sum()) if len(adj_pnl) or len(raw_pnl) else np.nan,
             "raw_win_rate": float((raw_pnl > 0).mean()) if len(raw_pnl) else np.nan,
             "raw_total_pnl": float(raw_pnl.sum()) if len(raw_pnl) else 0.0,
             "raw_max_drawdown": _calc_shadow_max_drawdown(settled_raw_chrono.get("raw_pnl", pd.Series(dtype=float))),
@@ -1307,6 +1437,15 @@ with dash_tab4:
             display_shadow["累计影子ROE"] = display_shadow["total_pnl"].apply(lambda x: f"{x:+.2%}")
             display_shadow["平均单次ROE"] = display_shadow["avg_pnl"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:+.2%}")
             display_shadow["最大回撤"] = display_shadow["max_drawdown"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.2%}")
+            display_shadow["近20笔ROE"] = display_shadow["roe_20t"].apply(lambda x: _format_pct_or_wait(x, signed=True))
+            display_shadow["近20笔胜率"] = display_shadow["win_rate_20t"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["近20笔回撤"] = display_shadow["max_dd_20t"].apply(lambda x: _format_pct_or_wait(x))
+            display_shadow["实盘PF"] = display_shadow["profit_factor_live"].apply(_format_factor)
+            display_shadow["单笔期望"] = display_shadow["expectancy_live"].apply(lambda x: _format_pct_or_wait(x, signed=True))
+            display_shadow["发车率"] = display_shadow["signal_rate"].apply(lambda x: "无推理" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["多单胜率"] = display_shadow["long_win_rate"].apply(lambda x: "无多单" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["空单胜率"] = display_shadow["short_win_rate"].apply(lambda x: "无空单" if pd.isna(x) else f"{x:.1%}")
+            display_shadow["宏观净贡献"] = display_shadow["macro_net_contribution"].apply(lambda x: _format_pct_or_wait(x, signed=True))
             display_shadow["未加宏观胜率"] = display_shadow["raw_win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
             display_shadow["未加宏观累计"] = display_shadow["raw_total_pnl"].apply(lambda x: f"{x:+.2%}")
             display_shadow["未加宏观回撤"] = display_shadow["raw_max_drawdown"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.2%}")
@@ -1320,15 +1459,22 @@ with dash_tab4:
             )
             st.dataframe(
                 display_shadow[[
-                    "experiment_id", "Live权重", "inference_count", "shadow_trade_count",
+                    "experiment_id", "cohort_month", "model_age_days", "role",
+                    "Live权重", "inference_count", "shadow_trade_count",
                     "settled_trade_count", "pending_trade_count", "影子胜率",
-                    "累计影子ROE", "平均单次ROE", "最大回撤", "未加宏观胜率", "未加宏观累计", "未加宏观回撤",
+                    "累计影子ROE", "平均单次ROE", "最大回撤",
+                    "近20笔ROE", "近20笔胜率", "近20笔回撤",
+                    "实盘PF", "单笔期望", "发车率", "多单胜率", "空单胜率", "宏观净贡献",
+                    "未加宏观胜率", "未加宏观累计", "未加宏观回撤",
                     "long_count", "short_count", "最近信号", "last_tier", "最近概率"
                 ]],
                 hide_index=True,
                 width='stretch',
                 column_config={
                     "experiment_id": "模型",
+                    "cohort_month": "训练批次",
+                    "model_age_days": "实盘天数",
+                    "role": "层级",
                     "inference_count": "推理数",
                     "shadow_trade_count": "影子发车",
                     "settled_trade_count": "已结算",
