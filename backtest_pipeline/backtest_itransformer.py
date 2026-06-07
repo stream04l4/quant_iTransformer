@@ -456,9 +456,11 @@ def run_backtest(args=None):
                 physical_sl_phys = -abs(HARD_SL)
                 atr_sl_phys = None
 
-            # 💡 情景 B: 任意同向信号都会刷新持仓计时；更高 Tier 额外补仓。
+            # 💡 情景 B: 同 Tier 信号才刷新持仓计时；更高 Tier 额外补仓并重置计时。
+            # 低 Tier 信号代表概率走弱，不能给高 Tier 持仓续命。
             elif current_pos == target_pos:
-                hold_timer_mins = HOLD_PERIOD * 60
+                if target_tier == current_tier or target_tier > current_tier:
+                    hold_timer_mins = HOLD_PERIOD * 60
 
                 if target_tier > current_tier:
                     # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓

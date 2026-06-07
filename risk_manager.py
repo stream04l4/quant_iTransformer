@@ -371,22 +371,26 @@ def _apply_logit_fusion(base_prob, macro_score, alpha):
     return 1.0 / (1.0 + math.exp(-adjusted_logit))
 
 
-def _resolve_target_signal_from_status(live_status, thresholds, base_sym):
+def _resolve_target_signal_tier_from_status(live_status, thresholds, base_sym):
     """
-    优先读取主引擎已经算出的 target_signal；旧状态文件缺字段时再复算。
+    优先读取主引擎已经算出的 target_signal/target_tier；旧状态文件缺字段时再复算。
     这里返回 target_signal，而不是 actual_signal，因为同向仓位下被 OMS 放弃的信号
     仍然应该刷新 12 小时持仓计时。
     """
     if _normalize_symbol_key(live_status.get("symbol")) != base_sym:
-        return 0
+        return 0, 0
 
     execution_state = live_status.get("execution_state", {}) or {}
     try:
         target_signal = int(execution_state.get("target_signal", 0) or 0)
     except (TypeError, ValueError):
         target_signal = 0
-    if target_signal in (-1, 1):
-        return target_signal
+    try:
+        target_tier = int(execution_state.get("target_tier", 0) or 0)
+    except (TypeError, ValueError):
+        target_tier = 0
+    if target_signal in (-1, 1) and target_tier in (1, 2, 3):
+        return target_signal, target_tier
 
     inference_data = live_status.get("model_inference", {}) or {}
     raw_p_up = float(inference_data.get("raw_prob_up", 0.0) or 0.0)
@@ -403,24 +407,41 @@ def _resolve_target_signal_from_status(live_status, thresholds, base_sym):
     adj_down_top10 = _apply_logit_fusion(raw_p_down, -macro_score, MACRO_ALPHA_TOP_10)
 
     if adj_up_top1 > thresholds.get('up_top_1', 1.0):
-        return 1
+        return 1, 3
     if adj_up_top5 > thresholds.get('up_top_5', 1.0):
-        return 1
+        return 1, 2
     if adj_up_top10 > thresholds.get('up_top_10', 1.0):
-        return 1
+        return 1, 1
     if adj_down_top1 > thresholds.get('down_top_1', 1.0):
-        return -1
+        return -1, 3
     if adj_down_top5 > thresholds.get('down_top_5', 1.0):
-        return -1
+        return -1, 2
     if adj_down_top10 > thresholds.get('down_top_10', 1.0):
-        return -1
-    return 0
+        return -1, 1
+    return 0, 0
+
+
+def _resolve_current_position_tier_from_status(live_status, current_side):
+    position_tier_state = live_status.get("position_tier_state", {}) or {}
+    try:
+        state_side = int(position_tier_state.get("side", 0) or 0)
+    except (TypeError, ValueError):
+        state_side = 0
+    try:
+        current_tier = int(position_tier_state.get("highest_tier", 0) or 0)
+    except (TypeError, ValueError):
+        current_tier = 0
+
+    if state_side != current_side:
+        return 0
+    return current_tier if current_tier in (1, 2, 3) else 0
 
 
 def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_status, thresholds):
     """
-    若最新信号评估出现与当前仓位同向的 target_signal，即使 OMS 因已有仓位未再次下单，
+    若最新信号评估出现与当前仓位同向且同 Tier 的 target_signal，即使 OMS 因已有仓位未再次下单，
     也把 entry_time 锚点刷新到信号触发时刻，避免 HOLD_PERIOD 仍从最初建仓时刻累计。
+    低 Tier 信号代表概率走弱，不能给高 Tier 持仓续命。
     """
     execution_state = live_status.get("execution_state", {}) or {}
     signal_refresh_ts = _safe_parse_epoch(execution_state.get("last_signal_evaluated_ts"))
@@ -429,9 +450,13 @@ def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_s
     if signal_refresh_ts is None:
         return
 
-    target_signal = _resolve_target_signal_from_status(live_status, thresholds, base_sym)
+    target_signal, target_tier = _resolve_target_signal_tier_from_status(live_status, thresholds, base_sym)
     current_side = 1 if str(pos_side).upper() == "LONG" else -1
     if target_signal != current_side:
+        return
+
+    current_tier = _resolve_current_position_tier_from_status(live_status, current_side)
+    if target_tier != current_tier:
         return
 
     last_refresh_ts = float(mem.get('last_same_signal_refresh_ts', 0.0) or 0.0)
@@ -443,7 +468,7 @@ def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_s
     mem['entry_time'] = signal_refresh_ts
     mem['last_same_signal_refresh_ts'] = signal_refresh_ts
     print(
-        f"🕒 [{base_sym}] 侦测到同向信号延续，持仓计时已刷新至 "
+        f"🕒 [{base_sym}] 侦测到同向同Tier-{current_tier}信号延续，持仓计时已刷新至 "
         f"{datetime.fromtimestamp(signal_refresh_ts).strftime('%Y-%m-%d %H:%M:%S')}。"
     )
 
