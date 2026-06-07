@@ -630,12 +630,22 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
             cohort_month = _month_label_from_ts(first_shadow_ts)
 
         settled = g[pd.to_numeric(g.get("settled", 0), errors="coerce").fillna(0).astype(int) == 1].copy()
-        adj_trades = g[pd.to_numeric(g.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0]
-        settled_adj = settled[pd.to_numeric(settled.get("adj_signal", 0), errors="coerce").fillna(0).astype(int) != 0].copy()
-        settled_raw = settled[pd.to_numeric(settled.get("raw_signal", 0), errors="coerce").fillna(0).astype(int) != 0].copy()
+        raw_signal = pd.to_numeric(g.get("raw_signal", pd.Series(0, index=g.index)), errors="coerce").fillna(0).astype(int)
+        adj_signal = pd.to_numeric(g.get("adj_signal", pd.Series(0, index=g.index)), errors="coerce").fillna(0).astype(int)
+        settled_raw_signal = pd.to_numeric(settled.get("raw_signal", pd.Series(0, index=settled.index)), errors="coerce").fillna(0).astype(int)
+        settled_adj_signal = pd.to_numeric(settled.get("adj_signal", pd.Series(0, index=settled.index)), errors="coerce").fillna(0).astype(int)
+
+        adj_trades = g[adj_signal != 0]
+        macro_boosted_trades = g[(raw_signal == 0) & (adj_signal != 0)]
+        settled_adj = settled[settled_adj_signal != 0].copy()
+        settled_raw = settled[settled_raw_signal != 0].copy()
+        settled_macro_boosted = settled[(settled_raw_signal == 0) & (settled_adj_signal != 0)].copy()
+        settled_macro_blocked = settled[(settled_raw_signal != 0) & (settled_adj_signal == 0)].copy()
 
         adj_pnl = pd.to_numeric(settled_adj.get("adj_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
         raw_pnl = pd.to_numeric(settled_raw.get("raw_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        macro_boosted_pnl = pd.to_numeric(settled_macro_boosted.get("adj_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
+        macro_blocked_pnl = pd.to_numeric(settled_macro_blocked.get("raw_pnl", pd.Series(dtype=float)), errors="coerce").dropna()
         settled_adj_chrono = settled_adj.sort_values("decision_ts")
         settled_raw_chrono = settled_raw.sort_values("decision_ts")
         recent_adj_chrono = settled_adj_chrono.tail(20)
@@ -681,6 +691,9 @@ def summarize_live_shadow_model_audit(audit_df, model_stack):
             "long_win_rate": float((long_pnl > 0).mean()) if len(long_pnl) else np.nan,
             "short_win_rate": float((short_pnl > 0).mean()) if len(short_pnl) else np.nan,
             "macro_net_contribution": float(adj_pnl.sum() - raw_pnl.sum()) if len(adj_pnl) or len(raw_pnl) else np.nan,
+            "macro_boosted_trade_count": len(macro_boosted_trades),
+            "macro_boosted_roe": float(macro_boosted_pnl.sum()) if len(macro_boosted_pnl) else 0.0,
+            "macro_blocked_roe": float(macro_blocked_pnl.sum()) if len(macro_blocked_pnl) else 0.0,
             "raw_win_rate": float((raw_pnl > 0).mean()) if len(raw_pnl) else np.nan,
             "raw_total_pnl": float(raw_pnl.sum()) if len(raw_pnl) else 0.0,
             "raw_max_drawdown": _calc_shadow_max_drawdown(settled_raw_chrono.get("raw_pnl", pd.Series(dtype=float))),
@@ -1446,6 +1459,9 @@ with dash_tab4:
             display_shadow["多单胜率"] = display_shadow["long_win_rate"].apply(lambda x: "无多单" if pd.isna(x) else f"{x:.1%}")
             display_shadow["空单胜率"] = display_shadow["short_win_rate"].apply(lambda x: "无空单" if pd.isna(x) else f"{x:.1%}")
             display_shadow["宏观净贡献"] = display_shadow["macro_net_contribution"].apply(lambda x: _format_pct_or_wait(x, signed=True))
+            display_shadow["宏观增强发车"] = display_shadow["macro_boosted_trade_count"].astype(int)
+            display_shadow["宏观增强ROE"] = display_shadow["macro_boosted_roe"].apply(lambda x: _format_pct_or_wait(x, signed=True))
+            display_shadow["宏观拦截ROE"] = display_shadow["macro_blocked_roe"].apply(lambda x: _format_pct_or_wait(x, signed=True))
             display_shadow["未加宏观胜率"] = display_shadow["raw_win_rate"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.1%}")
             display_shadow["未加宏观累计"] = display_shadow["raw_total_pnl"].apply(lambda x: f"{x:+.2%}")
             display_shadow["未加宏观回撤"] = display_shadow["raw_max_drawdown"].apply(lambda x: "待结算" if pd.isna(x) else f"{x:.2%}")
@@ -1464,7 +1480,8 @@ with dash_tab4:
                     "settled_trade_count", "pending_trade_count", "影子胜率",
                     "累计影子ROE", "平均单次ROE", "最大回撤",
                     "近20笔ROE", "近20笔胜率", "近20笔回撤",
-                    "实盘PF", "单笔期望", "发车率", "多单胜率", "空单胜率", "宏观净贡献",
+                    "实盘PF", "单笔期望", "发车率", "多单胜率", "空单胜率",
+                    "宏观净贡献", "宏观增强发车", "宏观增强ROE", "宏观拦截ROE",
                     "未加宏观胜率", "未加宏观累计", "未加宏观回撤",
                     "long_count", "short_count", "最近信号", "last_tier", "最近概率"
                 ]],
@@ -1490,12 +1507,23 @@ with dash_tab4:
                 if not recent_shadow.empty:
                     recent_shadow["decision_time"] = pd.to_datetime(recent_shadow["decision_ts"], unit="ms", errors="coerce")
                     recent_shadow["方向"] = recent_shadow["adj_signal"].map({1: "多", -1: "空", 0: "无"})
+                    raw_signal = pd.to_numeric(recent_shadow.get("raw_signal", pd.Series(0, index=recent_shadow.index)), errors="coerce").fillna(0).astype(int)
+                    adj_signal = pd.to_numeric(recent_shadow.get("adj_signal", pd.Series(0, index=recent_shadow.index)), errors="coerce").fillna(0).astype(int)
+                    recent_shadow["宏观动作"] = np.select(
+                        [
+                            (raw_signal == 0) & (adj_signal != 0),
+                            (raw_signal != 0) & (adj_signal == 0),
+                            raw_signal != adj_signal,
+                        ],
+                        ["增强触发", "拦截", "改向/改档"],
+                        default="无变化",
+                    )
                     recent_shadow["影子ROE"] = pd.to_numeric(recent_shadow["adj_pnl"], errors="coerce").apply(
                         lambda x: "待结算" if pd.isna(x) else f"{x:+.2%}"
                     )
                     st.dataframe(
                         recent_shadow[[
-                            "decision_time", "experiment_id", "方向", "adj_tier",
+                            "decision_time", "experiment_id", "宏观动作", "方向", "adj_tier",
                             "p_up", "p_down", "entry_price", "settle_price", "影子ROE"
                         ]],
                         hide_index=True,
