@@ -1583,7 +1583,7 @@ def run_live():
                     elif inventory_guard["block_new_orders"]:
                         action_str = "异常库存隔离中，主引擎禁止继续下单"
                     elif reverse_signal_ignored:
-                        action_str = "反向入场信号忽略，交由右脑按原始概率 Top-1 规则评估退出"
+                        action_str = "反向入场信号忽略，交由右脑按反向 Tier1 信号评估退出或紧逼追踪"
                     elif price_gate_blocked:
                         anchor_price = inference_price_guard.get("anchor_price")
                         delta_pct = inference_price_guard.get("price_delta_pct")

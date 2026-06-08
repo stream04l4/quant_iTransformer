@@ -946,12 +946,23 @@ def bailout_worker():
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
                     hold_hours = (time.time() - mem['entry_time']) / 3600.0
 
-                    # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
-                    # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
+                    target_signal, target_tier = _resolve_target_signal_tier_from_status(
+                        symbol_status,
+                        th,
+                        base_sym,
+                    )
+
+                    # 反转优先采用主引擎已经形成的 target_signal，确保宏观融合后
+                    # 达到入场级 Tier1 的反向信号也能触发 tight 追踪；原始概率 Top-10 作为兜底。
                     is_reversal = False
+                    current_side = 1 if pos_side == 'LONG' else -1
+                    if target_signal == -current_side:
+                        is_reversal = True
                     if pos_side == 'LONG' and raw_p_down > th.get('down_top_10', 1.0): is_reversal = True
                     if pos_side == 'SHORT' and raw_p_up > th.get('up_top_10', 1.0): is_reversal = True
                     is_favorable_signal = False
+                    if target_signal == current_side:
+                        is_favorable_signal = True
                     if pos_side == 'LONG' and raw_p_up > th.get('up_top_10', 1.0): is_favorable_signal = True
                     if pos_side == 'SHORT' and raw_p_down > th.get('down_top_10', 1.0): is_favorable_signal = True
 
