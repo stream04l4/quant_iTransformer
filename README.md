@@ -140,6 +140,7 @@ Streamlit 监控面板
 
 - `execution_oms.py` 遇到反向下单请求时不直接反手，只记录提示并交给 `risk_manager.py` 判断是否平仓或进入 `tight`。
 - `risk_manager.py` 优先使用 `live_pipeline.py` 写入状态文件的 `target_signal` 判断出场反转，因此宏观融合后形成的反向 Tier1 信号也会触发 tight；原始概率 Top-10 仅作为旧状态文件兜底。
+- `risk_manager.py` 会把 `trailing_mode / physical_sl_phys / atr_sl_phys / max_phys_pnl` 持续导出到 `data/live/chandelier_state.json`；进程重启且仓位仍存在时，会从该文件恢复 `tight` 或 `hard_tp` 追踪状态，并延迟清理空仓状态文件以规避启动期仓位快照抖动。
 - 交易所物理止损单采用“先挂新单、确认可查询、再撤旧单”的顺序，避免裸奔窗口。
 - 若交易所快照显示止损缺失、覆盖不足、无法解析或重复，右脑会按当前物理防线补挂或收敛。
 - Streamlit 活跃持仓会显示 `宽松ATR追踪` 或 `紧逼棘轮追踪`，实时警报会记录主动出场、被动出场、棘轮调整和紧逼追踪取消。

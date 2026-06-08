@@ -160,18 +160,18 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
 # 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
 BTCUSDT_LIVE_MODELS = [
-    {"experiment_id": "EXP_321B10D8", "weight": 0.250},  # 老模型最强，进攻主力 (25.0%)
-    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.210},  # 当前综合最强新模型 (21.0%)
-    {"experiment_id": "EXP_522EEE76", "weight": 0.200},  # 新模型主力，表现稳定 (20.0%)
-    {"experiment_id": "EXP_A4040585", "weight": 0.160},  # 稳健主力，回撤较低 (16.0%)
-    {"experiment_id": "EXP_F0EF9621", "weight": 0.080},  # 进攻辅助，收益强但回撤偏大 (8.0%)
-    {"experiment_id": "EXP_809B7D5F", "weight": 0.030},  # 候选观察 (3.0%)
-    {"experiment_id": "EXP_9797F116", "weight": 0.025},  # 候选观察 (2.5%)
-    {"experiment_id": "EXP_957E1908", "weight": 0.015},  # 候选观察 (1.5%)
-    {"experiment_id": "EXP_002574A2", "weight": 0.010},  # 低权重观察 (1.0%)
-    {"experiment_id": "EXP_A49047F0", "weight": 0.007},  # 旧模型降级观察 (0.7%)
-    {"experiment_id": "EXP_6ADB71DE", "weight": 0.007},  # 旧核心降级观察，主要因低频和近期弱 (0.7%)
-    {"experiment_id": "EXP_AA8D8236", "weight": 0.006},  # 旧模型降级观察 (0.6%)
+    {"experiment_id": "EXP_F0EF9621", "weight": 0.180},  # 进攻辅助，收益强但回撤偏大 (18.0%)
+    {"experiment_id": "EXP_321B10D8", "weight": 0.220},  # 老模型最强，进攻主力 (22.0%)
+    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.170},  # 当前综合最强新模型 (17.0%)
+    {"experiment_id": "EXP_522EEE76", "weight": 0.160},  # 新模型主力，表现稳定 (16.0%)
+    {"experiment_id": "EXP_809B7D5F", "weight": 0.120},  # 候选观察 (12.0%)
+    {"experiment_id": "EXP_A4040585", "weight": 0.090},  # 稳健主力，回撤较低 (9.0%)
+    {"experiment_id": "EXP_957E1908", "weight": 0.020},  # 候选观察 (2.0%)
+    {"experiment_id": "EXP_002574A2", "weight": 0.020},  # 低权重观察 (2.0%)
+    {"experiment_id": "EXP_9797F116", "weight": 0.010},  # 候选观察 (1.0%)
+    {"experiment_id": "EXP_A49047F0", "weight": 0.003},  # 旧模型降级观察 (0.3%)
+    {"experiment_id": "EXP_6ADB71DE", "weight": 0.003},  # 旧核心降级观察，主要因低频和近期弱 (0.3%)
+    {"experiment_id": "EXP_AA8D8236", "weight": 0.004},  # 旧模型降级观察 (0.4%)
 ]
 
 LIVE_SYMBOL_CONFIGS = {

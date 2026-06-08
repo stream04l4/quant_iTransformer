@@ -86,6 +86,31 @@ def _stop_price_from_phys(entry_px, pos_side, stop_phys):
     return entry_px * (1 + stop_phys) if pos_side == 'LONG' else entry_px * (1 - stop_phys)
 
 
+def _load_persisted_tracking_state(base_sym):
+    """从右脑 UI 状态文件恢复追踪状态，保证进程重启后 tight/hard_tp 不丢失。"""
+    state_path = os.path.join(LIVE_DATA_DIR, "chandelier_state.json")
+    if not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        state_payload = payload.get(base_sym, {}) if isinstance(payload, dict) else {}
+        return state_payload if isinstance(state_payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _phys_from_stop_price(entry_px, pos_side, stop_px):
+    try:
+        entry_px = float(entry_px)
+        stop_px = float(stop_px)
+    except (TypeError, ValueError):
+        return None
+    if entry_px <= 0 or stop_px <= 0:
+        return None
+    return (stop_px - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - stop_px) / entry_px
+
+
 def _normalize_model_specs(cfg):
     raw_models = cfg.get("models")
     if not raw_models:
@@ -779,6 +804,7 @@ def bailout_worker():
     tracking_mem = {}
     bailout_cooldown_locks = {}
     last_worker_error_ts = 0.0
+    no_position_seen_since = 0.0
 
     thresholds_by_symbol = _load_thresholds_by_symbol()
 
@@ -788,13 +814,19 @@ def bailout_worker():
                 current_positions = list(state.active_pos_map.values())
 
             if not current_positions:
-                tracking_mem.clear()
-                # 清理 UI 显示文件
-                if os.path.exists(os.path.join(LIVE_DATA_DIR, "chandelier_state.json")):
-                    try: os.remove(os.path.join(LIVE_DATA_DIR, "chandelier_state.json"))
-                    except: pass
+                now_ts = time.time()
+                if no_position_seen_since <= 0:
+                    no_position_seen_since = now_ts
+                # 启动/供货线程抖动时 active_pos_map 可能短暂为空；延迟清理，避免重启前的 tight 状态被抢先删掉。
+                if now_ts - no_position_seen_since >= max(10.0, RIGHT_BRAIN_SNAPSHOT_TIMEOUT * 3):
+                    tracking_mem.clear()
+                    # 清理 UI 显示文件
+                    if os.path.exists(os.path.join(LIVE_DATA_DIR, "chandelier_state.json")):
+                        try: os.remove(os.path.join(LIVE_DATA_DIR, "chandelier_state.json"))
+                        except: pass
                 time.sleep(1)
                 continue
+            no_position_seen_since = 0.0
 
             # 读取最新 AI 概率与前端硬参数
             live_status = {}
@@ -859,20 +891,74 @@ def bailout_worker():
                     # 初始化该币种的内存追踪器
                     if base_sym not in tracking_mem:
                         entry_time = _resolve_position_entry_time(p, base_sym)
+                        persisted_state = _load_persisted_tracking_state(base_sym)
+                        persisted_mode = persisted_state.get('trailing_mode')
+                        if persisted_mode not in ('hard_tp', 'tight'):
+                            persisted_mode = None
+                        persisted_active = bool(persisted_state.get('trailing_active')) and persisted_mode is not None
+
+                        current_phys_pnl_for_init = (
+                            (current_close - entry_px) / entry_px
+                            if pos_side == 'LONG'
+                            else (entry_px - current_close) / entry_px
+                        )
+                        persisted_max = float(persisted_state.get('max_phys_pnl', 0.0) or 0.0)
+                        max_phys_pnl_init = max(0.0, persisted_max, current_phys_pnl_for_init)
+
+                        persisted_physical_sl = _phys_from_stop_price(
+                            entry_px,
+                            pos_side,
+                            persisted_state.get('exchange_stop') or persisted_state.get('profit_floor'),
+                        )
+                        if persisted_physical_sl is None:
+                            persisted_physical_sl = persisted_state.get('physical_sl_phys')
+                        try:
+                            physical_sl_init = max(float(persisted_physical_sl), -abs(hard_sl))
+                        except (TypeError, ValueError):
+                            physical_sl_init = -abs(hard_sl)
+
+                        persisted_atr_sl = None
+                        if persisted_mode == 'hard_tp':
+                            persisted_atr_sl = _phys_from_stop_price(
+                                entry_px,
+                                pos_side,
+                                persisted_state.get('current_stop'),
+                            )
+                            if persisted_atr_sl is None:
+                                persisted_atr_sl = persisted_state.get('atr_sl_phys')
+                            try:
+                                persisted_atr_sl = float(persisted_atr_sl)
+                            except (TypeError, ValueError):
+                                persisted_atr_sl = None
+
+                        try:
+                            last_sl_update_px = float(
+                                persisted_state.get('exchange_stop') or persisted_state.get('profit_floor') or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            last_sl_update_px = 0.0
+
                         tracking_mem[base_sym] = {
-                            'max_phys_pnl': 0.0,
-                            'physical_sl_phys': -abs(hard_sl),
-                            'atr_sl_phys': None,
-                            'trailing_active': False,
-                            'trailing_mode': None,
+                            'max_phys_pnl': max_phys_pnl_init,
+                            'physical_sl_phys': physical_sl_init,
+                            'atr_sl_phys': persisted_atr_sl,
+                            'trailing_active': persisted_active,
+                            'trailing_mode': persisted_mode if persisted_active else None,
                             'entry_time': entry_time,
                             'last_same_signal_refresh_ts': 0.0,
-                            'last_sl_update_px': 0.0,
+                            'last_sl_update_px': last_sl_update_px,
                             'last_entry_px': entry_px,
                             'last_contracts': position_contracts,
                             'last_stop_repair_ts': 0.0,
                             'last_snapshot_warn_ts': 0.0,
                         }
+                        if persisted_active:
+                            msg = (
+                                f"[{base_sym}] 已恢复右脑追踪状态: mode={persisted_mode} | "
+                                f"物理保底={physical_sl_init:+.2%} | 最高浮盈={max_phys_pnl_init:+.2%}"
+                            )
+                            print(f"♻️ {msg}")
+                            log_system_alert("♻️ 追踪状态恢复", base_sym, msg)
 
                     mem = tracking_mem[base_sym]
                     if 'physical_sl_phys' not in mem:
