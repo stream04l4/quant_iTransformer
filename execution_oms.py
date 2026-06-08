@@ -236,14 +236,17 @@ def _margin_mode_text(position):
     return ""
 
 
-def _ensure_isolated_margin(exchange, gate_symbol):
+def _ensure_isolated_margin(exchange, gate_symbol, target_leverage=None):
     if not GATE_REQUIRE_ISOLATED_MARGIN:
         return True, "逐仓校验未启用"
 
+    leverage_value = float(target_leverage or 1.0)
     try:
-        exchange.set_margin_mode("isolated", gate_symbol)
+        # Gate does not implement ccxt.set_margin_mode(); for futures, isolated
+        # mode is expressed by setting a non-zero leverage on the position.
+        exchange.set_leverage(leverage_value, gate_symbol, {"marginMode": "isolated"})
         set_ok = True
-        set_msg = "已请求交易所切换/保持逐仓"
+        set_msg = f"已请求交易所切换/保持逐仓，并预设杠杆 {leverage_value:g}x"
     except Exception as e:
         err_text = str(e).lower()
         already_isolated = any(
@@ -927,7 +930,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             log_system_alert("❌ 资金不足", symbol, msg)
             return False, 0.0
 
-        margin_ok, margin_reason = _ensure_isolated_margin(exchange_private, gate_symbol)
+        margin_ok, margin_reason = _ensure_isolated_margin(exchange_private, gate_symbol, leverage)
         if not margin_ok:
             msg = f"❌ 逐仓保护拒绝开仓: {margin_reason}"
             print("⚠️", msg)
@@ -938,9 +941,14 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
             log_system_alert("🧯 逐仓保护", symbol, margin_reason)
 
         # 统一绝对杠杆语义：无论首次开仓还是同向升档，都先把交易所杠杆对齐到 Tier 目标值。
-        if abs(current_exchange_leverage - leverage) > 0.05:
+        margin_preselected_leverage = (
+            margin_ok
+            and GATE_REQUIRE_ISOLATED_MARGIN
+            and "预设杠杆" in str(margin_reason or "")
+        )
+        if not margin_preselected_leverage and abs(current_exchange_leverage - leverage) > 0.05:
             try:
-                exchange_private.set_leverage(leverage, gate_symbol)
+                exchange_private.set_leverage(leverage, gate_symbol, {"marginMode": "isolated"})
                 time.sleep(0.5)
             except Exception as e:
                 msg = f"⚠️ 无法将 {gate_symbol} 杠杆对齐到目标值 {leverage}x: {e}"

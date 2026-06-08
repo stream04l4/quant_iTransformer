@@ -167,9 +167,9 @@ Streamlit 监控面板
 | `BASE_RISK_BUDGET` | `0.2` | 单笔保证金预算比例 |
 | `MAX_NOTIONAL_BTC` | `100000` | BTC/ETH 最大 notional |
 | `MAX_NOTIONAL_ALTS` | `10000` | 其他币种最大 notional |
-| `BAILOUT_ATR_MULTI` | `3.5` | 高频熔断 ATR 跌幅阈值 |
-| `BAILOUT_VOL_MULTI` | `4.0` | 高频熔断爆量阈值 |
-| `BAILOUT_MIN_PHYSICAL_DROP` | `0.005` | 熔断最小物理跌幅 |
+| `BAILOUT_ATR_MULTI` | `4.5` | 高频熔断 ATR 跌幅阈值 |
+| `BAILOUT_VOL_MULTI` | `5.0` | 高频熔断爆量阈值 |
+| `BAILOUT_MIN_PHYSICAL_DROP` | `0.010` | 熔断最小物理跌幅 |
 | `BAILOUT_OBI_THRESH` | `0.2` | 订单簿失衡确认阈值 |
 
 ### 宏观情绪融合配置

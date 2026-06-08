@@ -37,6 +37,22 @@ THRESHOLD_KEYS = ["up_top_1", "up_top_5", "up_top_10", "down_top_1", "down_top_5
 PHYSICAL_TRAIL_STEP_PHYS = 0.005
 
 
+def _calc_bailout_adverse_move(prev_minute_close, current_open, current_close, pos_side):
+    """Return adverse move against the position, anchored to real minute entry points."""
+    prev_minute_close = float(prev_minute_close)
+    current_open = float(current_open)
+    current_close = float(current_close)
+    pos_side = str(pos_side or "").upper()
+
+    if pos_side == "LONG":
+        reference = min(prev_minute_close, current_open)
+        return max(0.0, reference - current_close), reference
+    if pos_side == "SHORT":
+        reference = max(prev_minute_close, current_open)
+        return max(0.0, current_close - reference), reference
+    return 0.0, current_close
+
+
 def _normalize_symbol_key(raw_symbol):
     """统一符号格式，兼容 BTCUSDT / BTC/USDT:USDT / BTC/USDT。"""
     return str(raw_symbol or "").split(":")[0].replace("/", "")
@@ -1093,8 +1109,6 @@ def bailout_worker():
                         ohlcv_1m = data['ohlcv_1m']
                         prev_minute_close = float(ohlcv_1m[-2][4])
                         current_open = float(ohlcv_1m[-1][1])
-                        current_high = max(float(ohlcv_1m[-1][2]), current_close)
-                        current_low = min(float(ohlcv_1m[-1][3]), current_close)
                         current_vol = float(ohlcv_1m[-1][5])
 
                         past_vols = [x[5] for x in ohlcv_1m[:-1]]
@@ -1117,17 +1131,21 @@ def bailout_worker():
 
                             is_flash_crash = False
                             is_flash_surge = False
-                            min_physical_space = current_close * BAILOUT_MIN_PHYSICAL_DROP
-                            adverse_for_long = current_close < min(prev_minute_close, current_open)
-                            adverse_for_short = current_close > max(prev_minute_close, current_open)
+                            adverse_move, adverse_reference = _calc_bailout_adverse_move(
+                                prev_minute_close,
+                                current_open,
+                                current_close,
+                                pos_side,
+                            )
+                            adverse_move_pct = adverse_move / (adverse_reference + 1e-8)
+                            min_physical_space = adverse_reference * BAILOUT_MIN_PHYSICAL_DROP
+                            price_break_threshold = max((dyn_atr_multi * atr_1m), min_physical_space)
 
                             if pos_side == 'LONG':
-                                drop_amt = current_high - current_close
-                                if adverse_for_long and drop_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                if adverse_move > price_break_threshold:
                                     is_flash_crash = True
                             elif pos_side == 'SHORT':
-                                surge_amt = current_close - current_low
-                                if adverse_for_short and surge_amt > max((dyn_atr_multi * atr_1m), min_physical_space):
+                                if adverse_move > price_break_threshold:
                                     is_flash_surge = True
 
                             if (is_flash_crash or is_flash_surge) and ('orderbook' in data):
@@ -1142,7 +1160,13 @@ def bailout_worker():
                                     if pos_side == 'LONG' and is_flash_crash:
                                         obi = bid_vol / (ask_vol + 1e-8)
                                         if obi < obi_thresh:
-                                            execute_bailout(bailout_ex, base_sym, p, f"真瀑布崩塌 (量能放大 {actual_vol_multi:.1f}x)", current_close)
+                                            execute_bailout(
+                                                bailout_ex,
+                                                base_sym,
+                                                p,
+                                                f"真瀑布崩塌 (跌幅 {adverse_move_pct*100:.2f}%, 量能放大 {actual_vol_multi:.1f}x)",
+                                                current_close,
+                                            )
                                             bailout_cooldown_locks[base_sym] = time.time()
                                             del tracking_mem[base_sym]
                                             continue
@@ -1150,7 +1174,13 @@ def bailout_worker():
                                     elif pos_side == 'SHORT' and is_flash_surge:
                                         obi = ask_vol / (bid_vol + 1e-8)
                                         if obi < obi_thresh:
-                                            execute_bailout(bailout_ex, base_sym, p, f"真逼空爆发 (量能放大 {actual_vol_multi:.1f}x)", current_close)
+                                            execute_bailout(
+                                                bailout_ex,
+                                                base_sym,
+                                                p,
+                                                f"真逼空爆发 (涨幅 {adverse_move_pct*100:.2f}%, 量能放大 {actual_vol_multi:.1f}x)",
+                                                current_close,
+                                            )
                                             bailout_cooldown_locks[base_sym] = time.time()
                                             del tracking_mem[base_sym]
                                             continue

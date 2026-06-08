@@ -146,7 +146,7 @@ DAILY_MAX_LOSS_USDT = float(os.environ.get("DAILY_MAX_LOSS_USDT", 0.0))
 # --- 右脑高频熔断参数 ---
 BAILOUT_ATR_MULTI = 4.5              # 价格瀑布触发阈值(ATR倍数)：1分钟内跌幅超过此倍数ATR才触发
 BAILOUT_VOL_MULTI = 5.0              # 异常爆量触发阈值(Volume倍数)：成交量必须超过均量的此倍数
-BAILOUT_MIN_PHYSICAL_DROP = 0.005    # 熔断最小物理跌幅过滤(0.5%)，防止微小波动误触
+BAILOUT_MIN_PHYSICAL_DROP = 0.010    # 熔断最小物理跌幅过滤(1.0%)，仅保留断崖级别行情逃生
 BAILOUT_OBI_THRESH = 0.2             # 订单簿失衡阈值(OBI < 0.2时才确认为真瀑布)
 RIGHT_BRAIN_SNAPSHOT_TIMEOUT = float(os.environ.get("RIGHT_BRAIN_SNAPSHOT_TIMEOUT", 3.0))
 RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN = float(os.environ.get("RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN", 60.0))
