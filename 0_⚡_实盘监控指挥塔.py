@@ -1270,7 +1270,7 @@ with dash_tab1:
         # 坐标轴美化 (去除杂乱网格线，保留极弱参考线，强制自适应 Y 轴视野)
         fig_eq.update_xaxes(showgrid=False, showspikes=True, spikemode="across", spikesnap="cursor", showline=False, spikedash="dot", spikecolor="#666666", spikethickness=1)
         fig_eq.update_yaxes(title_text="账户净值 (Equity)", secondary_y=False, tickformat=".4f", showgrid=True, gridcolor='rgba(255,255,255,0.05)', zeroline=False, range=[eq_min - y_padding, eq_max + y_padding])
-        fig_eq.update_yaxes(title_text="历史回撤幅度", secondary_y=True, tickformat=".0%", range=[-0.6, 0], showgrid=False, zeroline=False)
+        fig_eq.update_yaxes(title_text="历史回撤幅度", secondary_y=True, tickformat=".0%", range=[-0.2, 0], showgrid=False, zeroline=False)
 
         st.plotly_chart(fig_eq, width='stretch')
     else:
