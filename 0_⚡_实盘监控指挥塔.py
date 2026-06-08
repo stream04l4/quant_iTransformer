@@ -1002,10 +1002,18 @@ def render_realtime_portfolio():
                     trailing_state.get('exchange_stop', trailing_state.get('profit_floor', 0.0)) or 0.0
                 )
                 trailing_active = bool(trailing_state.get('trailing_active', False))
+                trailing_mode = str(trailing_state.get('trailing_mode') or "")
                 atr_retrace_pct = float(trailing_state.get('atr_retrace_pct', 0.0) or 0.0)
                 atr_target_sl = f"${atr_target_sl_px:,.4f}" if atr_target_sl_px > 0 else "初始化中 ⏳"
                 profit_floor = f"${profit_floor_px:,.4f}" if profit_floor_px > 0 else "未激活"
-                trailing_status = f"已激活 | 回撤宽度 {atr_retrace_pct:.2%}" if trailing_active else "未激活"
+                if trailing_active and trailing_mode == "tight":
+                    trailing_status = "紧逼棘轮追踪 | 0.5%步进"
+                elif trailing_active and trailing_mode == "hard_tp":
+                    trailing_status = f"宽松ATR追踪 | 回撤宽度 {atr_retrace_pct:.2%}"
+                elif trailing_active:
+                    trailing_status = f"已激活 | 回撤宽度 {atr_retrace_pct:.2%}"
+                else:
+                    trailing_status = "未激活"
 
                 # ==========================================
                 # 分开展示：交易所真实 OCO、右脑 ATR 内存线、物理棘轮目标。
@@ -1023,7 +1031,7 @@ def render_realtime_portfolio():
                     "当前标记价": f"${float(info.get('markPx', info.get('mark_price', 0))):,.4f}",
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
                     "收益率 (ROE)": f"{upl_ratio:+.2f}%",
-                    "ATR追踪状态": trailing_status,
+                    "追踪状态": trailing_status,
                     "ATR目标止损": atr_target_sl,
                     "物理棘轮目标": profit_floor,
                     "交易所保底 (OCO)": oco_min_roe_str,

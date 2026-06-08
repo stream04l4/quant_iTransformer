@@ -826,7 +826,7 @@ def execute_gate_trade(symbol, signal, leverage, current_price, tp_pct, sl_pct, 
                 current_pos_side = str(pos.get('side', '')).lower()
                 
                 if (side == 'buy' and current_pos_side == 'short') or (side == 'sell' and current_pos_side == 'long'):
-                    msg = "检测到反向入场请求，OMS 已忽略；由右脑按原始概率 Top-1 规则决定是否退出。"
+                    msg = "检测到反向入场请求，OMS 已忽略；由右脑按原始概率任意反向信号决定是否退出或紧逼追踪。"
                     print("ℹ️", msg)
                     log_system_alert("ℹ️ 反向信号忽略", symbol, msg)
                     return False, 0.0

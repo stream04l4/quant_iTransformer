@@ -48,8 +48,17 @@ def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
     return max(step, stepped_floor)
 
 
-def _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active):
-    if trailing_active and atr_sl_phys is not None:
+def _calc_tight_ratchet_phys(max_phys_pnl):
+    step = PHYSICAL_TRAIL_STEP_PHYS
+    if max_phys_pnl < step:
+        return None
+    raw_floor = max_phys_pnl - step
+    stepped_floor = np.floor((raw_floor + 1e-12) / step) * step
+    return max(step, stepped_floor)
+
+
+def _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_mode):
+    if trailing_mode == "hard_tp" and atr_sl_phys is not None:
         return max(physical_sl_phys, atr_sl_phys)
     return physical_sl_phys
 
@@ -370,6 +379,7 @@ def run_backtest(args=None):
 
     max_unrealized_phys_pnl = 0.0
     trailing_active = False
+    trailing_mode = None
     physical_sl_phys = -abs(HARD_SL)
     atr_sl_phys = None
 
@@ -453,6 +463,7 @@ def run_backtest(args=None):
 
                 max_unrealized_phys_pnl = 0.0
                 trailing_active = False
+                trailing_mode = None
                 physical_sl_phys = -abs(HARD_SL)
                 atr_sl_phys = None
 
@@ -461,6 +472,10 @@ def run_backtest(args=None):
             elif current_pos == target_pos:
                 if target_tier == current_tier or target_tier > current_tier:
                     hold_timer_mins = HOLD_PERIOD * 60
+                    if trailing_mode == "tight":
+                        trailing_active = False
+                        trailing_mode = None
+                        atr_sl_phys = None
 
                 if target_tier > current_tier:
                     # [核心修正]: 必须记住加仓前的"绝对止损价"，防止均价上移导致瞬间爆仓
@@ -532,10 +547,21 @@ def run_backtest(args=None):
             close_return = 0.0
 
             is_reversal = False
-            if current_pos == 1 and p_down > th["down_top_1"]: is_reversal = True
-            elif current_pos == -1 and p_up > th["up_top_1"]: is_reversal = True
+            if current_pos == 1 and p_down > th["down_top_10"]: is_reversal = True
+            elif current_pos == -1 and p_up > th["up_top_10"]: is_reversal = True
+            is_favorable_signal = False
+            if current_pos == 1 and p_up > th["up_top_10"]: is_favorable_signal = True
+            elif current_pos == -1 and p_down > th["down_top_10"]: is_favorable_signal = True
 
-            if is_reversal:
+            tight_cancelled_this_hour = False
+            if trailing_mode == "tight" and is_favorable_signal:
+                trailing_active = False
+                trailing_mode = None
+                atr_sl_phys = None
+                hold_timer_mins = HOLD_PERIOD * 60
+                tight_cancelled_this_hour = True
+
+            if is_reversal and not tight_cancelled_this_hour:
                 current_hour_open = opens_1h[exec_idx_1h]
                 current_phys_profit = (current_hour_open - entry_price) / entry_price if current_pos == 1 else (entry_price - current_hour_open) / entry_price
 
@@ -545,7 +571,12 @@ def run_backtest(args=None):
                     exit_reasons["REVERSAL_EXIT"] += 1
                 else:
                     trailing_active = True
+                    trailing_mode = "tight"
+                    atr_sl_phys = None
                     physical_sl_phys = max(physical_sl_phys, PHYSICAL_TRAIL_STEP_PHYS)
+                    tight_floor = _calc_tight_ratchet_phys(max_unrealized_phys_pnl)
+                    if tight_floor is not None:
+                        physical_sl_phys = max(physical_sl_phys, tight_floor)
 
             if not close_position:
                 for m_idx in range(start_1m_idx, end_1m_idx):
@@ -579,7 +610,7 @@ def run_backtest(args=None):
                         liquidated = True
                         break
 
-                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active)
+                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_mode)
                     if worst_intra <= active_stop_phys:
                         close_position = True
                         actual_exit_pct = active_stop_phys * current_leverage
@@ -591,25 +622,36 @@ def run_backtest(args=None):
                         max_unrealized_phys_pnl = best_intra
 
                     if max_unrealized_phys_pnl >= abs(HARD_TP):
-                        trailing_active = True
-                        ratchet_floor = _calc_physical_ratchet_phys(max_unrealized_phys_pnl, HARD_TP)
-                        if ratchet_floor is not None:
-                            physical_sl_phys = max(physical_sl_phys, ratchet_floor)
+                        if trailing_mode != "tight":
+                            trailing_active = True
+                            trailing_mode = "hard_tp"
+                            ratchet_floor = _calc_physical_ratchet_phys(max_unrealized_phys_pnl, HARD_TP)
+                            if ratchet_floor is not None:
+                                physical_sl_phys = max(physical_sl_phys, ratchet_floor)
+                    if trailing_mode == "tight":
+                        tight_floor = _calc_tight_ratchet_phys(max_unrealized_phys_pnl)
+                        if tight_floor is not None:
+                            physical_sl_phys = max(physical_sl_phys, tight_floor)
 
-                    if hold_timer_mins <= 0 and not trailing_active:
-                        if close_return < 0.005:
+                    if hold_timer_mins <= 0 and not tight_cancelled_this_hour:
+                        if close_return < 0.005 and not trailing_active:
                             close_position = True
                             actual_exit_pct = close_return * current_leverage
                             exit_reasons["TIME_LIMIT_EXIT"] += 1
                             break
                         else:
                             trailing_active = True
+                            trailing_mode = "tight"
+                            atr_sl_phys = None
                             physical_sl_phys = max(physical_sl_phys, PHYSICAL_TRAIL_STEP_PHYS)
+                            tight_floor = _calc_tight_ratchet_phys(max_unrealized_phys_pnl)
+                            if tight_floor is not None:
+                                physical_sl_phys = max(physical_sl_phys, tight_floor)
 
-                    if trailing_active and trailing_retrace_phys > 0:
+                    if trailing_mode == "hard_tp" and trailing_retrace_phys > 0:
                         atr_sl_phys = max_unrealized_phys_pnl - trailing_retrace_phys
 
-                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_active)
+                    active_stop_phys = _active_stop_phys(physical_sl_phys, atr_sl_phys, trailing_mode)
                     if worst_intra <= active_stop_phys:
                         close_position = True
                         actual_exit_pct = active_stop_phys * current_leverage
@@ -629,6 +671,9 @@ def run_backtest(args=None):
                 gross_loss += trade_start_equity
                 exit_reasons["LIQUIDATION_EXIT"] += 1
                 pnl_list.append(-1.0)
+                trailing_active = False
+                trailing_mode = None
+                atr_sl_phys = None
                 continue
 
             if close_position:
@@ -649,6 +694,9 @@ def run_backtest(args=None):
                 current_pos = 0
                 current_tier = 0
                 current_leverage = 0.0
+                trailing_active = False
+                trailing_mode = None
+                atr_sl_phys = None
 
                 pnl_list.append(trade_pnl / trade_start_equity)
             else:

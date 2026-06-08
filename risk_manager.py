@@ -70,6 +70,16 @@ def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
     return max(step, stepped_floor)
 
 
+def _calc_tight_ratchet_phys(max_phys_pnl):
+    """时间/反转触发的紧逼棘轮：最高浮盈与物理保底始终只保留约 0.5% 距离。"""
+    step = PHYSICAL_TRAIL_STEP_PHYS
+    if max_phys_pnl < step:
+        return None
+    raw_floor = max_phys_pnl - step
+    stepped_floor = math.floor((raw_floor + 1e-12) / step) * step
+    return max(step, stepped_floor)
+
+
 def _stop_price_from_phys(entry_px, pos_side, stop_phys):
     if stop_phys is None:
         return None
@@ -464,22 +474,22 @@ def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_s
     if signal_refresh_ts is None:
         signal_refresh_ts = _safe_parse_epoch(execution_state.get("last_inferred_hour"))
     if signal_refresh_ts is None:
-        return
+        return False
 
     target_signal, target_tier = _resolve_target_signal_tier_from_status(live_status, thresholds, base_sym)
     current_side = 1 if str(pos_side).upper() == "LONG" else -1
     if target_signal != current_side:
-        return
+        return False
 
     current_tier = _resolve_current_position_tier_from_status(live_status, current_side)
     if target_tier != current_tier:
-        return
+        return False
 
     last_refresh_ts = float(mem.get('last_same_signal_refresh_ts', 0.0) or 0.0)
     if signal_refresh_ts <= last_refresh_ts:
-        return
+        return False
     if signal_refresh_ts <= float(mem.get('entry_time', 0.0) or 0.0):
-        return
+        return False
 
     mem['entry_time'] = signal_refresh_ts
     mem['last_same_signal_refresh_ts'] = signal_refresh_ts
@@ -487,6 +497,7 @@ def _refresh_entry_time_on_same_direction_signal(mem, base_sym, pos_side, live_s
         f"🕒 [{base_sym}] 侦测到同向同Tier-{current_tier}信号延续，持仓计时已刷新至 "
         f"{datetime.fromtimestamp(signal_refresh_ts).strftime('%Y-%m-%d %H:%M:%S')}。"
     )
+    return True
 
 
 def _read_last_inferred_hour(base_sym=None):
@@ -853,6 +864,7 @@ def bailout_worker():
                             'physical_sl_phys': -abs(hard_sl),
                             'atr_sl_phys': None,
                             'trailing_active': False,
+                            'trailing_mode': None,
                             'entry_time': entry_time,
                             'last_same_signal_refresh_ts': 0.0,
                             'last_sl_update_px': 0.0,
@@ -867,6 +879,8 @@ def bailout_worker():
                         mem['physical_sl_phys'] = float(mem.get('dynamic_sl_phys', -abs(hard_sl)) or -abs(hard_sl))
                     if 'atr_sl_phys' not in mem:
                         mem['atr_sl_phys'] = None
+                    if 'trailing_mode' not in mem:
+                        mem['trailing_mode'] = 'hard_tp' if mem.get('trailing_active') else None
                     # ---------------------------------------------------------
                     # 🚨 补丁 2/2：侦测阶梯加仓造成的均价偏移，重置水位防线防误杀
                     # ---------------------------------------------------------
@@ -883,6 +897,7 @@ def bailout_worker():
                     )
 
                     # 如果交易所最新返回的均价/张数发生同向增加，说明触发了实盘加仓。
+                    same_signal_refreshed = False
                     if add_position_detected:
                         # 记住当时的物理绝对止损价格
                         if pos_side == 'LONG':
@@ -913,16 +928,17 @@ def bailout_worker():
                             f"持仓计时已重置至 {datetime.fromtimestamp(mem['entry_time']).strftime('%Y-%m-%d %H:%M:%S')}，"
                             "并已平移止损防线防止误杀。"
                         )
+                        same_signal_refreshed = True
                     else:
                         mem['last_contracts'] = position_contracts
 
-                    _refresh_entry_time_on_same_direction_signal(
-                        mem,
-                        base_sym,
-                        pos_side,
-                        symbol_status,
-                        th,
-                    )
+                        same_signal_refreshed = _refresh_entry_time_on_same_direction_signal(
+                            mem,
+                            base_sym,
+                            pos_side,
+                            symbol_status,
+                            th,
+                        )
                     # ---------------------------------------------------------
                     # 📈 轨道 1：双轨追踪状态机
                     # ---------------------------------------------------------
@@ -933,32 +949,58 @@ def bailout_worker():
                     # 🚨 修复 2：为了和回测 (backtest_itransformer.py) 保持 100% 物理一致，
                     # 必须使用模型【最原始的概率】来判断反转斩仓，绝不能用宏观融合后的变异概率。
                     is_reversal = False
-                    if pos_side == 'LONG' and raw_p_down > th.get('down_top_1', 1.0): is_reversal = True
-                    if pos_side == 'SHORT' and raw_p_up > th.get('up_top_1', 1.0): is_reversal = True
+                    if pos_side == 'LONG' and raw_p_down > th.get('down_top_10', 1.0): is_reversal = True
+                    if pos_side == 'SHORT' and raw_p_up > th.get('up_top_10', 1.0): is_reversal = True
+                    is_favorable_signal = False
+                    if pos_side == 'LONG' and raw_p_up > th.get('up_top_10', 1.0): is_favorable_signal = True
+                    if pos_side == 'SHORT' and raw_p_down > th.get('down_top_10', 1.0): is_favorable_signal = True
+
+                    tight_cancelled_this_loop = False
+                    if mem.get('trailing_mode') == 'tight' and (same_signal_refreshed or is_favorable_signal):
+                        mem['trailing_mode'] = None
+                        mem['trailing_active'] = False
+                        mem['atr_sl_phys'] = None
+                        reason = "同向信号刷新持仓时间" if same_signal_refreshed else "概率重新转向持仓方向"
+                        if is_favorable_signal and not same_signal_refreshed:
+                            mem['entry_time'] = time.time()
+                            hold_hours = 0.0
+                        tight_cancelled_this_loop = True
+                        log_system_alert("ℹ️ 紧逼追踪取消", base_sym, f"{reason}，停止继续执行0.5%紧逼棘轮；已抬高的交易所物理止损不主动放宽。")
 
                     need_market_close = False
                     close_reason = ""
 
                     # 触发器 1 & 3：反转 或 超过配置中的持仓时长上限
-                    if is_reversal or hold_hours >= HOLD_PERIOD:
+                    if not tight_cancelled_this_loop and (is_reversal or hold_hours >= HOLD_PERIOD):
                         if current_phys_pnl < 0.005 and not mem['trailing_active']:
                             need_market_close = True
                             close_reason = "AI反转" if is_reversal else f"{HOLD_PERIOD}小时持仓超时"
                             close_reason += " (利润不足0.5%立即斩仓)"
                         else:
                             mem['trailing_active'] = True
+                            mem['trailing_mode'] = 'tight'
+                            mem['atr_sl_phys'] = None
                             mem['physical_sl_phys'] = max(mem['physical_sl_phys'], PHYSICAL_TRAIL_STEP_PHYS)
+                            tight_floor = _calc_tight_ratchet_phys(mem['max_phys_pnl'])
+                            if tight_floor is not None:
+                                mem['physical_sl_phys'] = max(mem['physical_sl_phys'], tight_floor)
+
+                    if mem.get('trailing_mode') == 'tight':
+                        tight_floor = _calc_tight_ratchet_phys(mem['max_phys_pnl'])
+                        if tight_floor is not None:
+                            mem['physical_sl_phys'] = max(mem['physical_sl_phys'], tight_floor)
 
                     # 触发器 2：触及止盈线
-                    if mem['max_phys_pnl'] >= hard_tp:
+                    if mem['max_phys_pnl'] >= hard_tp and mem.get('trailing_mode') != 'tight':
                         mem['trailing_active'] = True
+                        mem['trailing_mode'] = 'hard_tp'
                         ratchet_floor = _calc_physical_ratchet_phys(mem['max_phys_pnl'], hard_tp)
                         if ratchet_floor is not None:
                             mem['physical_sl_phys'] = max(mem['physical_sl_phys'], ratchet_floor)
 
                     # ATR 是内存状态机，不刷新交易所物理单；它可随 ATR 扩张/收缩上下移动。
                     trailing_retrace_phys = 0.0
-                    if mem['trailing_active'] and trailing_atr_price > 0:
+                    if mem.get('trailing_mode') == 'hard_tp' and trailing_atr_price > 0:
                         trailing_retrace_phys = TRAILING_ATR_MULTI * trailing_atr_price / entry_px
                         mem['atr_sl_phys'] = mem['max_phys_pnl'] - trailing_retrace_phys
 
@@ -978,6 +1020,7 @@ def bailout_worker():
                         'current_stop': atr_target_sl_px,
                         'exchange_stop': physical_sl_px,
                         'trailing_active': bool(mem['trailing_active']),
+                        'trailing_mode': mem.get('trailing_mode'),
                         'profit_floor': physical_sl_px if mem['trailing_active'] else None,
                         'atr_retrace_pct': trailing_retrace_phys,
                         'max_phys_pnl': mem['max_phys_pnl'],
@@ -1093,8 +1136,9 @@ def bailout_worker():
                                     else previous_sl_px <= 0 or physical_sl_px < previous_sl_px
                                 )
                                 action = "收紧" if is_tightening else "初始化"
+                                mode_label = "紧逼棘轮" if mem.get('trailing_mode') == 'tight' else "宽松ATR"
                                 ratchet_msg = (
-                                    f"{pos_side} 物理保底止损已{action}至 ${physical_sl_px:.4f} | "
+                                    f"{pos_side} {mode_label}物理保底止损已{action}至 ${physical_sl_px:.4f} | "
                                     f"保底: {mem['physical_sl_phys']*100:+.2f}% | "
                                     f"ATR内存线: {(mem.get('atr_sl_phys') or 0.0)*100:+.2f}% | "
                                     f"最高浮盈: {mem['max_phys_pnl']*100:+.2f}%"
