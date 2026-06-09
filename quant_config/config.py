@@ -86,11 +86,13 @@ LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 8.0))
 FEE_RATE = 0.0005        
 
 HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
-HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.025))           
+HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.02))
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.025))
 # 追踪止盈回撤宽度：ATR(period) × multi / entry_price，替代固定 1% 回撤。
 TRAILING_ATR_PERIOD = int(os.environ.get("OPT_TRAILING_ATR_PERIOD", 14))
 TRAILING_ATR_MULTI = float(os.environ.get("OPT_TRAILING_ATR_MULTI", 3.5))
+# 到达 HARD_TP 后，交易所物理棘轮与最高浮盈之间保留的固定距离。
+TRAILING_PHYSICAL_GAP = float(os.environ.get("OPT_TRAILING_PHYSICAL_GAP", 0.015))
 
 # --- 实盘专用风控与仓位参数 ---
 # 宏观情绪非线性 Logit 融合参数。

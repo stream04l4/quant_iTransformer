@@ -33,8 +33,9 @@ BACKTEST_SEARCH_SPACE = {
     'LEVERAGE_2': [5.0],
     'LEVERAGE_3': [8.0],
     'HOLD_PERIOD': [12],
-    'HARD_TP': [0.025],
+    'HARD_TP': [0.02],
     'HARD_SL': [0.025],
+    'TRAILING_PHYSICAL_GAP': [0.015],
     'TRAILING_ATR_MULTI': [3.5]
 }
 

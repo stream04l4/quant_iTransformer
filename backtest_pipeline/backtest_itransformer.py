@@ -17,7 +17,7 @@ from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, PROCESSED_MAIN_ROOT, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
     EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
-    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, TRAILING_PHYSICAL_GAP, LIVE_SYMBOL_CONFIGS,
     normalize_symbol
 )
 from historical_pipeline.train_itransformer import InvertedTransformer
@@ -37,12 +37,12 @@ def _find_training_matrix_files(horizon):
     return sorted(set(files))
 
 
-def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
+def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp, physical_gap):
     hard_tp = abs(float(hard_tp))
     if max_phys_pnl < hard_tp:
         return None
     step = PHYSICAL_TRAIL_STEP_PHYS
-    gap = max(hard_tp - step, 0.0)
+    gap = max(float(physical_gap), 0.0)
     raw_floor = max_phys_pnl - gap
     stepped_floor = np.floor((raw_floor + 1e-12) / step) * step
     return max(step, stepped_floor)
@@ -625,7 +625,11 @@ def run_backtest(args=None):
                         if trailing_mode != "tight":
                             trailing_active = True
                             trailing_mode = "hard_tp"
-                            ratchet_floor = _calc_physical_ratchet_phys(max_unrealized_phys_pnl, HARD_TP)
+                            ratchet_floor = _calc_physical_ratchet_phys(
+                                max_unrealized_phys_pnl,
+                                HARD_TP,
+                                TRAILING_PHYSICAL_GAP,
+                            )
                             if ratchet_floor is not None:
                                 physical_sl_phys = max(physical_sl_phys, ratchet_floor)
                     if trailing_mode == "tight":

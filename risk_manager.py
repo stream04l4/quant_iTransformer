@@ -23,7 +23,7 @@ from quant_config.config import (
     MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE, MACRO_LOGIT_TAIL_SCORE,
     MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA, MACRO_LOGIT_MAX_DELTA,
     MACRO_LOGIT_MID_POWER, MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER,
-    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, LIVE_SYMBOL_CONFIGS,
+    TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, TRAILING_PHYSICAL_GAP, LIVE_SYMBOL_CONFIGS,
     GATE_SANDBOX_MODE, RIGHT_BRAIN_SNAPSHOT_TIMEOUT,
     RIGHT_BRAIN_SNAPSHOT_WARN_COOLDOWN
 )
@@ -58,13 +58,13 @@ def _normalize_symbol_key(raw_symbol):
     return str(raw_symbol or "").split(":")[0].replace("/", "")
 
 
-def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp):
-    """交易所物理保底棘轮：价格每多走 0.5%，保底同步抬高 0.5%，始终约保留 2% 空间。"""
+def _calc_physical_ratchet_phys(max_phys_pnl, hard_tp, physical_gap):
+    """交易所物理保底棘轮：价格每多走 0.5%，保底同步抬高 0.5%，与最高浮盈保持配置间距。"""
     hard_tp = abs(float(hard_tp))
     if max_phys_pnl < hard_tp:
         return None
     step = PHYSICAL_TRAIL_STEP_PHYS
-    gap = max(hard_tp - step, 0.0)
+    gap = max(float(physical_gap), 0.0)
     raw_floor = max_phys_pnl - gap
     stepped_floor = math.floor((raw_floor + 1e-12) / step) * step
     return max(step, stepped_floor)
@@ -1091,7 +1091,7 @@ def bailout_worker():
                     if mem['max_phys_pnl'] >= hard_tp and mem.get('trailing_mode') != 'tight':
                         mem['trailing_active'] = True
                         mem['trailing_mode'] = 'hard_tp'
-                        ratchet_floor = _calc_physical_ratchet_phys(mem['max_phys_pnl'], hard_tp)
+                        ratchet_floor = _calc_physical_ratchet_phys(mem['max_phys_pnl'], hard_tp, TRAILING_PHYSICAL_GAP)
                         if ratchet_floor is not None:
                             mem['physical_sl_phys'] = max(mem['physical_sl_phys'], ratchet_floor)
 
