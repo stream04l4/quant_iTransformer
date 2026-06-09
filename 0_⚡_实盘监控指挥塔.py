@@ -1069,9 +1069,100 @@ if hist_data:
     # 预处理 ROE 和持仓时间
     closed_records = []
     target_info_list = []
-    entry_memory = {}
+    position_memory = {}
     rev_flags = []
     is_closing_list = [] # 👈 新增：标记是否为平仓动作
+
+    def _safe_row_float(row_obj, key, default=0.0):
+        try:
+            value = row_obj.get(key, default)
+            if pd.isna(value):
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _new_position_from_row(row_obj, direction, qty_ratio=1.0):
+        qty_ratio = max(0.0, min(1.0, float(qty_ratio or 0.0)))
+        qty = abs(_safe_row_float(row_obj, 'amount', 0.0)) * qty_ratio
+        margin = max(0.0, _safe_row_float(row_obj, 'margin_used', 0.0)) * qty_ratio
+        lev = _safe_row_float(row_obj, 'effective_leverage', _safe_row_float(row_obj, 'leverage', 1.0))
+        if lev <= 0:
+            lev = 1.0
+        return {
+            'direction': int(direction),
+            'side': 'buy' if int(direction) == 1 else 'sell',
+            'qty': qty,
+            'avg_px': _safe_row_float(row_obj, 'fill_price', 0.0),
+            'margin': margin,
+            'notional': margin * lev,
+            'ts': pd.to_datetime(row_obj['exec_ts']),
+            'version': row_obj.get('trade_version', 'unknown'),
+            'xgb_prob': row_obj.get('xgb_prob', np.nan),
+        }
+
+    def _merge_position(pos, row_obj, direction):
+        add_pos = _new_position_from_row(row_obj, direction)
+        if not pos or pos.get('qty', 0.0) <= 0:
+            return add_pos
+
+        old_qty = max(0.0, float(pos.get('qty', 0.0) or 0.0))
+        add_qty = max(0.0, float(add_pos.get('qty', 0.0) or 0.0))
+        total_qty = old_qty + add_qty
+        if total_qty > 0:
+            pos['avg_px'] = ((pos['avg_px'] * old_qty) + (add_pos['avg_px'] * add_qty)) / total_qty
+        pos['qty'] = total_qty
+        pos['margin'] = max(0.0, float(pos.get('margin', 0.0) or 0.0)) + add_pos['margin']
+        pos['notional'] = max(0.0, float(pos.get('notional', 0.0) or 0.0)) + add_pos['notional']
+        if str(pos.get('version', 'unknown')) != str(add_pos.get('version', 'unknown')):
+            pos['version'] = 'mixed'
+
+        old_conf = pd.to_numeric(pos.get('xgb_prob', np.nan), errors='coerce')
+        add_conf = pd.to_numeric(add_pos.get('xgb_prob', np.nan), errors='coerce')
+        if pd.notna(old_conf) and pd.notna(add_conf) and total_qty > 0:
+            pos['xgb_prob'] = ((old_conf * old_qty) + (add_conf * add_qty)) / total_qty
+        elif pd.isna(old_conf):
+            pos['xgb_prob'] = add_conf
+        return pos
+
+    def _close_position(sym, pos, exit_px, close_ts, close_qty=None):
+        qty = max(0.0, float(pos.get('qty', 0.0) or 0.0))
+        if qty <= 0 or pos.get('avg_px', 0.0) <= 0:
+            return None, None
+
+        if close_qty is None or close_qty <= 0:
+            close_qty = qty
+        close_qty = min(float(close_qty), qty)
+        close_ratio = close_qty / qty if qty > 0 else 1.0
+        closed_margin = max(0.0, float(pos.get('margin', 0.0) or 0.0)) * close_ratio
+        closed_notional = max(0.0, float(pos.get('notional', 0.0) or 0.0)) * close_ratio
+        effective_lev = (closed_notional / closed_margin) if closed_margin > 0 else 1.0
+
+        if int(pos.get('direction', 0)) == 1:
+            raw_pnl = (exit_px - pos['avg_px']) / pos['avg_px']
+        else:
+            raw_pnl = (pos['avg_px'] - exit_px) / pos['avg_px']
+
+        realized_usdt = raw_pnl * closed_notional
+        real_roe = raw_pnl * effective_lev
+        closed_record = {
+            'exec_ts': close_ts,
+            'symbol': sym,
+            'real_roe': real_roe,
+            'account_impact': realized_usdt / initial_cap,
+            'realized_usdt': realized_usdt,
+            'hold_hours': (close_ts - pos['ts']).total_seconds() / 3600,
+            'version': pos.get('version', 'unknown'),
+            'xgb_prob': pos.get('xgb_prob', np.nan),
+        }
+
+        remaining = None
+        if close_ratio < 0.999999:
+            remaining = pos.copy()
+            remaining['qty'] = qty - close_qty
+            remaining['margin'] = pos['margin'] * (1.0 - close_ratio)
+            remaining['notional'] = pos['notional'] * (1.0 - close_ratio)
+        return closed_record, remaining
 
     for idx, row in combined_hist.iterrows():
         sym = row['交易对']
@@ -1079,63 +1170,63 @@ if hist_data:
         px = float(row['fill_price'])
         ts = pd.to_datetime(row['exec_ts'])
 
-        # 智能识别逻辑：如果当前有持仓且动作相反，则判定为平仓
-        mem = entry_memory.get(sym)
+        pos = position_memory.get(sym)
         is_opening = side in ['buy', 'sell']
         is_closing_action = side in ['close_long', 'close_short', 'exchange_close', 'bailout_close', 'bailout_panic_sell']
 
-        real_is_closing = False
         if is_closing_action:
-            real_is_closing = True
-        elif is_opening and mem and mem.get('px', 0) > 0:
-            # 如果动作是 buy 且之前是 sell，或者动作是 sell 且之前是 buy -> 判定为平仓
-            if (side == 'buy' and mem['side'] == 'sell') or (side == 'sell' and mem['side'] == 'buy'):
-                real_is_closing = True
-
-        if real_is_closing:
-            # 执行平仓逻辑
             is_closing_list.append(True)
-            if mem and mem.get('px', 0) > 0:
-                entry_px = mem['px']
-                entry_side = mem['side']
-                if entry_side == 'buy':
-                    raw_pnl = (px - entry_px) / entry_px
+            if pos and pos.get('qty', 0) > 0:
+                close_qty = abs(_safe_row_float(row, 'amount', pos.get('qty', 0.0)))
+                closed_record, remaining_pos = _close_position(sym, pos, px, ts, close_qty)
+                if closed_record:
+                    closed_records.append(closed_record)
+                    color = "🟢" if closed_record['realized_usdt'] > 0 else "🔴"
+                    target_info_list.append(
+                        f"{color} 实际: {closed_record['real_roe']:+.2%} / {closed_record['realized_usdt']:+.2f} USDT"
+                    )
+                    rev_flags.append(False)
+                    if remaining_pos:
+                        position_memory[sym] = remaining_pos
+                    else:
+                        position_memory.pop(sym, None)
                 else:
-                    raw_pnl = (entry_px - px) / entry_px
-
-                real_roe = raw_pnl * mem['lev']
-                closed_records.append({
-                    'exec_ts': ts,
-                    'symbol': sym,
-                    'real_roe': real_roe,
-                    'account_impact': (real_roe * mem['margin']) / initial_cap,
-                    'hold_hours': (ts - mem['ts']).total_seconds() / 3600,
-                    'version': mem.get('version', 'unknown'), # 👈 继承入场时的血统
-                    'xgb_prob': mem.get('xgb_prob', 0.5)    # 👈 继承入场时的概率
-                })
-                color = "🟢" if real_roe > 0 else "🔴"
-                target_info_list.append(f"{color} 实际: {real_roe:+.2%}")
-                rev_flags.append(False)
-                entry_memory[sym] = {'px': 0}
+                    target_info_list.append("💰 历史遗留单 (匹配失败)")
+                    rev_flags.append(False)
             else:
                 target_info_list.append("💰 历史遗留单 (匹配失败)")
                 rev_flags.append(False)
         elif is_opening:
-            # 执行开仓逻辑
-            is_closing_list.append(False)
-            entry_memory[sym] = {
-                'px': px,
-                'side': side,
-                'lev': float(row.get('leverage', 1.0)),
-                'ts': ts,
-                'margin': float(row.get('margin_used', 100.0)),
-                'version': row.get('trade_version', 'v1.0'),
-                'xgb_prob': row.get('xgb_prob', 0.5)
-            }
-            tp_move = abs(HARD_TP)
-            sl_move = abs(HARD_SL)
-            target_info_list.append(f"⏳ 预期: +{tp_move*100:.1f}% / -{sl_move*100:.1f}%")
-            rev_flags.append(row.get('is_ai_rev', False))
+            direction = 1 if side == 'buy' else -1
+            if pos and pos.get('qty', 0) > 0 and int(pos.get('direction', 0)) != direction:
+                is_closing_list.append(True)
+                order_qty = abs(_safe_row_float(row, 'amount', pos.get('qty', 0.0)))
+                closed_record, remaining_pos = _close_position(sym, pos, px, ts, order_qty)
+                if closed_record:
+                    closed_records.append(closed_record)
+                    color = "🟢" if closed_record['realized_usdt'] > 0 else "🔴"
+                    target_info_list.append(
+                        f"{color} 实际: {closed_record['real_roe']:+.2%} / {closed_record['realized_usdt']:+.2f} USDT"
+                    )
+                    rev_flags.append(False)
+                    if remaining_pos:
+                        position_memory[sym] = remaining_pos
+                    else:
+                        position_memory.pop(sym, None)
+
+                    remaining_order_qty = max(0.0, order_qty - float(pos.get('qty', 0.0) or 0.0))
+                    if remaining_order_qty > 1e-8 and order_qty > 0:
+                        position_memory[sym] = _new_position_from_row(row, direction, remaining_order_qty / order_qty)
+                else:
+                    target_info_list.append("💰 历史遗留单 (匹配失败)")
+                    rev_flags.append(False)
+            else:
+                is_closing_list.append(False)
+                position_memory[sym] = _merge_position(pos, row, direction)
+                tp_move = abs(HARD_TP)
+                sl_move = abs(HARD_SL)
+                target_info_list.append(f"⏳ 预期: +{tp_move*100:.1f}% / -{sl_move*100:.1f}%")
+                rev_flags.append(row.get('is_ai_rev', False))
         else:
             is_closing_list.append(False)
             target_info_list.append("-")
@@ -1583,7 +1674,10 @@ with dash_tab4:
                 st.markdown("###### 🎯 核心作战指标")
                 v_win_rate_curr = (v_df_curr['real_roe'] > 0).mean()
                 v_total_pnl_curr = v_df_curr['account_impact'].sum()
-                v_total_usdt_curr = v_total_pnl_curr * initial_cap
+                if 'realized_usdt' in v_df_curr.columns:
+                    v_total_usdt_curr = pd.to_numeric(v_df_curr['realized_usdt'], errors='coerce').fillna(0).sum()
+                else:
+                    v_total_usdt_curr = v_total_pnl_curr * initial_cap
 
                 span_days = (v_df_curr['exec_ts'].max() - v_df_curr['exec_ts'].min()).total_seconds() / 86400.0
                 safe_span = max(1.0, span_days)
@@ -1591,7 +1685,7 @@ with dash_tab4:
 
                 m1, m2 = st.columns(2)
                 m1.metric("服役期间实盘胜率", f"{v_win_rate_curr:.1%}", delta=f"总发车 {len(v_df_curr)} 次")
-                m2.metric("累计创造利润", f"{v_total_usdt_curr:+.2f} USDT", delta=f"账户净值折算 {v_total_pnl_curr:+.2%}", delta_color="normal" if v_total_usdt_curr > 0 else "inverse")
+                m2.metric("已平仓估算利润", f"{v_total_usdt_curr:+.2f} USDT", delta=f"本金折算 {v_total_pnl_curr:+.2%}", delta_color="normal" if v_total_usdt_curr > 0 else "inverse")
 
                 m3, m4 = st.columns(2)
                 m3.metric("平均持仓时间", f"{v_df_curr['hold_hours'].mean():.1f} 小时")
@@ -1599,6 +1693,7 @@ with dash_tab4:
                     m4.metric("实盘理论年化 (预估)", f"{annual_roi:+.2%}", delta=f"基于 {span_days:.1f} 天外推", delta_color="normal" if annual_roi > 0 else "inverse")
                 else:
                     m4.metric("实盘理论年化 (预估)", "计算中 ⏳", delta="跨度不足 24h")
+                st.caption("口径：本模块按本地订单流水重建已平仓收益；不等同于交易所账户总权益，未包含当前未平仓浮盈亏、精确手续费、资金费和非本模型历史资金变动。")
 
             with col2:
                 render_confidence_calibration(v_df_curr, shadow_df, model_stack)

@@ -16,7 +16,7 @@ from execution_oms import (
 )
 from quant_config.config import (
     DATA_DIR, LIVE_DATA_DIR, MODEL_DIR, SYMBOL, AUX_SYMBOLS,
-    HARD_TP, HARD_SL, HOLD_PERIOD,
+    HARD_TP, HARD_SL, HOLD_PERIOD, HOLD_EXPIRY_GRACE_SECONDS,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, FORECAST_HORIZON,
     BAILOUT_MIN_PHYSICAL_DROP, BAILOUT_OBI_THRESH, EXPERIMENT_ID,
     MACRO_ALPHA_TOP_10, MACRO_ALPHA_TOP_5, MACRO_ALPHA_TOP_1,
@@ -109,6 +109,52 @@ def _phys_from_stop_price(entry_px, pos_side, stop_px):
     if entry_px <= 0 or stop_px <= 0:
         return None
     return (stop_px - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - stop_px) / entry_px
+
+
+def _position_mark_price(position, fallback_price=0.0):
+    info = position.get("info", {}) or {}
+    candidates = [
+        position.get("markPrice"),
+        position.get("mark_price"),
+        info.get("mark_price"),
+        info.get("markPrice"),
+        info.get("mark_price_round"),
+        fallback_price,
+    ]
+    for raw_price in candidates:
+        try:
+            price = float(raw_price or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return 0.0
+
+
+def _position_physical_pnl(position, pos_side, entry_px, fallback_price):
+    mark_px = _position_mark_price(position, 0.0)
+    if entry_px > 0 and mark_px > 0:
+        if str(pos_side).upper() == 'LONG':
+            return (mark_px - entry_px) / entry_px, mark_px
+        return (entry_px - mark_px) / entry_px, mark_px
+
+    info = position.get("info", {}) or {}
+    try:
+        contracts = abs(float(info.get("size", position.get("contracts", 0)) or 0.0))
+        contract_size = float(position.get("contractSize", info.get("quanto_multiplier", 1)) or 1)
+        unrealized = float(info.get("unrealised_pnl", info.get("unrealized_pnl", 0)) or 0.0)
+        notional = contracts * contract_size * entry_px
+        if notional > 0:
+            return unrealized / notional, 0.0
+    except (TypeError, ValueError):
+        pass
+
+    mark_px = _position_mark_price(position, fallback_price)
+    if entry_px <= 0 or mark_px <= 0:
+        return 0.0, mark_px
+    if str(pos_side).upper() == 'LONG':
+        return (mark_px - entry_px) / entry_px, mark_px
+    return (entry_px - mark_px) / entry_px, mark_px
 
 
 def _normalize_model_specs(cfg):
@@ -570,19 +616,58 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
     """右脑专用：执行紧急市价逃生"""
     gate_sym = p['symbol']
     pos_side = str(p.get('side', '')).upper()
-    contracts = float(p.get('contracts', 0))
-    entry_px = float(p.get('entryPrice', p['info'].get('entry_price', p['info'].get('avgPx', 0))))
+    info = p.get('info', {}) or {}
+    contracts = abs(float(info.get('size', p.get('contracts', 0)) or 0.0))
+    entry_px = float(p.get('entryPrice', info.get('entry_price', info.get('avgPx', 0))) or 0.0)
 
     print(f"\n🚨 [右脑介入] 侦测到 {base_sym} {reason}！执行市价核弹清仓 (数量: {contracts})...")
     try:
+        live_position_status, live_position = _fetch_live_same_side_position(ex, gate_sym, pos_side)
+        if live_position_status == "flat":
+            msg = "交易所复核显示同向仓位已不存在，跳过市价平仓与本地平仓落库，等待供货线程记录真实被动平仓。"
+            print(f"   ℹ️ {msg}")
+            log_system_alert("ℹ️ 主动出场跳过", base_sym, msg)
+            _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=anchor_closed_ts)
+            return "flat"
+        if live_position_status == "active" and live_position:
+            p = live_position
+            info = p.get('info', {}) or {}
+            contracts = abs(float(info.get('size', p.get('contracts', contracts)) or contracts))
+            entry_px = float(p.get('entryPrice', info.get('entry_price', info.get('avgPx', entry_px))) or entry_px)
+            current_price = _position_mark_price(p, current_price) or current_price
+        if contracts <= 1e-8:
+            raise RuntimeError("复核后平仓数量为 0，拒绝写入本地平仓流水")
+
         # 1. 越权下发市价单
         cl_side = 'sell' if pos_side == 'LONG' else 'buy'
         try:
-            ex.create_order(symbol=gate_sym, type='market', side=cl_side, amount=contracts, params={'reduceOnly': True})
+            ex.create_order(
+                symbol=gate_sym,
+                type='market',
+                side=cl_side,
+                amount=contracts,
+                params={'reduceOnly': True, 'reduce_only': True},
+            )
             print(f"   ✅ 交易所市价平仓指令已下发 ({gate_sym})")
         except Exception as e:
             print(f"   ⚠️ 交易所下单接口报错: {e}")
-            # 即便下单报错也尝试继续执行落库，可能仓位已经由于 OCO 先一步平掉了
+            live_position_status, _ = _fetch_live_same_side_position(ex, gate_sym, pos_side)
+            if live_position_status == "flat":
+                msg = "下单报错后复核仓位已为空，不写本地主动平仓流水，交给被动平仓同步。"
+                print(f"   ℹ️ {msg}")
+                log_system_alert("ℹ️ 主动出场未落库", base_sym, msg)
+                _register_forced_exit_lock(base_sym, reason, anchor_closed_ts=anchor_closed_ts)
+                return "flat"
+            log_system_alert("❌ 主动出场失败", base_sym, f"{reason} | 交易所拒单且仓位仍存在: {e}")
+            return "failed"
+
+        time.sleep(0.8)
+        live_position_status, _ = _fetch_live_same_side_position(ex, gate_sym, pos_side)
+        if live_position_status == "active":
+            msg = "市价平仓下发后复核仍存在同向仓位，本轮不写本地平仓流水，等待下一轮右脑处理。"
+            print(f"   ⚠️ {msg}")
+            log_system_alert("⚠️ 主动出场未确认", base_sym, msg)
+            return "failed"
 
         # 2. 扫清残余 OCO
         try:
@@ -648,10 +733,12 @@ def execute_bailout(ex, base_sym, p, reason, current_price, anchor_closed_ts=Non
         )
         state.push_queue.put({"token": PUSHPLUS_TOKEN, "title": push_title, "content": push_content, "template": "html"})
         state.recent_pushes[base_sym] = time.time()
+        return "closed"
 
     except Exception as e:
         print(f"   ⚠️ 右脑熔断清仓失败: {e}")
         log_system_alert("❌ 熔断异常", base_sym, f"跳伞执行失败: {e}")
+        return "failed"
 
 
 def _gate_stop_text(stop_order):
@@ -984,6 +1071,9 @@ def bailout_worker():
 
                     # 如果交易所最新返回的均价/张数发生同向增加，说明触发了实盘加仓。
                     same_signal_refreshed = False
+                    now_ts = time.time()
+                    hold_deadline_ts = float(mem.get('entry_time', now_ts) or now_ts) + HOLD_PERIOD * 3600
+                    hold_expired = now_ts + HOLD_EXPIRY_GRACE_SECONDS >= hold_deadline_ts
                     if add_position_detected:
                         # 记住当时的物理绝对止损价格
                         if pos_side == 'LONG':
@@ -1018,19 +1108,22 @@ def bailout_worker():
                     else:
                         mem['last_contracts'] = position_contracts
 
-                        same_signal_refreshed = _refresh_entry_time_on_same_direction_signal(
-                            mem,
-                            base_sym,
-                            pos_side,
-                            symbol_status,
-                            th,
-                        )
+                        if not hold_expired:
+                            same_signal_refreshed = _refresh_entry_time_on_same_direction_signal(
+                                mem,
+                                base_sym,
+                                pos_side,
+                                symbol_status,
+                                th,
+                            )
                     # ---------------------------------------------------------
                     # 📈 轨道 1：双轨追踪状态机
                     # ---------------------------------------------------------
-                    current_phys_pnl = (current_close - entry_px) / entry_px if pos_side == 'LONG' else (entry_px - current_close) / entry_px
+                    current_phys_pnl, _ = _position_physical_pnl(p, pos_side, entry_px, current_close)
                     mem['max_phys_pnl'] = max(mem['max_phys_pnl'], current_phys_pnl)
-                    hold_hours = (time.time() - mem['entry_time']) / 3600.0
+                    now_ts = time.time()
+                    hold_hours = (now_ts - mem['entry_time']) / 3600.0
+                    hold_expired = now_ts + HOLD_EXPIRY_GRACE_SECONDS >= mem['entry_time'] + HOLD_PERIOD * 3600
 
                     target_signal, target_tier = _resolve_target_signal_tier_from_status(
                         symbol_status,
@@ -1061,6 +1154,7 @@ def bailout_worker():
                         if is_favorable_signal and not same_signal_refreshed:
                             mem['entry_time'] = time.time()
                             hold_hours = 0.0
+                            hold_expired = False
                         tight_cancelled_this_loop = True
                         log_system_alert("ℹ️ 紧逼追踪取消", base_sym, f"{reason}，停止继续执行0.5%紧逼棘轮；已抬高的交易所物理止损不主动放宽。")
 
@@ -1068,11 +1162,11 @@ def bailout_worker():
                     close_reason = ""
 
                     # 触发器 1 & 3：反转 或 超过配置中的持仓时长上限
-                    if not tight_cancelled_this_loop and (is_reversal or hold_hours >= HOLD_PERIOD):
+                    if not tight_cancelled_this_loop and (is_reversal or hold_expired):
                         if current_phys_pnl < 0.005 and not mem['trailing_active']:
                             need_market_close = True
                             close_reason = "AI反转" if is_reversal else f"{HOLD_PERIOD}小时持仓超时"
-                            close_reason += " (利润不足0.5%立即斩仓)"
+                            close_reason += f" (利润不足0.5%立即斩仓，交易所Mark浮盈={current_phys_pnl:+.2%})"
                         else:
                             mem['trailing_active'] = True
                             mem['trailing_mode'] = 'tight'
@@ -1102,9 +1196,10 @@ def bailout_worker():
                         mem['atr_sl_phys'] = mem['max_phys_pnl'] - trailing_retrace_phys
 
                     if need_market_close:
-                        execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)
-                        bailout_cooldown_locks[base_sym] = time.time()
-                        del tracking_mem[base_sym]
+                        bailout_result = execute_bailout(bailout_ex, base_sym, p, close_reason, current_close)
+                        if bailout_result in ("closed", "flat"):
+                            bailout_cooldown_locks[base_sym] = time.time()
+                            del tracking_mem[base_sym]
                         continue
 
                     physical_sl_px = _stop_price_from_phys(entry_px, pos_side, mem['physical_sl_phys'])

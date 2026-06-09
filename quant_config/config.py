@@ -85,7 +85,9 @@ LEVERAGE_3 = float(os.environ.get("OPT_LEVERAGE_3", 8.0))
 
 FEE_RATE = 0.0005        
 
-HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))         
+HOLD_PERIOD = int(os.environ.get("OPT_HOLD_PERIOD", 12))
+# 持仓到期容差：距离 HOLD_PERIOD 不足该秒数时，视为已到期，避免整点推理早几秒导致超时拖到下一小时。
+HOLD_EXPIRY_GRACE_SECONDS = int(os.environ.get("OPT_HOLD_EXPIRY_GRACE_SECONDS", 60))
 HARD_TP = float(os.environ.get("OPT_HARD_TP", 0.02))
 HARD_SL = float(os.environ.get("OPT_HARD_SL", 0.025))
 # 追踪止盈回撤宽度：ATR(period) × multi / entry_price，替代固定 1% 回撤。

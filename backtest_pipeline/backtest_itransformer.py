@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from quant_config.config import (
     SYMBOL, PROCESSED_MAIN_DIR, PROCESSED_MAIN_ROOT, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR,
-    EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HARD_TP, HARD_SL,
+    EXPERIMENT_ID, FEE_RATE, HOLD_PERIOD, HOLD_EXPIRY_GRACE_SECONDS, HARD_TP, HARD_SL,
     LEVERAGE_1, LEVERAGE_2, LEVERAGE_3, FORECAST_HORIZON,
     TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI, TRAILING_PHYSICAL_GAP, LIVE_SYMBOL_CONFIGS,
     normalize_symbol
@@ -470,7 +470,8 @@ def run_backtest(args=None):
             # 💡 情景 B: 同 Tier 信号才刷新持仓计时；更高 Tier 额外补仓并重置计时。
             # 低 Tier 信号代表概率走弱，不能给高 Tier 持仓续命。
             elif current_pos == target_pos:
-                if target_tier == current_tier or target_tier > current_tier:
+                hold_near_expiry = hold_timer_mins * 60 <= HOLD_EXPIRY_GRACE_SECONDS
+                if target_tier > current_tier or (target_tier == current_tier and not hold_near_expiry):
                     hold_timer_mins = HOLD_PERIOD * 60
                     if trailing_mode == "tight":
                         trailing_active = False
