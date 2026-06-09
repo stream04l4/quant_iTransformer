@@ -19,7 +19,11 @@ from quant_config.config import (
     SYMBOL, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
-    FORECAST_HORIZON, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS
+    FORECAST_HORIZON, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS,
+    MACRO_ALPHA_TOP_10, MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE,
+    MACRO_LOGIT_TAIL_SCORE, MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA,
+    MACRO_LOGIT_MAX_DELTA, MACRO_MAX_PROB_SHIFT, MACRO_LOGIT_MID_POWER,
+    MACRO_LOGIT_TAIL_POWER, MACRO_LOGIT_EXTREME_POWER
 )
 
 # --- 核心配置路径 ---
@@ -217,6 +221,112 @@ def _format_factor(value):
     if np.isinf(value):
         return "∞"
     return f"{float(value):.2f}"
+
+
+def _safe_float_value(value, default=np.nan):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dashboard_logit_fusion(base_prob, macro_score, alpha):
+    """和 live_pipeline 的宏观融合口径保持一致，用于旧 payload 的 UI 兜底。"""
+    epsilon = 1e-7
+    p_safe = np.clip(_safe_float_value(base_prob, 0.0), epsilon, 1.0 - epsilon)
+    logit = np.log(p_safe / (1.0 - p_safe))
+
+    score = float(np.clip(_safe_float_value(macro_score, 0.0), -1.0, 1.0))
+    abs_score = abs(score)
+    sign = 1.0 if score >= 0 else -1.0
+    tier_scale = float(np.clip(float(alpha or 0.0) / max(abs(MACRO_ALPHA_TOP_10), 1e-9), 0.0, 1.0))
+
+    dead_zone = min(max(MACRO_LOGIT_DEAD_ZONE, 0.0), 1.0)
+    mid_score = min(max(MACRO_LOGIT_MID_SCORE, dead_zone + 1e-9), 1.0)
+    tail_score = min(max(MACRO_LOGIT_TAIL_SCORE, mid_score + 1e-9), 1.0)
+
+    if abs_score <= dead_zone:
+        macro_delta = 0.0
+    elif abs_score <= mid_score:
+        x = (abs_score - dead_zone) / (mid_score - dead_zone)
+        macro_delta = MACRO_LOGIT_MID_DELTA * (x ** MACRO_LOGIT_MID_POWER)
+    elif abs_score <= tail_score:
+        x = (abs_score - mid_score) / (tail_score - mid_score)
+        macro_delta = MACRO_LOGIT_MID_DELTA + (
+            MACRO_LOGIT_TAIL_DELTA - MACRO_LOGIT_MID_DELTA
+        ) * (x ** MACRO_LOGIT_TAIL_POWER)
+    else:
+        x = (abs_score - tail_score) / (1.0 - tail_score + 1e-9)
+        macro_delta = MACRO_LOGIT_TAIL_DELTA + (
+            MACRO_LOGIT_MAX_DELTA - MACRO_LOGIT_TAIL_DELTA
+        ) * (x ** MACRO_LOGIT_EXTREME_POWER)
+
+    adjusted_logit = logit + (sign * macro_delta * tier_scale)
+    adjusted_prob = float(1.0 / (1.0 + np.exp(-adjusted_logit)))
+    max_shift = max(0.0, float(MACRO_MAX_PROB_SHIFT)) * abs_score * tier_scale
+    return float(np.clip(adjusted_prob, p_safe - max_shift, p_safe + max_shift))
+
+
+def _solo_order_decision_from_probs(p_down, p_up, thresholds):
+    if not thresholds:
+        return 0, 0
+    if p_up > thresholds.get("up_top_1", 1.0):
+        return 1, 3
+    if p_up > thresholds.get("up_top_5", 1.0):
+        return 1, 2
+    if p_up > thresholds.get("up_top_10", 1.0):
+        return 1, 1
+    if p_down > thresholds.get("down_top_1", 1.0):
+        return -1, 3
+    if p_down > thresholds.get("down_top_5", 1.0):
+        return -1, 2
+    if p_down > thresholds.get("down_top_10", 1.0):
+        return -1, 1
+    return 0, 0
+
+
+def _format_order_signal(signal):
+    try:
+        signal = int(signal)
+    except (TypeError, ValueError):
+        signal = 0
+    if signal == 1:
+        return "做多"
+    if signal == -1:
+        return "做空"
+    return "否"
+
+
+def _resolve_submodel_order_status(model_info, macro_score):
+    signal = model_info.get("adj_signal", model_info.get("signal", model_info.get("target_signal")))
+    tier = model_info.get("adj_tier", model_info.get("tier", model_info.get("target_tier")))
+    try:
+        signal_int = int(signal)
+        tier_int = int(tier or 0)
+        if signal_int in (-1, 0, 1) and tier_int in (0, 1, 2, 3):
+            return _format_order_signal(signal_int), f"Tier-{tier_int}" if tier_int else "-"
+    except (TypeError, ValueError):
+        pass
+
+    exp_id = str(model_info.get("experiment_id", model_info.get("name", ""))).strip()
+    try:
+        thresholds, _ = _load_thresholds_for_experiment(exp_id)
+    except Exception:
+        thresholds = {}
+    if not thresholds:
+        return "待门槛", "-"
+
+    p_up = _safe_float_value(model_info.get("prob_up"))
+    p_down = _safe_float_value(model_info.get("prob_down"))
+    if pd.isna(p_up) or pd.isna(p_down):
+        return "待概率", "-"
+
+    adj_p_up = _dashboard_logit_fusion(p_up, macro_score, MACRO_ALPHA_TOP_10)
+    adj_p_down = _dashboard_logit_fusion(p_down, -macro_score, MACRO_ALPHA_TOP_10)
+    signal_int, tier_int = _solo_order_decision_from_probs(adj_p_down, adj_p_up, thresholds)
+    return _format_order_signal(signal_int), f"Tier-{tier_int}" if tier_int else "-"
 
 # ==========================================
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
@@ -1960,15 +2070,21 @@ def render_market_radar():
 
         if ensemble_models:
             with st.expander("查看子模型概率与权重", expanded=model_count > 1):
-                model_df = pd.DataFrame([
-                    {
+                def _build_submodel_row(m):
+                    order_text, tier_text = _resolve_submodel_order_status(m, macro_score)
+                    return {
                         "模型": m.get("experiment_id", m.get("name", "unknown")),
                         "权重": float(m.get("weight", 0.0)) * 100,
                         "看涨": np.nan if pd.isna(m.get("prob_up", np.nan)) else float(m.get("prob_up", 0.0)) * 100,
                         "震荡": np.nan if pd.isna(m.get("prob_flat", np.nan)) else float(m.get("prob_flat", 0.0)) * 100,
                         "看跌": np.nan if pd.isna(m.get("prob_down", np.nan)) else float(m.get("prob_down", 0.0)) * 100,
                         "状态": m.get("status", "已推理"),
+                        "是否下单": order_text,
+                        "Tier": tier_text,
                     }
+
+                model_df = pd.DataFrame([
+                    _build_submodel_row(m)
                     for m in ensemble_models
                 ])
                 st.dataframe(

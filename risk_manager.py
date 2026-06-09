@@ -1166,7 +1166,7 @@ def bailout_worker():
                         if current_phys_pnl < 0.005 and not mem['trailing_active']:
                             need_market_close = True
                             close_reason = "AI反转" if is_reversal else f"{HOLD_PERIOD}小时持仓超时"
-                            close_reason += f" (利润不足0.5%立即斩仓，交易所Mark浮盈={current_phys_pnl:+.2%})"
+                            close_reason += f" (利润不足0.5%立即斩仓，交易所口径物理浮盈={current_phys_pnl:+.2%})"
                         else:
                             mem['trailing_active'] = True
                             mem['trailing_mode'] = 'tight'
