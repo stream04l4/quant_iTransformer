@@ -19,7 +19,7 @@ from quant_config.config import (
     SYMBOL, MODEL_DIR, LIVE_DATA_DIR, AUX_SYMBOLS,
     HARD_TP, HARD_SL, INITIAL_CAPITAL, BASE_RISK_BUDGET,
     BAILOUT_ATR_MULTI, BAILOUT_VOL_MULTI, TRAILING_ATR_PERIOD, TRAILING_ATR_MULTI,
-    FORECAST_HORIZON, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS,
+    FORECAST_HORIZON, HOLD_PERIOD, EXPERIMENT_ID, LIVE_SYMBOL_CONFIGS,
     MACRO_ALPHA_TOP_10, MACRO_LOGIT_DEAD_ZONE, MACRO_LOGIT_MID_SCORE,
     MACRO_LOGIT_TAIL_SCORE, MACRO_LOGIT_MID_DELTA, MACRO_LOGIT_TAIL_DELTA,
     MACRO_LOGIT_MAX_DELTA, MACRO_MAX_PROB_SHIFT, MACRO_LOGIT_MID_POWER,
@@ -230,6 +230,151 @@ def _safe_float_value(value, default=np.nan):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_parse_epoch(raw_value):
+    """兼容秒/毫秒时间戳，解析失败返回 None。"""
+    try:
+        ts = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    return ts
+
+
+def _parse_local_exec_ts(raw_value):
+    if not raw_value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(raw_value), fmt).timestamp()
+        except (TypeError, ValueError):
+            continue
+    try:
+        parsed = pd.to_datetime(raw_value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _resolve_latest_same_side_trade_time(base_symbol, pos_side):
+    db_name = os.path.join(LIVE_DATA_DIR, f"trading_intelligence_{base_symbol}.db")
+    local_open_side = "buy" if str(pos_side).upper() == "LONG" else "sell"
+    if not os.path.exists(db_name):
+        return None
+    try:
+        with sqlite3.connect(db_name, timeout=1.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT exec_ts
+                FROM live_trades
+                WHERE side = ?
+                ORDER BY exec_ts DESC
+                LIMIT 1
+                """,
+                (local_open_side,),
+            )
+            row = cursor.fetchone()
+        return _parse_local_exec_ts(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _load_live_status_by_symbol():
+    status_file = os.path.join(LIVE_DATA_DIR, "live_status.json")
+    if not os.path.exists(status_file):
+        return {}
+    try:
+        with open(status_file, "r") as f:
+            status_data = json.load(f)
+    except Exception:
+        return {}
+
+    symbols = status_data.get("symbols", {}) if isinstance(status_data, dict) else {}
+    if isinstance(symbols, dict) and symbols:
+        return {_normalize_symbol_key(sym): payload for sym, payload in symbols.items()}
+
+    sym_key = _normalize_symbol_key(status_data.get("symbol", SYMBOL)) if isinstance(status_data, dict) else ""
+    return {sym_key: status_data} if sym_key else {}
+
+
+def _resolve_same_direction_refresh_time(pos_side, symbol_status, base_entry_ts):
+    symbol_status = symbol_status or {}
+    execution_state = symbol_status.get("execution_state", {}) or {}
+    signal_refresh_ts = _safe_parse_epoch(execution_state.get("last_signal_evaluated_ts"))
+    if signal_refresh_ts is None:
+        signal_refresh_ts = _safe_parse_epoch(execution_state.get("last_inferred_hour"))
+    if signal_refresh_ts is None:
+        return None
+
+    try:
+        target_signal = int(execution_state.get("target_signal", 0) or 0)
+        target_tier = int(execution_state.get("target_tier", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    current_side = 1 if str(pos_side).upper() == "LONG" else -1
+    if target_signal != current_side:
+        return None
+
+    position_tier_state = symbol_status.get("position_tier_state", {}) or {}
+    try:
+        state_side = int(position_tier_state.get("side", 0) or 0)
+        current_tier = int(position_tier_state.get("highest_tier", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if state_side != current_side or target_tier != current_tier:
+        return None
+    if target_tier not in (1, 2, 3):
+        return None
+    if base_entry_ts is not None and signal_refresh_ts <= float(base_entry_ts):
+        return None
+    return signal_refresh_ts
+
+
+def _resolve_position_entry_time_for_ui(position, base_symbol, pos_side, trailing_state, symbol_status=None):
+    exported_entry_ts = _safe_parse_epoch((trailing_state or {}).get("entry_time"))
+    base_entry_ts = exported_entry_ts
+
+    if base_entry_ts is None:
+        base_entry_ts = _resolve_latest_same_side_trade_time(base_symbol, pos_side)
+
+    if base_entry_ts is None:
+        info = position.get("info", {}) or {}
+        for raw_ts in [
+            info.get("open_time"),
+            position.get("timestamp"),
+            position.get("lastUpdateTimestamp"),
+            info.get("update_time"),
+        ]:
+            parsed_ts = _safe_parse_epoch(raw_ts)
+            if parsed_ts is not None:
+                base_entry_ts = parsed_ts
+                break
+
+    refresh_ts = _resolve_same_direction_refresh_time(pos_side, symbol_status, base_entry_ts)
+    return refresh_ts if refresh_ts is not None else base_entry_ts
+
+
+def _format_remaining_hold_time(entry_ts):
+    if entry_ts is None:
+        return "未知"
+    remaining_sec = float(entry_ts) + float(HOLD_PERIOD) * 3600.0 - time.time()
+    if remaining_sec <= 0:
+        return "已到期"
+    total_minutes = int(np.ceil(remaining_sec / 60.0))
+    hours, minutes = divmod(total_minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days > 0:
+        return f"{days}d {hours}h"
+    return f"{hours}h {minutes:02d}m"
 
 
 def _dashboard_logit_fusion(base_prob, macro_score, alpha):
@@ -1049,11 +1194,15 @@ def render_realtime_portfolio():
 
             # 在循环前，一次性读取右脑导出的 ATR 追踪状态。
             chandelier_mem = _load_chandelier_state()
+            live_status_by_symbol = _load_live_status_by_symbol()
 
             for p in positions:
                 info = p['info']
                 symbol_raw = p['symbol']
                 base_symbol = _normalize_symbol_key(symbol_raw)
+                pos_side = str(p.get('side', '')).upper()
+                entry_px = 0.0
+                mark_px = 0.0
 
                 real_tp, real_sl = "未挂载 ⚠️", "未挂载 ⚠️"
                 physical_sl_px = 0.0 # 👇 新增：用于数学计算的物理止损价
@@ -1107,6 +1256,15 @@ def render_realtime_portfolio():
 
                 # 从右脑状态中提取 ATR 内存线与交易所物理棘轮目标。
                 trailing_state = chandelier_mem.get(base_symbol, {}) or {}
+                symbol_status = live_status_by_symbol.get(base_symbol, {})
+                entry_time_ts = _resolve_position_entry_time_for_ui(
+                    p,
+                    base_symbol,
+                    pos_side,
+                    trailing_state,
+                    symbol_status,
+                )
+                remaining_hold_time = _format_remaining_hold_time(entry_time_ts)
                 atr_target_sl_px = float(trailing_state.get('current_stop', 0.0) or 0.0)
                 profit_floor_px = float(
                     trailing_state.get('exchange_stop', trailing_state.get('profit_floor', 0.0)) or 0.0
@@ -1137,6 +1295,7 @@ def render_realtime_portfolio():
                     "杠杆": f"{leverage_used:.0f}x",
                     "占用保证金": f"${actual_margin:,.2f}",
                     "开仓均价": f"${entry_px:,.4f}",
+                    "剩余持仓时间": remaining_hold_time,
                     "防守止损 (SL)": real_sl,
                     "当前标记价": f"${float(info.get('markPx', info.get('mark_price', 0))):,.4f}",
                     "浮动盈亏 (USDT)": f"{upl:,.2f}",
