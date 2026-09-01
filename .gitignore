@@ -14,7 +14,6 @@ models/
 
 # 3. 配置文件 (防止实盘 API 密钥或私人调参泄露)
 *.json.tmp
-.env
 # 4. Python 缓存与虚拟环境
 __pycache__/
 *.py[cod]

@@ -28,9 +28,10 @@ quant_iTransformer/
 ├── state_manager.py               # 线程共享状态
 ├── 0_⚡_实盘监控指挥塔.py          # Streamlit 实盘监控面板
 ├── data/
-│   ├── train/                     # 训练数据、缓存、优化结果、实盘审计 CSV
+│   ├── train/                     # 原始与加工训练数据、缓存、实盘审计 CSV
 │   └── live/                      # 实盘状态、SQLite、JSON 快照
 └── model/                         # 模型权重、动态阈值、回测图表
+    └── result/                    # auto_optimize 调参搜索结果报告（CSV）
 ```
 
 ## 整体架构
@@ -70,11 +71,89 @@ Streamlit 监控面板
 4. 训练采用 purged split，训练集和验证集之间按预测周期隔离，降低标签泄露风险。
 5. 最优模型按 `selection_score` 保存到 `model/itransformer_{SYMBOL}_best_{EXPERIMENT_ID}.pth`，权重文件内包含模型结构参数、特征列、预测周期、验证指标等元数据。
 
+### 训练数据特征
+
+`build_main_features.py` 生成的训练宽表每行对应一个小时，文件名为 `{SYMBOL}_Master_Training_Matrix_{horizon}h_{date}.parquet`。`train_itransformer.py` 会取除 `hour_timestamp` 和 `target_{horizon}h_return` 之外的所有列作为模型输入，特征列表随权重文件元数据（`feature_cols`）保存，实盘推理按它校验，因此离线与在线必须同构。
+
+当前默认配置（含 aggTrades 订单流）共 **31 个输入特征**；若 aggTrades 数据缺失会自动降级为 26 个。可用 `inspect_features.py` 检查宽表维度与特征健康度（死特征、z-score epsilon 吞噬等）。
+
+#### 行标记
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `is_synthetic` | `0/1` 整数 | upsample 补插后的合成行标记：该小时 K 线、OI 或溢价指数任一缺失即记 1，与其他特征一同入模 |
+
+#### 价格行为（期货 1h K 线）
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `log_return` | `ln(close_t / close_{t-1})` | 当小时对数收益 |
+| `max_ret_24h` | `rolling_max(log_return, 24)` | 过去 24h 最大单根对数收益；“彩票效应”因子，识别非理性拉升 |
+| `ma_bias` | `(close - EMA_200) / EMA_200` | 相对长期趋势中枢的偏离度 |
+| `upper_shadow` | `(high - max(open, close)) / (high - low)` | 上影线占比，盘中抛压 |
+| `lower_shadow` | `(min(open, close) - low) / (high - low)` | 下影线占比，盘中承接 |
+| `bb_squeeze` | `4 * std(close, 20) / mean(close, 20)` | 布林带宽度代理，衡量波动率收缩/扩张 |
+| `ppo_hist` | `(EMA_12 - EMA_26) / EMA_26 - EMA_9(同左)` | PPO 柱状图，趋势变化的动量加速度 |
+| `rsi_14` | `(RSI_14 - 50) / 50`（Wilder 平滑） | 短期超买超卖，归一化到 `[-1, 1]` |
+| `rsi_48` | `(RSI_48 - 50) / 50`（Wilder 平滑） | 中期超买超卖，归一化到 `[-1, 1]` |
+| `taker_ratio_delta` | `diff(taker_buy_volume / volume)` | 主动买入占比差分（TBRD），捕捉资金突袭的“加速度” |
+
+#### 波动与流动性
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `amihud_illiquidity_zscore` | `ln(\|log_return\| / quote_volume)` 的 Robust Z | Amihud 价格冲击/流动性消耗率，平稳化后入模 |
+| `realized_vol_1h_zscore` | `sqrt(Σ ret_1m²)`（基于 1m K 线）的 Robust Z | 小时级高频已实现波动率，平稳化后入模 |
+| `vol_skew_24h` | `log_return` 24h 滚动偏度（原生中心矩展开） | 收益分布不对称性，左尾即崩盘风险 |
+| `rv_term_structure` | `realized_vol_1h / mean(realized_vol_1h, 24)`，clip `[0, 50]` | 已实现波动率期限结构，当前小时 RV 相对 24h 均值的倍数 |
+
+#### 持仓与资金（永续结构）
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `oi_delta_pct` | `(OI_t - OI_{t-1}) / OI_{t-1}`，clip `[-1, 1]` | 小时级持仓量变化率，识别新建仓与强平 |
+| `funding_rate_momentum` | `mean(funding, 24) - mean(funding, 72)` | 资金费率动量，短期相对中期的定位溢价 |
+| `premium_delta` | `premium_close_t - premium_close_{t-1}` | 溢价指数（标记价格）小时变化，期现基差波动 |
+
+#### 横截面（辅助标的）
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `cross_asset_return` | `ln(cross_t / cross_{t-1})` | 辅助标的 1h 对数收益；优先 ETHBTC 直接交易对，缺失时回退 ETHUSDT/BTCUSDT 合成比值 |
+| `price_pos_24h` | `(close - min(low, 24)) / (max(high, 24) - min(low, 24))` | 收盘价在过去 24h 高低区间的位置，微观结构级 |
+| `price_pos_72h` | 同上，窗口 = 72 | 过去 72h 高低区间位置，中短线波段中枢 |
+| `price_pos_168h` | 同上，窗口 = 168 | 过去一周高低区间位置，宏观支撑/压制 |
+
+#### 时间编码
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `hour_sin` / `hour_cos` | `sin/cos(2π * hour / 24)` | 小时循环编码，捕捉资金费率结算时点等日内周期 |
+| `week_sin` / `week_cos` | `sin/cos(2π * weekday / 7)` | 星期循环编码，捕捉周内周期 |
+
+#### 订单流（aggTrades，由 `build_aggtrades.py` 生成）
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `cvd_zscore` | `CVD = Σ taker买量 - Σ taker卖量` 的 Robust Z | 小时级净主动买入偏离度 |
+| `whale_net_flow_zscore` | `(whale_buy - whale_sell)` 的 Robust Z | 大单净流入（单笔名义 ≥ 20 万 USDT） |
+| `whale_ls_ratio_zscore` | `(whale_buy + ε) / (whale_sell + ε)` 的 Robust Z | 大单多空比 |
+| `retail_ratio` | `散户量 / 总量`（单笔名义 ≤ 4000 USDT） | 散户参与度占比 |
+| `cvd_oi_divergence` | `cvd_zscore - oi_delta_pct_zscore` | COID 高阶背离：净主动买入偏离度减去持仓偏离度，识别“订单流 vs OI”背离 |
+
+#### 目标变量（不作为模型输入）
+
+| 特征 | 计算方式 | 说明 |
+| --- | --- | --- |
+| `target_{horizon}h_return` | `ln(close_{t+H} / close_t)`，`H = FORECAST_HORIZON`（默认 12） | 未来 H 小时对数收益；训练时按 `CLASS_THRESHOLD` 划为 down / flat / up 三类 |
+
+> **Robust Z-Score 说明**：带 `_zscore` 后缀的特征按 `0.6745 * (x - rolling_median(x, 168).shift(1)) / (rolling_MAD(x, 168).shift(1) + 1e-9)` 计算并 clip 到 `[-4, 4]`，基准窗口严格取 t-1 往前的 168 小时，避免未来信息。其中 `oi_delta_pct_zscore` 仅作 `cvd_oi_divergence` 的中间变量，不入模；入模的是原始 `oi_delta_pct`。
+
 ### 模型结构
 
 核心模型定义在 `historical_pipeline/train_itransformer.py` 的 `InvertedTransformer`：
 
-- 输入形状：`[batch, seq_len, num_features]`
+- 输入形状：`[batch, seq_len, num_features]`（`num_features` 由宽表特征列数决定，当前为 31，详见上文“训练数据特征”）
 - 反转维度：转为 `[batch, num_features, seq_len]`，让每个变量作为 token，时间窗口作为 token embedding 的输入。
 - 编码层：`nn.TransformerEncoder`，`n_heads` 由 `D_MODEL` 自动选择可整除值。
 - 输出层：flatten 后通过 MLP 输出 3 个 logits，对应 `down / flat / up`。
@@ -160,12 +239,13 @@ Streamlit 监控面板
 | 配置 | 默认位置 | 说明 |
 | --- | --- | --- |
 | `DATA_DIR` | `data/` | 项目数据根目录 |
-| `TRAIN_DATA_DIR` | `data/train/` | 训练数据、优化结果、实盘特征审计 |
+| `TRAIN_DATA_DIR` | `data/train/` | 训练数据、实盘特征审计 |
 | `LIVE_DATA_DIR` | `data/live/` | 实盘状态 JSON 与 SQLite |
 | `TEMP_DIR` | `data/train/raw_temp/` | 历史数据下载与缓存 |
 | `PROCESSED_AGGTRADES_DIR` | `data/train/processed/aggtrades_1h/{SYMBOL}` | 订单流小时特征 |
 | `PROCESSED_MAIN_DIR` | `data/train/processed/main_features_1h/{SYMBOL}` | 主训练宽表 |
 | `MODEL_DIR` | `model/` | 模型权重、阈值、回测图 |
+| `RESULT_DIR` | `model/result/` | auto_optimize 搜索结果报告（optimization_results / alpha_pure_evaluation） |
 
 ### 标的与数据区间
 
@@ -369,8 +449,8 @@ python3 sentiment_scraper.py
 | `data/train/processed/main_features_1h/{SYMBOL}/*.parquet` | `build_main_features.py` | 训练宽表 |
 | `model/itransformer_{SYMBOL}_best_{EXP}.pth` | `train_itransformer.py` | 模型权重与元数据 |
 | `model/dynamic_thresholds_{EXP}.json` | `check_prob_distribution.py` | 分位数概率阈值 |
-| `data/train/optimization_results_alpha.csv` | `auto_optimize.py --mode alpha` | Alpha 搜索结果 |
-| `data/train/optimization_results_backtest.csv` | `auto_optimize.py --mode backtest` | 回测参数搜索结果 |
+| `model/result/optimization_results_alpha.csv` | `auto_optimize.py --mode alpha` | Alpha 搜索结果 |
+| `model/result/optimization_results_backtest.csv` | `auto_optimize.py --mode backtest` | 回测参数搜索结果 |
 | `data/live/live_status.json` | `live_pipeline.py` | 实盘监控面板状态 |
 | `data/live/gateway_state.db` | `market_gateway.py` | 行情网关本地记忆库 |
 | `data/live/trading_intelligence_{SYMBOL}.db` | `execution_oms.py` | 交易流水与实盘审计 |

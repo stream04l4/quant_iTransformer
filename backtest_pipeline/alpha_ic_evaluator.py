@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 # 🚨 剔除网络拓扑和预测周期的硬编码依赖，只保留路径
-from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, TRAIN_DATA_DIR, TEMP_DIR, EXPERIMENT_ID
+from quant_config.config import SYMBOL, PROCESSED_MAIN_DIR, MODEL_DIR, RESULT_DIR, TEMP_DIR, EXPERIMENT_ID
 from historical_pipeline.train_itransformer import InvertedTransformer
 
 
@@ -231,7 +231,8 @@ def evaluate_pure_alpha():
         pd.set_option('display.float_format', '{:.4f}'.format)
         print(report_df.to_string(index=False))
         
-        out_file = TRAIN_DATA_DIR / "alpha_pure_evaluation.csv"
+        RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        out_file = RESULT_DIR / "alpha_pure_evaluation.csv"
         report_df.to_csv(out_file, mode='a', header=not out_file.exists(), index=False)
         print(f"\n💾 扫雷报告已追加保存至 {out_file}")
 

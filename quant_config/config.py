@@ -30,6 +30,8 @@ PROCESSED_DIR = TRAIN_DATA_DIR / "processed"
 PROCESSED_AGGTRADES_ROOT = PROCESSED_DIR / "aggtrades_1h"
 PROCESSED_MAIN_ROOT = PROCESSED_DIR / "main_features_1h"
 MODEL_DIR = PROJECT_ROOT / "model"
+# 调参/回测结果输出目录（auto_optimize 等生成的 CSV 报告，data/ 只保留原始与加工数据）
+RESULT_DIR = MODEL_DIR / "result"
 
 # ==========================================
 # 2. 交易标的与业务参数 (Trading & Features)
@@ -58,7 +60,7 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
 DATA_START_MONTH = (2021, 12)   
-DATA_END_MONTH = (2026, 6)     
+DATA_END_MONTH = (2026, 8)     
 
 # ==========================================
 # 4. 币安接口与表结构路由 (Endpoints & Schema)

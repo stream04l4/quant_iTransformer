@@ -14,13 +14,13 @@ import uuid
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-from quant_config.config import TRAIN_DATA_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR, SYMBOL
+from quant_config.config import RESULT_DIR, MODEL_DIR, HISTORICAL_DIR, BACKTEST_DIR, SYMBOL
 
 ALPHA_SEARCH_SPACE = {
     'FORECAST_HORIZON': [12],
     'SEQ_LEN': [672],
     'CLASS_THRESHOLD': [0.018],
-    'E_LAYERS': [1],
+    'E_LAYERS': [2],
     'D_MODEL': [128],
     'DROPOUT': [0.3],
     'BATCH_SIZE': [128],
@@ -230,7 +230,8 @@ def main():
         print("❌ 错误：在 backtest 模式下，必须使用 --base-model 指定基座模型！")
         sys.exit(1)
 
-    RESULTS_CSV = TRAIN_DATA_DIR / f"optimization_results_{args.mode}.csv"
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_CSV = RESULT_DIR / f"optimization_results_{args.mode}.csv"
     search_space = ALPHA_SEARCH_SPACE if args.mode == 'alpha' else BACKTEST_SEARCH_SPACE
 
     keys, values = zip(*search_space.items())
