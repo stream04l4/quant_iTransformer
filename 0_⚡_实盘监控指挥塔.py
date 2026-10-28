@@ -115,8 +115,171 @@ def _normalize_live_configs():
 LIVE_CONFIGS = _normalize_live_configs()
 ALL_SYMBOLS = list(LIVE_CONFIGS.keys())
 
-# --- UI 页面配置与高频轮询开关 ---
+# --- UI 页面配置（set_page_config 必须是首个 st 命令，登录门禁紧随其后） ---
 st.set_page_config(page_title="iTransformer 预测引擎", layout="wide")
+
+# ===================== 共享登录门禁（与 stock-screener 9090 同一套登录） =====================
+# 凭据来自本目录 .env：WEB_ADMIN_USER / WEB_ADMIN_PASS / WEB_SESSION_SECRET
+# （值与 stock-screener/.env 相同 → 任一系统登录，另一侧免登）。
+# token 契约与 stock-screener/web/auth.py 完全一致：
+#   v1.{user}.{exp}.{b64url(hmac_sha256(secret, "v1.{user}.{exp}))}，cookie ssc_session，7 天。
+# cookie 按域（host）不按端口 → 同机 9090/9091 共享同一 cookie。
+import base64 as _b64
+import hashlib as _hashlib
+import hmac as _hmac
+import time as _time
+
+_AUTH_COOKIE = "ssc_session"
+_AUTH_TTL = 7 * 24 * 3600
+
+def _auth_cfg():
+    return (os.environ.get("WEB_ADMIN_USER"), os.environ.get("WEB_ADMIN_PASS"),
+            os.environ.get("WEB_SESSION_SECRET"))
+
+def _auth_b64e(b):
+    return _b64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+def _auth_b64d(s):
+    return _b64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def _auth_parse(token, secret):
+    """有效 → 用户名；无效/过期/格式错 → None（与 stock 侧 parse_token 同行为）。"""
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 4 or parts[0] != "v1":
+        return None
+    user, exp_s, sig = parts[1], parts[2], parts[3]
+    if not user or not exp_s.isdigit() or int(exp_s) < _time.time():
+        return None
+    expect = _hmac.new(secret.encode("utf-8"), f"v1.{user}.{exp_s}".encode("utf-8"),
+                       _hashlib.sha256).digest()
+    try:
+        given = _auth_b64d(sig)
+    except Exception:  # 非法 base64
+        return None
+    return user if _hmac.compare_digest(expect, given) else None
+
+def _auth_make(user, secret):
+    exp = int(_time.time() + _AUTH_TTL)
+    payload = f"v1.{user}.{exp}"
+    sig = _hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), _hashlib.sha256).digest()
+    return f"{payload}.{_auth_b64e(sig)}"
+
+def _auth_read_token():
+    """读浏览器 ssc_session cookie。
+    streamlit 1.65 已移除 st.get_cookie/st.cookie → 首选 st.context.cookies
+    （初始请求携带的 cookie，实测跨端口送达正常）；保留旧版 API 兜底。"""
+    try:
+        c = st.context.cookies
+        v = c.get(_AUTH_COOKIE) if c is not None else None
+        if v:
+            return v
+    except Exception:
+        pass
+    for _getter in ("get_cookie", "experimental_get_cookie"):
+        fn = getattr(st, _getter, None)
+        if not fn:
+            continue
+        try:
+            v = fn(_AUTH_COOKIE)
+            if isinstance(v, dict):  # 兼容返回 {"value": ...} 的版本
+                v = v.get("value")
+            if v:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _set_browser_cookie(token):
+    """st.cookie 已移除（streamlit 1.65）→ 写临时 HTML 到 CWD/static/（streamlit 静态服务，
+    同源 iframe 可执行 JS 写 document.cookie），iframe 加载后延迟清理。
+    cookie 按 host 不按端口 → 写入后 9090/9091 互通（刷新/新标签生效）。
+    token 仅短暂落盘（~15s 自动删除），URL 不含 token。"""
+    import threading
+    import uuid
+    from pathlib import Path
+
+    def _do():
+        # 与 streamlit 的 app 静态目录同源：main_script 所在目录 / static
+        static_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "static"
+        static_dir.mkdir(exist_ok=True)
+        fn = static_dir / f"_ssc_{uuid.uuid4().hex}.html"
+        fn.write_text(
+            "<!doctype html><script>(function(){try{document.cookie='ssc_session="
+            + token + ";path=/;max-age=" + str(_AUTH_TTL) + ";samesite=lax';}catch(e){}})();</"
+            "script>",
+            encoding="utf-8",
+        )
+        # height 必须为正数（streamlit 1.65 对 0 抛 StreamlitInvalidHeightError）；
+        # app 静态服务路由是 /app/static/（/static/ 是前端 bundle，会落到 SPA 回退页）
+        st.iframe("/app/static/" + fn.name, height=1)
+
+        def _cleanup():
+            import time as _t
+            _t.sleep(15)
+            try:
+                fn.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    try:
+        _do()
+    except Exception:
+        pass  # 写 cookie 失败不阻断登录（本会话 session_state 仍放行）
+
+
+def _auth_gate():
+    au, ap, secret = _auth_cfg()
+    if not au or not ap or not secret:
+        st.error("登录凭据未配置：quant .env 缺少 WEB_ADMIN_USER / WEB_ADMIN_PASS / WEB_SESSION_SECRET")
+        st.stop()
+    user = st.session_state.get("_ssc_user")  # 本会话内已验证 → 直接放行
+    if not user:
+        tok = _auth_read_token()
+        user = _auth_parse(tok, secret) if tok else None
+        if user:
+            st.session_state["_ssc_user"] = user
+    if user:
+        # cookie 回写（表单登录后）：每次重跑都渲染同步 iframe（自动刷新会周期性
+        # 重建页面，单次渲染可能被清掉），直到新页面加载时 context.cookies 确认
+        # 浏览器已持有 cookie 才停止。同步 iframe 高 0 不可见，重设同值幂等。
+        sync_tok = st.session_state.get("_ssc_cookie_sync")
+        if sync_tok:
+            if _auth_read_token() is not None:
+                st.session_state.pop("_ssc_cookie_sync", None)
+            else:
+                _set_browser_cookie(sync_tok)
+        return
+    # ---- 未登录：登录表单（与 A股4维选股 同一账号密码） ----
+    st.title("⚡ Quant iTransformer · 登录")
+    st.caption("与 A股4维选股（9090）共享登录状态：任一系统登录后，另一侧免登。")
+    err = st.session_state.pop("_ssc_login_err", None)
+    if err:
+        st.error(err)
+    u_in = st.text_input("用户名", key="_ssc_login_u")
+    p_in = st.text_input("密码", type="password", key="_ssc_login_p")
+    if st.button("登 录"):
+        ok = (bool(u_in) and au is not None and ap is not None
+              and _hmac.compare_digest(str(u_in), au)
+              and _hmac.compare_digest(str(p_in), ap))
+        if ok:
+            # 本会话立即放行；cookie 回写延到面板渲染的那次运行（一次性）
+            st.session_state["_ssc_user"] = au
+            st.session_state["_ssc_cookie_sync"] = _auth_make(au, secret)
+            st.rerun()
+        else:
+            st.session_state["_ssc_login_err"] = "用户名或密码错误"
+    host = os.environ.get("PUBLIC_HOST") or "localhost"
+    st.caption(f"[← A股4维选股](http://{host}:9090/)")
+    st.stop()
+
+_auth_gate()
+# ==============================================================================
+
 
 # --- 🧠 按实盘配置加载概率门槛 ---
 def _load_thresholds_for_experiment(exp_id):
@@ -477,6 +640,8 @@ def _resolve_submodel_order_status(model_info, macro_score):
 # ⚡ 极简系统总控台 (合并刷新控制与硬件监控)
 # ==========================================
 st.sidebar.markdown("### ⚡ 系统总控台")
+_pub_host = os.environ.get("PUBLIC_HOST") or "localhost"
+st.sidebar.caption(f"[← A股4维选股](http://{_pub_host}:9090/)（共享登录）")
 
 # 使用列布局，把开关和频率数字框挤在一行，极致节省空间
 col_tog, col_val = st.sidebar.columns([1.2, 1])
