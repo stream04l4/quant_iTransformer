@@ -21,7 +21,8 @@ from quant_config.config import (
     TEMP_DIR, PROCESSED_MAIN_DIR, PROCESSED_AGGTRADES_DIR,
     PROCESSED_AGGTRADES_ROOT, SYMBOL, AUX_SYMBOLS,
     DATA_START_MONTH, DATA_END_MONTH, FORECAST_HORIZON,
-    BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_FUTURES_DAILY, BINANCE_BASE_URL_SPOT, BINANCE_BASE_URL_METRICS_DAILY,
+    BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_FUTURES_DAILY, BINANCE_BASE_URL_SPOT,
+    BINANCE_BASE_URL_SPOT_DAILY, BINANCE_BASE_URL_METRICS_DAILY,
     KLINE_COLS, FUNDING_COLS
 )
 
@@ -207,7 +208,7 @@ def save_raw_kline_parquet(full_df, timeframe):
 def fetch_daily_fill(market, data_type, symbol, timeframe, start_date, end_date):
     """当前月月度文件要到月末才生成，用 daily 包把数据桥接到最近可用日。
     404 (当天 dump 未发布) 跳过继续，保证幂等可重跑。"""
-    base_daily = BINANCE_BASE_URL_FUTURES_DAILY if market == "futures" else BINANCE_BASE_URL_SPOT + "/daily"
+    base_daily = BINANCE_BASE_URL_FUTURES_DAILY if market == "futures" else BINANCE_BASE_URL_SPOT_DAILY
     sandbox_root = TEMP_DIR / "daily" / data_type / symbol / timeframe
     dfs = []
     d = start_date
@@ -838,6 +839,25 @@ def build_features(horizon):
     null_report = features.null_count()
     with pl.Config(tbl_cols=-1):
         print(null_report)
+
+    # 空值区间诊断：对有空值的列输出空值所在时间区间 (区分头部预热 vs 尾部数据缺口)
+    ts_sorted = features.sort("hour_timestamp")
+    for col in [c for c in features.columns if ts_sorted[c].null_count() > 0]:
+        ts = ts_sorted.filter(pl.col(col).is_null())["hour_timestamp"].to_list()
+        if not ts:
+            continue
+        ranges = []
+        start = prev = ts[0]
+        for t in ts[1:]:
+            if (t - prev).total_seconds() <= 3600 * 2:
+                prev = t
+            else:
+                ranges.append((start, prev))
+                start = prev = t
+        ranges.append((start, prev))
+        desc = ", ".join(f"{a}~{b}" for a, b in ranges[:3])
+        more = f" (+{len(ranges) - 3} 个区间)" if len(ranges) > 3 else ""
+        print(f"   ⚠️ {col} 空值 {len(ts)} 处 | {desc}{more}")
 
     # 无漏网之鱼，安全执行空值剥离
     before_rows = features.height

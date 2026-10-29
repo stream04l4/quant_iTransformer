@@ -68,6 +68,7 @@ DATA_END_MONTH = (2026, 10)     # 含当前月：月度文件到上月，当前�
 BINANCE_BASE_URL_FUTURES = "https://data.binance.vision/data/futures/um/monthly"
 BINANCE_BASE_URL_FUTURES_DAILY = "https://data.binance.vision/data/futures/um/daily"
 BINANCE_BASE_URL_SPOT = "https://data.binance.vision/data/spot/monthly"
+BINANCE_BASE_URL_SPOT_DAILY = "https://data.binance.vision/data/spot/daily"
 BINANCE_BASE_URL_METRICS_DAILY = "https://data.binance.vision/data/futures/um/daily/metrics"
 # 强制规范无表头 CSV 的字段名防错
 KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time", 
