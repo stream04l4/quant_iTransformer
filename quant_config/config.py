@@ -60,7 +60,7 @@ FORECAST_HORIZON = int(os.environ.get("OPT_FORECAST_HORIZON", 12))
 # 3. 历史数据获取区间 (Data Range)
 # ==========================================
 DATA_START_MONTH = (2021, 12)   
-DATA_END_MONTH = (2026, 8)     
+DATA_END_MONTH = (2026, 10)     # 含当前月：月度文件到上月，当前月由 daily 增量补到昨天
 
 # ==========================================
 # 4. 币安接口与表结构路由 (Endpoints & Schema)

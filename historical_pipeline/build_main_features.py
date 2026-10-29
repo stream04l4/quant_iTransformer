@@ -21,7 +21,7 @@ from quant_config.config import (
     TEMP_DIR, PROCESSED_MAIN_DIR, PROCESSED_AGGTRADES_DIR,
     PROCESSED_AGGTRADES_ROOT, SYMBOL, AUX_SYMBOLS,
     DATA_START_MONTH, DATA_END_MONTH, FORECAST_HORIZON,
-    BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_SPOT, BINANCE_BASE_URL_METRICS_DAILY,
+    BINANCE_BASE_URL_FUTURES, BINANCE_BASE_URL_FUTURES_DAILY, BINANCE_BASE_URL_SPOT, BINANCE_BASE_URL_METRICS_DAILY,
     KLINE_COLS, FUNDING_COLS
 )
 
@@ -184,17 +184,93 @@ def load_and_concat_months(market, data_type, symbol, timeframe="1h", save_raw_p
     ).sort("exact_timestamp")
 
     if save_raw_parquet:
-        raw_dir = TEMP_DIR / "klines" / symbol
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        output_path = raw_dir / f"{symbol}_raw_{timeframe}.parquet"
-        raw_cols = ["exact_timestamp", "open", "high", "low", "close", "volume"]
-        optional_cols = ["quote_volume", "count", "taker_buy_volume"]
-        raw_cols.extend([c for c in optional_cols if c in full_df.columns])
-        full_df.select(raw_cols).rename({"exact_timestamp": "timestamp"}).write_parquet(output_path)
-        print(f"   💾 {timeframe} 物理 K 线库合并完成并生成缓存: {output_path.name}")
-        
+        save_raw_kline_parquet(full_df, timeframe)
+
     return full_df.with_columns(
         pl.col("exact_timestamp").dt.truncate("1h").alias("hour_timestamp")
+    )
+
+def save_raw_kline_parquet(full_df, timeframe):
+    """保存未被污染的 raw K 线库 (给回测/RV 计算用)，当前月 daily 补齐后也会刷新。"""
+    raw_dir = TEMP_DIR / "klines" / SYMBOL
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    output_path = raw_dir / f"{SYMBOL}_raw_{timeframe}.parquet"
+    raw_cols = ["exact_timestamp", "open", "high", "low", "close", "volume"]
+    optional_cols = ["quote_volume", "count", "taker_buy_volume"]
+    raw_cols.extend([c for c in optional_cols if c in full_df.columns])
+    full_df.select(raw_cols).rename({"exact_timestamp": "timestamp"}).write_parquet(output_path)
+    print(f"   💾 {timeframe} 物理 K 线库合并完成并生成缓存: {output_path.name}")
+
+# ==========================================
+# 1b. 当前月 daily 增量补齐 (数据 dump 有 T+1~2 天延迟, 未发布日自动跳过)
+# ==========================================
+def fetch_daily_fill(market, data_type, symbol, timeframe, start_date, end_date):
+    """当前月月度文件要到月末才生成，用 daily 包把数据桥接到最近可用日。
+    404 (当天 dump 未发布) 跳过继续，保证幂等可重跑。"""
+    base_daily = BINANCE_BASE_URL_FUTURES_DAILY if market == "futures" else BINANCE_BASE_URL_SPOT + "/daily"
+    sandbox_root = TEMP_DIR / "daily" / data_type / symbol / timeframe
+    dfs = []
+    d = start_date
+    while d <= end_date:
+        date_str = d.strftime("%Y-%m-%d")
+        if data_type == "premiumIndexKlines":
+            url = f"{base_daily}/premiumIndexKlines/{symbol}/1h/{symbol}-1h-{date_str}.zip"
+        else:
+            url = f"{base_daily}/klines/{symbol}/{timeframe}/{symbol}-{timeframe}-{date_str}.zip"
+        sandbox_dir = sandbox_root / date_str
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = next((p for p in sandbox_dir.iterdir() if p.suffix.lower() == ".csv"), None)
+        if csv_path is None:
+            try:
+                with requests.get(url, stream=True, timeout=15) as r:
+                    if r.status_code == 200:
+                        zip_path = sandbox_dir / "temp.zip"
+                        with open(zip_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
+                        with zipfile.ZipFile(zip_path) as z:
+                            z.extract(z.namelist()[0], sandbox_dir)
+                        os.remove(zip_path)
+                    else:
+                        print(f"   ⚠️ {date_str} 尚未发布 (HTTP {r.status_code})，跳过")
+                csv_path = next((p for p in sandbox_dir.iterdir() if p.suffix.lower() == ".csv"), None)
+            except Exception as e:
+                print(f"   ❌ {date_str} 下载异常: {e}")
+        if csv_path is not None:
+            try:
+                df = pl.read_csv(csv_path, has_header=csv_has_header(csv_path),
+                                 new_columns=KLINE_COLS, schema_overrides=csv_schema_overrides("klines"))
+                df = df.cast({col: pl.Float64 for col in KLINE_COLS if col != "open_time"})
+                dfs.append(df)
+                print(f"   ✅ daily {data_type} ({timeframe}) | {symbol} | {date_str} | {df.height} 行")
+            except Exception as e:
+                print(f"   ❌ {date_str} 解析失败: {e}")
+        d += timedelta(days=1)
+    if not dfs:
+        return None
+    full_df = pl.concat(dfs).with_columns(
+        pl.from_epoch(timestamp_ms_expr("open_time"), time_unit="ms").alias("exact_timestamp")
+    ).sort("exact_timestamp")
+    return full_df.with_columns(pl.col("exact_timestamp").dt.truncate("1h").alias("hour_timestamp"))
+
+def fetch_funding_api(symbol, start_date):
+    """fundingRate 在 data.binance.vision 上没有 daily dump (只有月度)，
+    当前月从实时 API 补 (8 小时间隔，单页 limit=1000 足够覆盖当月)。"""
+    start_ms = int(datetime(start_date.year, start_date.month, 1).timestamp() * 1000)
+    try:
+        r = requests.get(
+            f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&startTime={start_ms}&limit=1000",
+            timeout=15,
+        )
+        r.raise_for_status()
+        rows = [{"calc_time": int(it["fundingTime"]), "funding_interval_hours": 8.0,
+                 "last_funding_rate": float(it["fundingRate"])} for it in r.json()]
+    except Exception as e:
+        print(f"   ❌ funding API 补齐失败: {e}")
+        return None
+    if not rows:
+        return None
+    return pl.DataFrame(rows).with_columns(
+        pl.from_epoch(pl.col("calc_time"), time_unit="ms").dt.truncate("1h").alias("hour_timestamp")
     )
 
 def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
@@ -424,6 +500,50 @@ def build_features(horizon):
 
     # 🚨 [新增拉取] 获取 Metrics (Open Interest)
     main_metrics = fetch_daily_metrics_concurrent(SYMBOL, DATA_START_MONTH, DATA_END_MONTH)
+
+    # ==========================================
+    # 📅 [当前月 daily 增量补齐] 月度 dump 到上月为止，
+    #    当前月从 1 号补到昨天 (T+1~2 天延迟，未发布日自动跳过)。
+    # ==========================================
+    today = date.today()
+    if tuple(DATA_END_MONTH) >= (today.year, today.month):
+        d_start = date(today.year, today.month, 1)
+        d_end = today - timedelta(days=1)
+        if d_end >= d_start:
+            print(f"\n📅 [当前月 daily 增量补齐] {d_start} → {d_end} ...")
+            extra = fetch_daily_fill("futures", "klines", SYMBOL, "1h", d_start, d_end)
+            if extra is not None:
+                main_klines = pl.concat([main_klines, extra]).unique(subset=["exact_timestamp"], keep="last").sort("exact_timestamp")
+                save_raw_kline_parquet(main_klines, "1h")  # 刷新 raw_1h (含当前月)
+            extra_1m = fetch_daily_fill("futures", "klines", SYMBOL, "1m", d_start, d_end)
+            if extra_1m is not None:
+                # 1m 只用于 realized_vol (读 raw_1m.parquet)，与月度缓存按 timestamp 去重合并后刷新
+                raw_1m_path = TEMP_DIR / "klines" / SYMBOL / f"{SYMBOL}_raw_1m.parquet"
+                raw_cols = ["timestamp", "open", "high", "low", "close", "volume",
+                            "quote_volume", "count", "taker_buy_volume"]
+                extra_raw = extra_1m.rename({"exact_timestamp": "timestamp"})
+                base = pl.read_parquet(raw_1m_path) if raw_1m_path.exists() else None
+                common = [c for c in raw_cols if c in extra_raw.columns and (base is None or c in base.columns)]
+                merged = (pl.concat([base.select(common), extra_raw.select(common)]) if base is not None
+                          else extra_raw.select(common))
+                merged = merged.unique(subset=["timestamp"], keep="last").sort("timestamp")
+                raw_1m_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.select(common).write_parquet(raw_1m_path)
+                print(f"   💾 raw_1m 已刷新 (含当前月 daily): {merged.height} 行")
+            extra_f = fetch_funding_api(SYMBOL, d_start)
+            if extra_f is not None:
+                main_funding = extra_f if main_funding is None else pl.concat([main_funding, extra_f]).unique(subset=["calc_time"], keep="last")
+            extra = fetch_daily_fill("futures", "premiumIndexKlines", SYMBOL, "1h", d_start, d_end)
+            if extra is not None:
+                main_premium = extra if main_premium is None else pl.concat([main_premium, extra]).unique(subset=["exact_timestamp"], keep="last")
+            if len(AUX_SYMBOLS) >= 1:
+                extra = fetch_daily_fill("spot", "klines", AUX_SYMBOLS[0], "1h", d_start, d_end)
+                if extra is not None:
+                    aux_reference = extra if aux_reference is None else pl.concat([aux_reference, extra]).unique(subset=["exact_timestamp"], keep="last")
+            if len(AUX_SYMBOLS) >= 2:
+                extra = fetch_daily_fill("spot", "klines", AUX_SYMBOLS[1], "1h", d_start, d_end)
+                if extra is not None:
+                    direct_cross = extra if direct_cross is None else pl.concat([direct_cross, extra]).unique(subset=["exact_timestamp"], keep="last")
 
     print("\n🧩 [第三阶段] 执行全局时间轴对齐 (Join)...")
     main_premium = main_premium.select(["hour_timestamp", pl.col("close").alias("premium_close")]) if main_premium is not None else None
