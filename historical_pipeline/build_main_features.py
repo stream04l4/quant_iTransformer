@@ -269,9 +269,10 @@ def fetch_funding_api(symbol, start_date):
         return None
     if not rows:
         return None
-    return pl.DataFrame(rows).with_columns(
-        pl.from_epoch(pl.col("calc_time"), time_unit="ms").dt.truncate("1h").alias("hour_timestamp")
-    )
+    return pl.DataFrame(rows).with_columns([
+        pl.from_epoch(pl.col("calc_time"), time_unit="ms").alias("exact_timestamp"),
+        pl.from_epoch(pl.col("calc_time"), time_unit="ms").dt.truncate("1h").alias("hour_timestamp"),
+    ])
 
 def fetch_daily_metrics_concurrent(symbol, start_ym, end_ym):
     print(f"\n🐋 启动多线程下载 Daily Metrics 订单流 (包含 Open Interest)...")
