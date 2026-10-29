@@ -154,7 +154,7 @@ def run_experiment(params, mode, base_model, save_models):
             scripts = ['train_itransformer.py', 'check_prob_distribution.py', 'alpha_ic_evaluator.py']
             for script in scripts:
                 script_path = HISTORICAL_DIR / script if script == 'train_itransformer.py' else BACKTEST_DIR / script
-                result = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True, env=env)
+                result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
                 if result.returncode != 0:
                     return {"error": f"💥 {script} 报错:\n{result.stderr}", **params, 'exp_id': exp_id}
                 if script == 'alpha_ic_evaluator.py':
@@ -165,7 +165,7 @@ def run_experiment(params, mode, base_model, save_models):
 
             # 立刻用同一模型和同一动态概率阈值跑完整撮合，补齐“可交易性”维度。
             backtest_path = BACKTEST_DIR / 'backtest_itransformer.py'
-            bt_result = subprocess.run([sys.executable, str(backtest_path)], capture_output=True, text=True, env=env)
+            bt_result = subprocess.run(['python3', str(backtest_path)], capture_output=True, text=True, env=env)
             if bt_result.returncode != 0:
                 res.update(prefix_metrics(extract_backtest_metrics(""), "bt_"))
                 res["bt_error"] = bt_result.stderr
@@ -189,7 +189,7 @@ def run_experiment(params, mode, base_model, save_models):
                 return {"error": f"💥 基座模型复制失败: {e}", **params, 'exp_id': exp_id}
                 
             script_path = BACKTEST_DIR / 'backtest_itransformer.py'
-            result = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True, env=env)
+            result = subprocess.run(['python3', str(script_path)], capture_output=True, text=True, env=env)
             
             if result.returncode != 0:
                 res = {"error": f"💥 回测报错:\n{result.stderr}", **params}
