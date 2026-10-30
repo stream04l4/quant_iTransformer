@@ -142,12 +142,22 @@ class CryptoDatasetGPU(Dataset):
                 raise ValueError(f"OPT_FEATURE_COLS 含矩阵中不存在的列: {missing}")
             self.feature_cols = wanted
         
+        # 🚨 [阶段 L] 标签列开关（Joel 批准 2026-11-02，spec §8.2）：OPT_LABEL_COL=预计算标签列（label_A/label_B_075/100/125/label_C）；
+        # 默认空 = 原阈值逻辑零改动。NaN 标签行（C 歧义剔除）在数据集构建前整行剔除
+        label_col = os.environ.get("OPT_LABEL_COL", "").strip()
+        if label_col:
+            if label_col not in df.columns:
+                raise ValueError(f"OPT_LABEL_COL={label_col} 不在矩阵列中")
+            df = df.filter(pl.col(label_col).is_not_null())
         X = df.select(self.feature_cols).to_numpy().astype('float32')
         Y_raw = df.select(target_col).to_numpy().astype('float32').reshape(-1)
         
         # 3 分类逻辑
-        Y_class = np.where(Y_raw > CLASS_THRESHOLD, 2, 
-                           np.where(Y_raw < -CLASS_THRESHOLD, 0, 1))
+        if label_col:
+            Y_class = df.select(label_col).to_numpy().astype('float32').reshape(-1)
+        else:
+            Y_class = np.where(Y_raw > CLASS_THRESHOLD, 2, 
+                               np.where(Y_raw < -CLASS_THRESHOLD, 0, 1))
         
         split_idx = int(len(X) * train_ratio)
         
