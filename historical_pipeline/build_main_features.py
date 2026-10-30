@@ -623,15 +623,15 @@ def build_features(horizon):
     if "aux_reference_close" in master_df.columns:
         btc_log_ret = pl.col("close").log().diff(1)
         eth_log_ret = pl.col("aux_reference_close").log().diff(1)
-        master_df = master_df.with_columns(
-            (
-                (btc_log_ret * eth_log_ret).rolling_mean(window_size=24)
-                - btc_log_ret.rolling_mean(window_size=24) * eth_log_ret.rolling_mean(window_size=24)
-            ) / (
-                btc_log_ret.rolling_std(window_size=24)
-                * eth_log_ret.rolling_std(window_size=24) + 1e-12
-            ).alias("btc_eth_corr_24h")
+        # 注意：alias 必须作用于整个商（先存变量再 .alias），直接写在分母上会因优先级只命名分母
+        corr_24h = (
+            (btc_log_ret * eth_log_ret).rolling_mean(window_size=24)
+            - btc_log_ret.rolling_mean(window_size=24) * eth_log_ret.rolling_mean(window_size=24)
+        ) / (
+            btc_log_ret.rolling_std(window_size=24)
+            * eth_log_ret.rolling_std(window_size=24) + 1e-12
         )
+        master_df = master_df.with_columns(corr_24h.alias("btc_eth_corr_24h"))
     else:
         master_df = master_df.with_columns(pl.lit(None).cast(pl.Float64).alias("btc_eth_corr_24h"))
     # 🚨 [核心修复] 分级前向填充：依据各个特征在物理世界的更新频率
