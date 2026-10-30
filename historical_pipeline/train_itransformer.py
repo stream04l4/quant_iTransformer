@@ -173,8 +173,9 @@ class CryptoDatasetGPU(Dataset):
         split_ts = os.environ.get("OPT_SPLIT_TS", "").strip()
         if split_ts:
             tdt = df.schema["hour_timestamp"]
-            split_idx = int(df.filter(pl.col("hour_timestamp") >= pl.lit(datetime.fromisoformat(split_ts)).cast(tdt)).height)
-            print(f"🔒 [P0] OPT_SPLIT_TS={split_ts} → split_idx={split_idx}")
+            # 切分点索引 = 第一个 ts >= split_ts 的行号（即 ts < split_ts 的行数）
+            split_idx = int(df.filter(pl.col("hour_timestamp") < pl.lit(datetime.fromisoformat(split_ts)).cast(tdt)).height)
+            print(f"🔒 [P0] OPT_SPLIT_TS={split_ts} → split_idx={split_idx} (train=[0,{split_idx-FORECAST_HORIZON}) val=({split_idx+FORECAST_HORIZON},end]")
         else:
             split_idx = int(len(X) * train_ratio)
         
