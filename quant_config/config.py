@@ -167,19 +167,14 @@ EXPERIMENT_ID = os.environ.get("OPT_EXP_ID", "default_run")
 # live_pipeline/market_gateway/risk_manager 会读取这里，同时加载多个已训练好的单币模型。
 # 每个交易标的可配置任意数量模型；单模型时保留旧写法也兼容。
 BTCUSDT_LIVE_MODELS = [
-    {"experiment_id": "EXP_F0EF9621", "weight": 0.180},  # 进攻辅助，收益强但回撤偏大 (18.0%)
-    {"experiment_id": "EXP_321B10D8", "weight": 0.220},  # 老模型最强，进攻主力 (22.0%)
-    {"experiment_id": "EXP_E7E8B0B4", "weight": 0.170},  # 当前综合最强新模型 (17.0%)
-    {"experiment_id": "EXP_522EEE76", "weight": 0.160},  # 新模型主力，表现稳定 (16.0%)
-    {"experiment_id": "EXP_809B7D5F", "weight": 0.120},  # 候选观察 (12.0%)
-    {"experiment_id": "EXP_A4040585", "weight": 0.090},  # 稳健主力，回撤较低 (9.0%)
-    {"experiment_id": "EXP_957E1908", "weight": 0.020},  # 候选观察 (2.0%)
-    {"experiment_id": "EXP_002574A2", "weight": 0.020},  # 低权重观察 (2.0%)
-    {"experiment_id": "EXP_9797F116", "weight": 0.010},  # 候选观察 (1.0%)
-    {"experiment_id": "EXP_A49047F0", "weight": 0.003},  # 旧模型降级观察 (0.3%)
-    {"experiment_id": "EXP_6ADB71DE", "weight": 0.003},  # 旧核心降级观察，主要因低频和近期弱 (0.3%)
-    {"experiment_id": "EXP_AA8D8236", "weight": 0.004},  # 旧模型降级观察 (0.4%)
+    {"experiment_id": "EXP_718D47C0", "weight": 0.40},  # 10-30 寻优: Rank_IC 最高 +0.047
+    {"experiment_id": "EXP_220A157A", "weight": 0.40},  # 10-30 寻优: 综合分最佳, Alpha命中 68.8%
+    {"experiment_id": "EXP_066DC380", "weight": 0.20},  # 10-30 寻优: IC 胜率最高 54.8%
 ]
+# [备份 2026-10-30] 旧 12 模型组合(权重文件不在本机, 留档参考):
+# EXP_F0EF9621 0.180 / EXP_321B10D8 0.220 / EXP_E7E8B0B4 0.170 / EXP_522EEE76 0.160 /
+# EXP_809B7D5F 0.120 / EXP_A4040585 0.090 / EXP_957E1908 0.020 / EXP_002574A2 0.020 /
+# EXP_9797F116 0.010 / EXP_A49047F0 0.003 / EXP_6ADB71DE 0.003 / EXP_AA8D8236 0.004
 
 LIVE_SYMBOL_CONFIGS = {
     SYMBOL: {
