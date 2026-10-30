@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -179,12 +180,25 @@ def train_model():
     
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n🚀 启动 iTransformer 训练 | 硬件: {DEVICE} (H100 极速模式)")
-    
+
+    # P0.5-F1（Joel 批准 2026-10-30）：可复现播种。未设 OPT_SEED（默认 -1）时完全保持原行为
+    SEED = int(os.environ.get("OPT_SEED", -1))
+    if SEED >= 0:
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"🎲 可复现播种已启用: OPT_SEED={SEED} (cudnn.deterministic=True)")
+
     train_set = CryptoDatasetGPU(DATA_PATH, seq_len=SEQ_LEN, device=DEVICE, is_train=True)
     val_set = CryptoDatasetGPU(DATA_PATH, seq_len=SEQ_LEN, device=DEVICE, is_train=False)
-    
+
+    # P0.5-F1：shuffle 顺序由播种 generator 决定（未播种时 generator=None 保持原行为）
+    shuffle_generator = torch.Generator().manual_seed(SEED) if SEED >= 0 else None
     # 无需 workers，数据已在 GPU 显存内
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, generator=shuffle_generator)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
     
     num_variates = len(train_set.feature_cols)
@@ -223,6 +237,7 @@ def train_model():
     best_val_loss = float('inf')
     best_selection_score = -float('inf')
     patience, patience_counter = 16, 0
+    score_history = []  # P0.5-F2：滑动中位数窗口
     
     # 🚨 新增：提取验证集标签分布，防范 Regime Shift (环境突变)
     val_labels = val_set.Y
@@ -291,17 +306,24 @@ def train_model():
         alpha_metrics = compute_validation_alpha_metrics(all_val_logits, val_set.Y, val_set.Y_raw)
         pred_dist = torch.bincount(all_val_preds, minlength=3).cpu().numpy()
         
+        # P0.5-F2（Joel 批准 2026-10-30）：选择准则去噪——用最近 5 epoch 的滑动中位数比较，
+        # 消除"未充分训练的第 1 个 epoch 噪声瞬时见顶被保存"的选点路径；
+        # 前 4 个 epoch 为 warmup（5 点中位窗口未满），不参与选择、不计 patience
+        score_history.append(alpha_metrics["selection_score"])
+        smoothed_score = float(np.median(score_history[-5:]))
+        selection_active = len(score_history) >= 5
+        
         print(f"Epoch [{epoch+1:02d}/{EPOCHS}] LR: {current_lr:.2e} | "
               f"T_Loss: {avg_train_loss:.4f} | V_Loss: {avg_val_loss:.4f} (Acc: {val_acc:.2f}%) "
               f"| RankIC: {alpha_metrics['rank_ic']:+.4f} | Top精度: {alpha_metrics['top_precision']:.2%} "
-              f"| Spread: {alpha_metrics['tail_return_spread']:+.4f} | Score: {alpha_metrics['selection_score']:+.4f} "
+              f"| Spread: {alpha_metrics['tail_return_spread']:+.4f} | Score: {alpha_metrics['selection_score']:+.4f} | Smooth5: {smoothed_score:+.4f} "
               f"| 预测分布[空, 平, 多]: {pred_dist}")
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
-        if alpha_metrics["selection_score"] > best_selection_score:
-            best_selection_score = alpha_metrics["selection_score"]
+        if selection_active and smoothed_score > best_selection_score:
+            best_selection_score = smoothed_score
             patience_counter = 0
             
             # 🚨 修复：保存极其详尽的模型元数据，防止实盘加载时架构碎裂
@@ -318,7 +340,7 @@ def train_model():
                 'd_ff': dynamic_d_ff,
                 'e_layers': E_LAYERS,
                 'dropout': DROPOUT,
-                'epoch': epoch,
+                'epoch': epoch + 1,  # P0.5-F3：1-indexed（循环变量 0-indexed，显示为 epoch+1），防误读为"未训练"
                 'model_state_dict': model.state_dict(),
                 'feature_cols': train_set.feature_cols,
                 # 🚨 补回：性能基准元数据，用于后续模型对比与实盘心跳校验
@@ -334,7 +356,8 @@ def train_model():
                 'class_weight_power': CLASS_WEIGHT_POWER,
             }, save_path)
             print(f"    ⭐ 新权重及完整元数据已保存! (Score: {best_selection_score:+.4f} | Best V_Loss: {best_val_loss:.4f})")
-        else:
+        elif selection_active:
+            # warmup 期（前 4 epoch）不计 patience，避免未训练阶段被提前掐断
             patience_counter += 1
             if patience_counter >= patience:
                 print("\n🛑 触发早停机制，防止过拟合！")
