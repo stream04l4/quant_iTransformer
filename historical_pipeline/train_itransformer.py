@@ -123,6 +123,14 @@ class CryptoDatasetGPU(Dataset):
         print(f"📦 加载数据集 ({'训练' if is_train else '验证'}): {Path(parquet_path).name}")
         df = pl.read_parquet(parquet_path)
         
+        # 🚨 [P0] 严格 walk-forward 隔离（Joel 批准 2026-11-02）：OPT_DATA_END_TS 按时间戳物理截断矩阵，
+        # test 行永不进入训练/早停/checkpoint 选择；未设置时零改动
+        data_end_ts = os.environ.get("OPT_DATA_END_TS", "").strip()
+        if data_end_ts:
+            tdt = df.schema["hour_timestamp"]
+            df = df.filter(pl.col("hour_timestamp") < pl.lit(data_end_ts).cast(tdt))
+            print(f"🔒 [P0] OPT_DATA_END_TS={data_end_ts} → 截断后 {df.height} 行")
+        
         target_col = f"target_{FORECAST_HORIZON}h_return"
         if target_col not in df.columns:
             raise ValueError(f"找不到目标列 {target_col}，请确认特征宽表与 FORECAST_HORIZON 一致。")
@@ -160,7 +168,15 @@ class CryptoDatasetGPU(Dataset):
         
         # 🚨 [阶段 L] 切分口径（spec：A/B/C 完全相同切分）：先在完整矩阵上定切分点（同一时间边界），
         # 再按段剔除 NaN 标签行（C 歧义/σ̂ warmup/尾段）——各变体差异仅为被剔除行本身
-        split_idx = int(len(X) * train_ratio)
+        # 🚨 [P0] OPT_SPLIT_TS: train/val 边界时间戳（替代 train_ratio 比例切分）；未设置时原行为
+        # 边界两侧仍各有 FORECAST_HORIZON(12h) purge（下方逻辑不变）= 标签重叠宽度 H，构造性无重叠
+        split_ts = os.environ.get("OPT_SPLIT_TS", "").strip()
+        if split_ts:
+            tdt = df.schema["hour_timestamp"]
+            split_idx = int(df.filter(pl.col("hour_timestamp") >= pl.lit(split_ts).cast(tdt)).height)
+            print(f"🔒 [P0] OPT_SPLIT_TS={split_ts} → split_idx={split_idx}")
+        else:
+            split_idx = int(len(X) * train_ratio)
         
         # 🚨 修复：严格 Purged Split，阻断标签与特征的微小交叉泄露
         train_end = split_idx - FORECAST_HORIZON
