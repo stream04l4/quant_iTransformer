@@ -24,7 +24,7 @@ ALPHA_SEARCH_SPACE = {
     'D_MODEL': [128, 256],
     'DROPOUT': [0.3],
     'BATCH_SIZE': [128],
-    'LEARNING_RATE': [5e-6, 1e-5],
+    'LEARNING_RATE': [5e-6],
     'EPOCHS': [100]
 }
 
