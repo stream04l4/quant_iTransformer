@@ -847,8 +847,8 @@ def build_features(horizon):
     ]
     features = features.with_columns(zscore_exprs)
 
-    # 步骤 4: 丢弃中间临时变量（含 V2 前缀列 volume_log1p/downside_vol_24h/vov_24h 与 log_return_zscore）
-    features = features.drop(rz_medians + rz_mads + ["volume_log1p", "downside_vol_24h", "vov_24h", "log_return_zscore"])
+    # 步骤 4: 丢弃中间临时变量（log_return_zscore 留到 oi_price_divergence 算完后丢弃）
+    features = features.drop(rz_medians + rz_mads + ["volume_log1p", "downside_vol_24h", "vov_24h"])
 
     # 🚨 [新增] COID: 高阶订单流背离 (CVD净买单偏离度减去总持仓偏离度)
     if "cvd_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
@@ -860,7 +860,7 @@ def build_features(horizon):
     if "log_return_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
         features = features.with_columns(
             (pl.col("log_return_zscore") - pl.col("oi_delta_pct_zscore")).alias("oi_price_divergence")
-        )
+        ).drop("log_return_zscore")  # 中间列用完即弃，不进最终矩阵
 
     # 🚨 终极核对：新增 max_ret_24h，剔除 oi_price_cross 与 vpt_zscore
     final_cols = [
