@@ -172,7 +172,13 @@ class CryptoDatasetGPU(Dataset):
 # ==========================================
 def train_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    parquet_files = sorted(list(PROCESSED_MAIN_DIR.glob(f"{SYMBOL}_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
+    # 🚨 [阶段 2] 特征集开关（Joel 批准 2026-11-01，阶段 2 对比训练）：
+    # OPT_FEATURE_SET=39 → 读 39d 矩阵（独立子目录）；默认 31 → 原路径原行为，零改动
+    if os.environ.get("OPT_FEATURE_SET", "31").strip() == "39":
+        search_dir = PROCESSED_MAIN_DIR.parent / "main_features_39d" / SYMBOL
+    else:
+        search_dir = PROCESSED_MAIN_DIR
+    parquet_files = sorted(list(search_dir.glob(f"{SYMBOL}_Master_Training_Matrix_{FORECAST_HORIZON}h_*.parquet")))
     if not parquet_files:
         print(f"❌ 未找到 {SYMBOL} / {FORECAST_HORIZON}h 对应的特征宽表！")
         return
