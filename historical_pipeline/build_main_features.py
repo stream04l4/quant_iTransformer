@@ -627,7 +627,7 @@ def build_features(horizon):
     if fill_exprs:
         master_df = master_df.with_columns(fill_exprs)
 
-    print("⚙️ [第四阶段] 计算 31 维特征矩阵...")
+    print("⚙️ [第四阶段] 计算 39 维特征矩阵 (31 旧 + 8 V2 新, FES v1)...")
     master_df = master_df.cast({col: pl.Float64 for col in ["open", "high", "low", "close", "volume"]})
             
     # 合成完毕后，物理销毁用于计算的冗余母体数据
@@ -719,6 +719,33 @@ def build_features(horizon):
         ((pl.col("close") - pl.col("low").rolling_min(window_size=168)) / (pl.col("high").rolling_max(window_size=168) - pl.col("low").rolling_min(window_size=168) + 1e-9)).alias("price_pos_168h")
     )
 
+    # ==========================================================
+    # 🚨 [特征 V2 · FES v1] 8 个新特征（Joel 批准 2026-10-30，零新数据源）
+    # 因果约定（FES §0.1）：滚动统计 shift(1) 严格事前；当根 bar 字段在决策时刻已收盘可用
+    # ==========================================================
+    features = features.with_columns([
+        # 32 taker_imbalance: 主动买/卖量原始失衡 (V_buy−V_sell)/(V_buy+V_sell+ε)，天然 [-1,1] 不 clip
+        (
+            (pl.col("taker_buy_volume") - (pl.col("volume") - pl.col("taker_buy_volume")))
+            / (pl.col("volume") + 1e-9)
+        ).alias("taker_imbalance"),
+        # 33 volume_zscore 前缀列: log(1+V)，下方 24h MAD 滚动 z（FES: min_periods=16）
+        (pl.col("volume") + 1.0).log().alias("volume_log1p"),
+        # 34 trend_efficiency_ratio: Kaufman ER 24h，1=趋势 0=震荡，天然 [0,1] 不 clip
+        (
+            (pl.col("close") - pl.col("close").shift(24)).abs()
+            / (pl.col("close").diff(1).abs().rolling_sum(window_size=24) + 1e-9)
+        ).alias("trend_efficiency_ratio"),
+        # 35 downside_volatility 前缀列: 24h 下行波动率 sqrt(mean(min(r,0)²))，下方 168h MAD z
+        (
+            pl.col("log_return").clip(upper_bound=0.0).pow(2).rolling_mean(window_size=24).sqrt()
+        ).alias("downside_vol_24h"),
+        # 38 volatility_of_volatility 前缀列: RV_1h 的 24h 标准差，下方 168h MAD z
+        pl.col("realized_vol_1h").rolling_std(window_size=24).alias("vov_24h"),
+        # 39 return_24h: 24h 累计对数收益（原始值入模，与 log_return 口径一致）
+        (pl.col("close").log() - pl.col("close").shift(24).log()).alias("return_24h"),
+    ])
+
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
     symbol_agg_files = find_symbol_aggtrade_files(SYMBOL)
     if symbol_agg_files:
@@ -776,31 +803,63 @@ def build_features(horizon):
     # 🚨 时序平稳化：去除高度共线的 net_taker_vol，保留 vpt 和 cvd
     print("🌊 [时序平稳化] 正在对高维度绝对量特征进行 Robust Z-Score (MAD) 降维与截断...")
     # 🚨 [剔除] vpt，因其逻辑已被更敏锐的 cvd_zscore 覆盖
-    rolling_cols = ["realized_vol_1h", "amihud_illiquidity", "oi_delta_pct"]
+    # FES v1（Joel 批准 2026-10-30）：原 :779-795 的 168h MAD 滚动 z 抽成参数化作业表，
+    # 旧 6 列保持 (168, 120) 原参数——计算序列与原逻辑位级一致（回归验证 max|Δ|<1e-9 兜底）
+    rz_jobs = [
+        # (源列, 窗口, min_samples, 输出列名)
+        ("realized_vol_1h", 168, 120, "realized_vol_1h_zscore"),
+        ("amihud_illiquidity", 168, 120, "amihud_illiquidity_zscore"),
+        ("oi_delta_pct", 168, 120, "oi_delta_pct_zscore"),
+        # V2 中间列: log_return 的 168h z，仅用于 oi_price_divergence（FES §2-37），算完即弃
+        ("log_return", 168, 120, "log_return_zscore"),
+    ]
     if "cvd" in features.columns:
-        rolling_cols.extend(["cvd", "whale_net_flow", "whale_ls_ratio"])
+        rz_jobs.extend([
+            ("cvd", 168, 120, "cvd_zscore"),
+            ("whale_net_flow", 168, 120, "whale_net_flow_zscore"),
+            ("whale_ls_ratio", 168, 120, "whale_ls_ratio_zscore"),
+        ])
+    # V2 新 z 列（FES §2）: volume 24h 窗口(min 16)；downside/vov/funding 168h 窗口
+    rz_jobs.extend([
+        ("volume_log1p", 24, 16, "volume_zscore"),
+        ("downside_vol_24h", 168, 120, "downside_volatility"),
+        ("last_funding_rate", 168, 120, "funding_rate_zscore"),
+        ("vov_24h", 168, 120, "volatility_of_volatility"),
+    ])
 
-    # 步骤 1: 计算 rolling median (严格事前：使用 t-1 往前的 168 个窗口作为环境基准)
+    # 步骤 1: 计算 rolling median (严格事前：shift(1) 后窗口只覆盖 t-1 及以前)
+    rz_medians = [f"__rz_median_{alias}" for _, _, _, alias in rz_jobs]
+    rz_mads = [f"__rz_mad_{alias}" for _, _, _, alias in rz_jobs]
     features = features.with_columns([
-        pl.col(c).rolling_median(window_size=168, min_samples=120).shift(1).alias(f"{c}_median") for c in rolling_cols
+        pl.col(src).rolling_median(window, min_samples=min_samples).shift(1).alias(f"__rz_median_{alias}")
+        for src, window, min_samples, alias in rz_jobs
     ])
     # 步骤 2: 计算 rolling MAD (Median Absolute Deviation)，同样 shift(1)
     features = features.with_columns([
-        (pl.col(c) - pl.col(f"{c}_median")).abs().rolling_median(window_size=168, min_samples=120).shift(1).alias(f"{c}_mad") for c in rolling_cols
+        (pl.col(src) - pl.col(f"__rz_median_{alias}")).abs()
+        .rolling_median(window, min_samples=min_samples).shift(1).alias(f"__rz_mad_{alias}")
+        for src, window, min_samples, alias in rz_jobs
     ])
     # 步骤 3: 计算 Robust Z-Score 并截断到 [-4, 4]
     zscore_exprs = [
-        (0.6745 * (pl.col(c) - pl.col(f"{c}_median")) / (pl.col(f"{c}_mad") + 1e-9)).clip(-4.0, 4.0).alias(f"{c}_zscore") for c in rolling_cols
+        (0.6745 * (pl.col(src) - pl.col(f"__rz_median_{alias}")) / (pl.col(f"__rz_mad_{alias}") + 1e-9)).clip(-4.0, 4.0).alias(alias)
+        for src, window, min_samples, alias in rz_jobs
     ]
     features = features.with_columns(zscore_exprs)
-    
-    # 步骤 4: 丢弃中间临时变量
-    features = features.drop([f"{c}_median" for c in rolling_cols] + [f"{c}_mad" for c in rolling_cols])
+
+    # 步骤 4: 丢弃中间临时变量（含 V2 前缀列 volume_log1p/downside_vol_24h/vov_24h 与 log_return_zscore）
+    features = features.drop(rz_medians + rz_mads + ["volume_log1p", "downside_vol_24h", "vov_24h", "log_return_zscore"])
 
     # 🚨 [新增] COID: 高阶订单流背离 (CVD净买单偏离度减去总持仓偏离度)
     if "cvd_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
         features = features.with_columns(
             (pl.col("cvd_zscore") - pl.col("oi_delta_pct_zscore")).alias("cvd_oi_divergence")
+        )
+
+    # 🚨 [特征 V2 · FES v1] 37 oi_price_divergence: 价格收益 z − OI 变化 z（各自 168h MAD z 后相减，合成值不 clip）
+    if "log_return_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
+        features = features.with_columns(
+            (pl.col("log_return_zscore") - pl.col("oi_delta_pct_zscore")).alias("oi_price_divergence")
         )
 
     # 🚨 终极核对：新增 max_ret_24h，剔除 oi_price_cross 与 vpt_zscore
@@ -817,6 +876,12 @@ def build_features(horizon):
     # 🌟 新增: COID 被放进含有深度订单流的分支中
     if "cvd" in features.columns:
         final_cols.extend(["cvd_zscore", "whale_net_flow_zscore", "whale_ls_ratio_zscore", "retail_ratio", "cvd_oi_divergence"])
+
+    # 🚨 [特征 V2 · FES v1] 8 个新列 (32-39) 按 FES §2 固定顺序追加在尾部
+    final_cols.extend([
+        "taker_imbalance", "volume_zscore", "trend_efficiency_ratio", "downside_volatility",
+        "funding_rate_zscore", "oi_price_divergence", "volatility_of_volatility", "return_24h",
+    ])
 
     features = features.select(final_cols)
 
@@ -869,9 +934,12 @@ def build_features(horizon):
         print("⚠️ 警告：缺失清洗删除比例超过 20%，建议检查数据源完整性后再训练。")
     
     current_date = datetime.now().strftime("%Y%m%d")
-    # 👇 文件名加上了 {horizon}h 的标志
-    file_name = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_{current_date}.parquet"
-    output_path = PROCESSED_MAIN_DIR / file_name
+    # 👇 [特征 V2 · FES v1] 39d 矩阵写入独立目录 main_features_39d/，
+    # 避免被旧管道 glob (main_features_1h/..._12h_*.parquet) 误选；31/39 切换开关属阶段 2 报批范围
+    out_dir = PROCESSED_MAIN_DIR.parent / "main_features_39d" / SYMBOL
+    out_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_39d_{current_date}.parquet"
+    output_path = out_dir / file_name
     features.write_parquet(output_path)
     print(f"\n✅ 终极宽表构建成功！路径: {output_path} | 最终规模: {features.shape}")
 
