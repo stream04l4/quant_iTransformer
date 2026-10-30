@@ -617,6 +617,23 @@ def build_features(horizon):
     else:
         master_df = master_df.with_columns(pl.lit(None).cast(pl.Float64).alias("realized_vol_1h"))
 
+    # 🚨 [特征 V3 · 阶段 3] 46 btc_eth_corr_24h: BTC/ETH 1h 对数收益 24h 滚动相关（当根 bar 已收盘，口径同 return 系）
+    # 必须在 aux_reference_close 被销毁（下方 drop_aux_cols）之前计算；此处 log_return 尚未创建，内联 diff(1)
+    # 本 polars 版本无 rolling_corr，用协方差恒等式手工展开：cov=mean(xy)−mean(x)mean(y)，除以 std 积
+    if "aux_reference_close" in master_df.columns:
+        btc_log_ret = pl.col("close").log().diff(1)
+        eth_log_ret = pl.col("aux_reference_close").log().diff(1)
+        master_df = master_df.with_columns(
+            (
+                (btc_log_ret * eth_log_ret).rolling_mean(window_size=24)
+                - btc_log_ret.rolling_mean(window_size=24) * eth_log_ret.rolling_mean(window_size=24)
+            ) / (
+                btc_log_ret.rolling_std(window_size=24)
+                * eth_log_ret.rolling_std(window_size=24) + 1e-12
+            ).alias("btc_eth_corr_24h")
+        )
+    else:
+        master_df = master_df.with_columns(pl.lit(None).cast(pl.Float64).alias("btc_eth_corr_24h"))
     # 🚨 [核心修复] 分级前向填充：依据各个特征在物理世界的更新频率
     fill_exprs = []
     
@@ -770,17 +787,7 @@ def build_features(horizon):
                 (pl.col("low") - pl.col("close").shift(1)).abs(),
             ).rolling_mean(window_size=24) / (pl.col("close") + 1e-9)
         ).alias("atr_pct_24h"),
-        # 46 btc_eth_corr_24h: BTC/ETH 1h 对数收益 24h 滚动相关（当根 bar 已收盘，口径同 return 系）
-        # 本 polars 版本无 rolling_corr，用协方差恒等式手工展开：cov=mean(xy)−mean(x)mean(y)，除以 std 积
-        (
-            (
-                pl.col("log_return") * (pl.col("aux_reference_close").log().diff(1))
-            ).rolling_mean(window_size=24)
-            - pl.col("log_return").rolling_mean(window_size=24) * (pl.col("aux_reference_close").log().diff(1)).rolling_mean(window_size=24)
-        ) / (
-            pl.col("log_return").rolling_std(window_size=24)
-            * (pl.col("aux_reference_close").log().diff(1)).rolling_std(window_size=24) + 1e-12
-        ).alias("btc_eth_corr_24h"),
+        # 46 btc_eth_corr_24h: 已在 aux_reference_close 销毁前计算（见 :620 附近），此处不重复
     ])
     # 40 volume_price_divergence 的派生（vpd_pzscore − vpd_vzscore）在 z 块之后执行（见下方 COID 邻块）
 
