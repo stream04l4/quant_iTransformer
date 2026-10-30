@@ -746,6 +746,38 @@ def build_features(horizon):
         (pl.col("close").log() - pl.col("close").shift(24).log()).alias("return_24h"),
     ])
 
+    # ==========================================================
+    # 🚨 [特征 V3 · 阶段 3] 7 个扩展特征（Joel 批准 2026-11-01 升 V3，零新数据源）
+    # 数据源核对：count=1h K线自带交易笔数；premium_close/funding=现有管道；ETH=aux_reference_close（现货 ETHUSDT）
+    # ==========================================================
+    features = features.with_columns([
+        # 40 volume_price_divergence 前缀×2: 24h ΔP z 与 24h Δlog(1+V) z，下方相减
+        pl.col("log_return").alias("vpd_pret_24h"),
+        (pl.col("volume") + 1.0).log().diff(1).alias("vpd_vret_24h"),
+        # 41 trade_intensity_zscore 前缀列: log(1+N_trades)，下方 24h MAD z
+        (pl.col("count") + 1.0).log().alias("count_log1p"),
+        # 42 drawdown_168h: 距 168h 高点回撤 P_t/HH − 1（shift(1) 严格事前，天然 (−1, 0]）
+        (
+            pl.col("close") / pl.col("high").rolling_max(window_size=168).shift(1) - 1.0
+        ).alias("drawdown_168h"),
+        # 44 return_4h: 4h 对数收益（原始值）
+        (pl.col("close").log() - pl.col("close").shift(4).log()).alias("return_4h"),
+        # 45 atr_pct_24h: ATR_24h/P_t（相对值，天然 ~1-3% 量级，不 z）
+        (
+            pl.max_horizontal(
+                pl.col("high") - pl.col("low"),
+                (pl.col("high") - pl.col("close").shift(1)).abs(),
+                (pl.col("low") - pl.col("close").shift(1)).abs(),
+            ).rolling_mean(window_size=24) / (pl.col("close") + 1e-9)
+        ).alias("atr_pct_24h"),
+        # 46 btc_eth_corr_24h: BTC/ETH 1h 对数收益 24h 滚动相关（当根 bar 已收盘，口径同 return 系）
+        pl.col("log_return").rolling_corr(
+            (pl.col("aux_reference_close").log() - pl.col("aux_reference_close").shift(1).log()),
+            window_size=24,
+        ).alias("btc_eth_corr_24h"),
+    ])
+    # 40 volume_price_divergence 的派生（vpd_pzscore − vpd_vzscore）在 z 块之后执行（见下方 COID 邻块）
+
     print("\n📊 [第五阶段] 聚合 aggTrades 历史订单流数据...")
     symbol_agg_files = find_symbol_aggtrade_files(SYMBOL)
     if symbol_agg_files:
@@ -826,6 +858,13 @@ def build_features(horizon):
         ("last_funding_rate", 168, 120, "funding_rate_zscore"),
         ("vov_24h", 168, 120, "volatility_of_volatility"),
     ])
+    # V3 新 z 列（阶段 3）: vpd 双前缀 24h；count 24h；premium 168h
+    rz_jobs.extend([
+        ("vpd_pret_24h", 24, 16, "vpd_pzscore"),
+        ("vpd_vret_24h", 24, 16, "vpd_vzscore"),
+        ("count_log1p", 24, 16, "trade_intensity_zscore"),
+        ("premium_close", 168, 120, "basis_zscore"),
+    ])
 
     # 步骤 1: 计算 rolling median (严格事前：shift(1) 后窗口只覆盖 t-1 及以前)
     rz_medians = [f"__rz_median_{alias}" for _, _, _, alias in rz_jobs]
@@ -847,8 +886,8 @@ def build_features(horizon):
     ]
     features = features.with_columns(zscore_exprs)
 
-    # 步骤 4: 丢弃中间临时变量（log_return_zscore 留到 oi_price_divergence 算完后丢弃）
-    features = features.drop(rz_medians + rz_mads + ["volume_log1p", "downside_vol_24h", "vov_24h"])
+    # 步骤 4: 丢弃中间临时变量（vpd_*zscore 留到 volume_price_divergence 算完后丢弃）
+    features = features.drop(rz_medians + rz_mads + ["volume_log1p", "downside_vol_24h", "vov_24h", "count_log1p"])
 
     # 🚨 [新增] COID: 高阶订单流背离 (CVD净买单偏离度减去总持仓偏离度)
     if "cvd_zscore" in features.columns and "oi_delta_pct_zscore" in features.columns:
@@ -861,6 +900,12 @@ def build_features(horizon):
         features = features.with_columns(
             (pl.col("log_return_zscore") - pl.col("oi_delta_pct_zscore")).alias("oi_price_divergence")
         ).drop("log_return_zscore")  # 中间列用完即弃，不进最终矩阵
+
+    # 🚨 [特征 V3 · 阶段 3] 40 volume_price_divergence: 价格 z − 量能 z（各自 24h MAD z 后相减，合成值不 clip）
+    if "vpd_pzscore" in features.columns and "vpd_vzscore" in features.columns:
+        features = features.with_columns(
+            (pl.col("vpd_pzscore") - pl.col("vpd_vzscore")).alias("volume_price_divergence")
+        ).drop(["vpd_pzscore", "vpd_vzscore", "vpd_pret_24h", "vpd_vret_24h"])
 
     # 🚨 终极核对：新增 max_ret_24h，剔除 oi_price_cross 与 vpt_zscore
     final_cols = [
@@ -881,6 +926,11 @@ def build_features(horizon):
     final_cols.extend([
         "taker_imbalance", "volume_zscore", "trend_efficiency_ratio", "downside_volatility",
         "funding_rate_zscore", "oi_price_divergence", "volatility_of_volatility", "return_24h",
+    ])
+    # 🚨 [特征 V3 · 阶段 3] 7 个扩展列 (40-46)
+    final_cols.extend([
+        "volume_price_divergence", "trade_intensity_zscore", "drawdown_168h", "basis_zscore",
+        "return_4h", "atr_pct_24h", "btc_eth_corr_24h",
     ])
 
     features = features.select(final_cols)
@@ -934,11 +984,11 @@ def build_features(horizon):
         print("⚠️ 警告：缺失清洗删除比例超过 20%，建议检查数据源完整性后再训练。")
     
     current_date = datetime.now().strftime("%Y%m%d")
-    # 👇 [特征 V2 · FES v1] 39d 矩阵写入独立目录 main_features_39d/，
-    # 避免被旧管道 glob (main_features_1h/..._12h_*.parquet) 误选；31/39 切换开关属阶段 2 报批范围
-    out_dir = PROCESSED_MAIN_DIR.parent / "main_features_39d" / SYMBOL
+    # 👇 [特征 V3 · 阶段 3] 46d 矩阵写入独立目录 main_features_46d/，
+    # 39d/31d 矩阵文件保留不动（消融分组在训练端按列选取，共用 46d 矩阵）
+    out_dir = PROCESSED_MAIN_DIR.parent / "main_features_46d" / SYMBOL
     out_dir.mkdir(parents=True, exist_ok=True)
-    file_name = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_39d_{current_date}.parquet"
+    file_name = f"{SYMBOL}_Master_Training_Matrix_{horizon}h_46d_{current_date}.parquet"
     output_path = out_dir / file_name
     features.write_parquet(output_path)
     print(f"\n✅ 终极宽表构建成功！路径: {output_path} | 最终规模: {features.shape}")

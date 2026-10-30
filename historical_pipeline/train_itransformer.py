@@ -132,6 +132,15 @@ class CryptoDatasetGPU(Dataset):
             c for c in df.columns
             if c not in exclude_cols and not (c.startswith("target_") and c.endswith("h_return"))
         ]
+        # 🚨 [阶段 3] 消融分组选列（Joel 批准 2026-11-01）：OPT_FEATURE_COLS="a,b,c" 按给定顺序取列；
+        # 未设置时用全部特征列（原行为零改动）。供 46d 矩阵上跑 31/37/39/42/46 分组消融
+        only_cols = os.environ.get("OPT_FEATURE_COLS", "").strip()
+        if only_cols:
+            wanted = [c.strip() for c in only_cols.split(",") if c.strip()]
+            missing = [c for c in wanted if c not in df.columns]
+            if missing:
+                raise ValueError(f"OPT_FEATURE_COLS 含矩阵中不存在的列: {missing}")
+            self.feature_cols = wanted
         
         X = df.select(self.feature_cols).to_numpy().astype('float32')
         Y_raw = df.select(target_col).to_numpy().astype('float32').reshape(-1)
