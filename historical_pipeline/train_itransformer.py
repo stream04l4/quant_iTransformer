@@ -143,12 +143,11 @@ class CryptoDatasetGPU(Dataset):
             self.feature_cols = wanted
         
         # 🚨 [阶段 L] 标签列开关（Joel 批准 2026-11-02，spec §8.2）：OPT_LABEL_COL=预计算标签列（label_A/label_B_075/100/125/label_C）；
-        # 默认空 = 原阈值逻辑零改动。NaN 标签行（C 歧义剔除）在数据集构建前整行剔除
+        # 默认空 = 原阈值逻辑零改动。NaN 标签行在切分后按段剔除（见下）
         label_col = os.environ.get("OPT_LABEL_COL", "").strip()
         if label_col:
             if label_col not in df.columns:
                 raise ValueError(f"OPT_LABEL_COL={label_col} 不在矩阵列中")
-            df = df.filter(pl.col(label_col).is_not_null())
         X = df.select(self.feature_cols).to_numpy().astype('float32')
         Y_raw = df.select(target_col).to_numpy().astype('float32').reshape(-1)
         
@@ -159,6 +158,8 @@ class CryptoDatasetGPU(Dataset):
             Y_class = np.where(Y_raw > CLASS_THRESHOLD, 2, 
                                np.where(Y_raw < -CLASS_THRESHOLD, 0, 1))
         
+        # 🚨 [阶段 L] 切分口径（spec：A/B/C 完全相同切分）：先在完整矩阵上定切分点（同一时间边界），
+        # 再按段剔除 NaN 标签行（C 歧义/σ̂ warmup/尾段）——各变体差异仅为被剔除行本身
         split_idx = int(len(X) * train_ratio)
         
         # 🚨 修复：严格 Purged Split，阻断标签与特征的微小交叉泄露
@@ -166,10 +167,15 @@ class CryptoDatasetGPU(Dataset):
         
         if is_train:
             X_data, Y_data = X[:train_end], Y_class[:train_end]
+            raw_data = Y_raw[:train_end]
         else:
             val_start_idx = split_idx + FORECAST_HORIZON
             X_data, Y_data = X[val_start_idx:], Y_class[val_start_idx:]
-            
+            raw_data = Y_raw[val_start_idx:]
+        if label_col:
+            keep = ~np.isnan(Y_data)
+            X_data, Y_data, raw_data = X_data[keep], Y_data[keep], raw_data[keep]
+        
         # 直接推送至 GPU
         X_tensor = torch.tensor(X_data, dtype=torch.float32, device=device)
         Y_tensor = torch.tensor(Y_data, dtype=torch.long, device=device)
@@ -177,7 +183,6 @@ class CryptoDatasetGPU(Dataset):
         # 核心：使用 unfold 直接在显存中生成滑动窗口视图，完美避开 CPU Dataloader 瓶颈
         self.X = X_tensor.unfold(dimension=0, size=seq_len, step=1).transpose(1, 2).contiguous()
         self.Y = Y_tensor[seq_len - 1:]
-        raw_data = Y_raw[:train_end] if is_train else Y_raw[val_start_idx:]
         self.Y_raw = torch.tensor(raw_data, dtype=torch.float32, device=device)[seq_len - 1:]
 
     def __len__(self):
