@@ -128,7 +128,7 @@ class CryptoDatasetGPU(Dataset):
         data_end_ts = os.environ.get("OPT_DATA_END_TS", "").strip()
         if data_end_ts:
             tdt = df.schema["hour_timestamp"]
-            df = df.filter(pl.col("hour_timestamp") < pl.lit(data_end_ts).cast(tdt))
+            df = df.filter(pl.col("hour_timestamp") < pl.lit(datetime.fromisoformat(data_end_ts)).cast(tdt))
             print(f"🔒 [P0] OPT_DATA_END_TS={data_end_ts} → 截断后 {df.height} 行")
         
         target_col = f"target_{FORECAST_HORIZON}h_return"
@@ -173,7 +173,7 @@ class CryptoDatasetGPU(Dataset):
         split_ts = os.environ.get("OPT_SPLIT_TS", "").strip()
         if split_ts:
             tdt = df.schema["hour_timestamp"]
-            split_idx = int(df.filter(pl.col("hour_timestamp") >= pl.lit(split_ts).cast(tdt)).height)
+            split_idx = int(df.filter(pl.col("hour_timestamp") >= pl.lit(datetime.fromisoformat(split_ts)).cast(tdt)).height)
             print(f"🔒 [P0] OPT_SPLIT_TS={split_ts} → split_idx={split_idx}")
         else:
             split_idx = int(len(X) * train_ratio)
