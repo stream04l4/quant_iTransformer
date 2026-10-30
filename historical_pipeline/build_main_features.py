@@ -771,9 +771,15 @@ def build_features(horizon):
             ).rolling_mean(window_size=24) / (pl.col("close") + 1e-9)
         ).alias("atr_pct_24h"),
         # 46 btc_eth_corr_24h: BTC/ETH 1h 对数收益 24h 滚动相关（当根 bar 已收盘，口径同 return 系）
-        pl.col("log_return").rolling_corr(
-            (pl.col("aux_reference_close").log() - pl.col("aux_reference_close").shift(1).log()),
-            window_size=24,
+        # 本 polars 版本无 rolling_corr，用协方差恒等式手工展开：cov=mean(xy)−mean(x)mean(y)，除以 std 积
+        (
+            (
+                pl.col("log_return") * (pl.col("aux_reference_close").log().diff(1))
+            ).rolling_mean(window_size=24)
+            - pl.col("log_return").rolling_mean(window_size=24) * (pl.col("aux_reference_close").log().diff(1)).rolling_mean(window_size=24)
+        ) / (
+            pl.col("log_return").rolling_std(window_size=24)
+            * (pl.col("aux_reference_close").log().diff(1)).rolling_std(window_size=24) + 1e-12
         ).alias("btc_eth_corr_24h"),
     ])
     # 40 volume_price_divergence 的派生（vpd_pzscore − vpd_vzscore）在 z 块之后执行（见下方 COID 邻块）
