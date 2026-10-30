@@ -286,50 +286,114 @@ def run_backtest(args=None):
 
     DEVICE = torch.device("cuda")  # 明确 H100 环境
 
+    # ============ N1 模式（Stage N S1 出场消融，2026-10-30 Joel 批准） ============
+    # 全部开关默认关闭 = 原行为；仅在提供 N1_SIGNAL_FILE 时启用。
+    # N1_SIGNAL_FILE : 逐小时信号文件 (hour_timestamp,p_down,p_up,th_up_top10,th_down_top10)
+    # N1_EXIT_MODE   : production(默认) / no_sl(去硬止损,保留棘轮等) / fixed12h(12h 硬到期)
+    # N1_WINDOW_START/END : 评估段 ISO 时间戳；N1_GATE 入场门槛(默认 0.40)；N1_LEVERAGE 固定杠杆(默认 1.0)
+    # N1_JSON_OUT / N1_TRADES_OUT : 机器可读输出
+    n1_signal_file = os.environ.get("N1_SIGNAL_FILE", "").strip()
+    n1_mode = bool(n1_signal_file)
+    n1_exit_mode = os.environ.get("N1_EXIT_MODE", "production").strip()
+    n1_window_start = os.environ.get("N1_WINDOW_START", "").strip()
+    n1_window_end = os.environ.get("N1_WINDOW_END", "").strip()
+    n1_gate = float(os.environ.get("N1_GATE", "0.40"))
+    n1_leverage = float(os.environ.get("N1_LEVERAGE", "1.0"))
+    n1_json_out = os.environ.get("N1_JSON_OUT", "").strip()
+    n1_trades_out = os.environ.get("N1_TRADES_OUT", "").strip()
+    n1_fixed12h = n1_mode and n1_exit_mode == "fixed12h"
+    n1_no_sl = n1_mode and n1_exit_mode == "no_sl"
+    if n1_mode and n1_exit_mode not in ("production", "no_sl", "fixed12h"):
+        raise ValueError(f"❌ N1_EXIT_MODE 非法: {n1_exit_mode}")
+    if n1_mode and not (n1_window_start and n1_window_end):
+        raise ValueError("❌ N1 模式需要 N1_WINDOW_START / N1_WINDOW_END")
+    n1_ws_sec = int(pd.Timestamp(n1_window_start).timestamp()) if n1_mode else 0
+    th = None  # 由 N1 信号段（严格 val 阈值）或下方 _weighted_thresholds 赋值
+
     # 1. 优先定位模型权重文件，一切以它保存的元数据为准。
     # 默认仍是 EXPERIMENT_ID 单模型；只有显式 --models / --use-live-models 才进入 ensemble。
-    try:
-        model_specs = _resolve_model_specs(args)
-        model_components = [_load_model_component(spec, DEVICE) for spec in model_specs]
-        _validate_ensemble_components(model_components)
-    except Exception as e:
-        print(f"❌ 模型加载失败: {e}")
-        return
+    # N1 模式：外部信号文件，跳过模型加载/推理（Stage N S1 消融）。
+    if n1_mode:
+        model_components = []
+        ckpt_horizon = 12  # N1 口径固定 12h（与 P0 一致）
+        _n1_matrix_env = os.environ.get("N1_MATRIX", "").strip()
+        if not _n1_matrix_env or not Path(_n1_matrix_env).exists():
+            print(f"❌ N1 模式需要 N1_MATRIX 指向特征宽表 parquet（当前: {_n1_matrix_env}）")
+            return
+        data_path = Path(_n1_matrix_env)
+        print(f"🚀 N1 模式 | exit={n1_exit_mode} | gate={n1_gate} | lev={n1_leverage} | matrix={data_path.name}")
+    else:
+        try:
+            model_specs = _resolve_model_specs(args)
+            model_components = [_load_model_component(spec, DEVICE) for spec in model_specs]
+            _validate_ensemble_components(model_components)
+        except Exception as e:
+            print(f"❌ 模型加载失败: {e}")
+            return
 
-    primary_component = model_components[0]
-    ckpt_horizon = int(primary_component["forecast_horizon"])
-    model_count = len(model_components)
-    model_stack = ", ".join(
-        f"{component['exp_id']}@{component['weight']:.2f}" for component in model_components
-    )
-    print(f"🚀 启动终极回测 V5 (绝对严谨财务核算 + 动态杠杆)...")
-    print(f"🧩 模型模式: {'Ensemble' if model_count > 1 else 'Single'} x{model_count} | {model_stack}")
+        primary_component = model_components[0]
+        ckpt_horizon = int(primary_component["forecast_horizon"])
+        model_count = len(model_components)
+        model_stack = ", ".join(
+            f"{component['exp_id']}@{component['weight']:.2f}" for component in model_components
+        )
+        print(f"🚀 启动终极回测 V5 (绝对严谨财务核算 + 动态杠杆)...")
+        print(f"🧩 模型模式: {'Ensemble' if model_count > 1 else 'Single'} x{model_count} | {model_stack}")
 
-    # 基于真实 horizon 精准匹配特征宽表
-    data_files = _find_training_matrix_files(ckpt_horizon)
-    if not data_files:
-        print(f"❌ 找不到对应 Horizon ({ckpt_horizon}h) 的数据文件！")
-        return
-    data_path = data_files[-1]
+        # 基于真实 horizon 精准匹配特征宽表
+        data_files = _find_training_matrix_files(ckpt_horizon)
+        if not data_files:
+            print(f"❌ 找不到对应 Horizon ({ckpt_horizon}h) 的数据文件！")
+            return
+        data_path = data_files[-1]
 
     # === 1. 独立加载特征空间与执行空间 ===
     df = pl.read_parquet(data_path)
     timestamps = df.select("hour_timestamp").to_series().to_numpy()
 
-    # 🚨 防呆机制 2：彻底消灭时空错位。使用各模型 seq_len 独立预热，对齐同一个测试集原点
-    split_idx = int(df.height * 0.8) + ckpt_horizon
-    max_seq_len = max(int(component["seq_len"]) for component in model_components)
-    warmup_start_idx = split_idx - max_seq_len + 1
+    if n1_mode:
+        # N1：评估段 = [N1_WINDOW_START, N1_WINDOW_END)（无推理，无需预热）
+        _ts64 = timestamps.astype("datetime64[s]").astype(np.int64)
+        _we_sec = int(pd.Timestamp(n1_window_end).timestamp())
+        split_idx = int(np.searchsorted(_ts64, n1_ws_sec, side="left"))
+        end_idx = int(np.searchsorted(_ts64, _we_sec, side="left"))
+        if end_idx <= split_idx:
+            print("❌ N1 窗口内没有矩阵行！")
+            return
+        test_timestamps = timestamps[split_idx:end_idx]
+        valid_timestamps = test_timestamps.tolist()
 
-    if warmup_start_idx < 0:
-        print(f"❌ 数据量不足以支撑最大 seq_len={max_seq_len} 的预热！")
-        return
+        sig = pd.read_csv(n1_signal_file)
+        sig_ts = sig["hour_timestamp"].astype("datetime64[s]").astype(np.int64).to_numpy()
+        matrix_ts = _ts64[split_idx:end_idx]
+        if len(sig_ts) != len(matrix_ts) or not np.array_equal(sig_ts, matrix_ts):
+            raise ValueError(
+                f"❌ N1 信号文件与矩阵行不对齐: signal={len(sig_ts)} matrix={len(matrix_ts)}"
+            )
+        p_down_arr = sig["p_down"].to_numpy().astype(float)
+        p_up_arr = sig["p_up"].to_numpy().astype(float)
+        p_flat_arr = np.clip(1.0 - p_up_arr - p_down_arr, 0.0, 1.0)
+        predictions_probs = np.stack([p_down_arr, p_flat_arr, p_up_arr], axis=1)
+        _thu = float(sig["th_up_top10"].iloc[0])
+        _thd = float(sig["th_down_top10"].iloc[0])
+        th = {"up_top_1": _thu, "up_top_5": _thu, "up_top_10": _thu,
+              "down_top_1": _thd, "down_top_5": _thd, "down_top_10": _thd}
+        print(f"⚙️ N1 信号加载: {len(predictions_probs)} 行 | 严格 val 阈值 up_top10={_thu:.4f} down_top10={_thd:.4f}")
+    else:
+        # 🚨 防呆机制 2：彻底消灭时空错位。使用各模型 seq_len 独立预热，对齐同一个测试集原点
+        split_idx = int(df.height * 0.8) + ckpt_horizon
+        max_seq_len = max(int(component["seq_len"]) for component in model_components)
+        warmup_start_idx = split_idx - max_seq_len + 1
 
-    test_timestamps = timestamps[split_idx:]
-    valid_timestamps = test_timestamps.tolist()
+        if warmup_start_idx < 0:
+            print(f"❌ 数据量不足以支撑最大 seq_len={max_seq_len} 的预热！")
+            return
 
-    print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
-    predictions_probs = _generate_weighted_probabilities(df, model_components, split_idx, DEVICE)
+        test_timestamps = timestamps[split_idx:]
+        valid_timestamps = test_timestamps.tolist()
+
+        print("\n⚙️ 正在 H100 上生成概率矩阵 (全显存 Zero-Copy 极速推理)...")
+        predictions_probs = _generate_weighted_probabilities(df, model_components, split_idx, DEVICE)
 
     # 极速加载 1h 和 1m 的真实物理价格 (执行空间)
     raw_kline_dir = TEMP_DIR / "klines" / SYMBOL
@@ -357,7 +421,11 @@ def run_backtest(args=None):
     # 🏦 基于 1h 决策 + 1m 显微镜追踪的双轨状态机
     # ==========================================
     # 🚨 防呆机制 3：多模型时动态分位数阈值跟随概率 ensemble 做同权重融合。
-    th = _weighted_thresholds(model_components)
+    # （N1 模式的 th 已在信号加载段由严格 val 阈值给出）
+    if not n1_mode:
+        th = _weighted_thresholds(model_components)
+    if th is None:
+        raise RuntimeError("❌ 阈值未就绪（N1 信号段 / _weighted_thresholds 均未赋值）")
 
     print("📥 已成功加载动态分位数阈值。")
 
@@ -378,6 +446,8 @@ def run_backtest(args=None):
     open_cost = 0.0
 
     max_unrealized_phys_pnl = 0.0
+    min_adverse_phys_pnl = 0.0   # N1: 全程最大不利波动（MAE，物理口径）
+    n1_trades = []               # N1: 逐笔记录（仅 N1 模式写出）
     trailing_active = False
     trailing_mode = None
     physical_sl_phys = -abs(HARD_SL)
@@ -433,7 +503,15 @@ def run_backtest(args=None):
         target_tier = 0
         target_leverage = 0.0
 
-        if p_up > th["up_top_1"]:      target_pos = 1; target_tier = 3; target_leverage = LEVERAGE_3
+        if n1_mode:
+            # N1：仅在 12h 块起点（相对窗口起点的 12h 网格）允许开仓；固定 gate，单档 N1_LEVERAGE。
+            # 与 P0 口径一致；同向信号刷新逻辑对 fixed12h 在情景 B 关闭（见下）。
+            if (signal_time - n1_ws_sec) % (12 * 3600) == 0:
+                if p_up >= n1_gate and p_up > p_down:
+                    target_pos = 1; target_tier = 1; target_leverage = n1_leverage
+                elif p_down >= n1_gate and p_down > p_up:
+                    target_pos = -1; target_tier = 1; target_leverage = n1_leverage
+        elif p_up > th["up_top_1"]:      target_pos = 1; target_tier = 3; target_leverage = LEVERAGE_3
         elif p_up > th["up_top_5"]:    target_pos = 1; target_tier = 2; target_leverage = LEVERAGE_2
         elif p_up > th["up_top_10"]:   target_pos = 1; target_tier = 1; target_leverage = LEVERAGE_1
         elif p_down > th["down_top_1"]:  target_pos = -1; target_tier = 3; target_leverage = LEVERAGE_3
@@ -462,14 +540,17 @@ def run_backtest(args=None):
                 if target_pos == -1: short_trades += 1
 
                 max_unrealized_phys_pnl = 0.0
+                min_adverse_phys_pnl = 0.0
+                _n1_reason = ""
                 trailing_active = False
                 trailing_mode = None
-                physical_sl_phys = -abs(HARD_SL)
+                physical_sl_phys = -1.0 if n1_no_sl else -abs(HARD_SL)
                 atr_sl_phys = None
 
             # 💡 情景 B: 同 Tier 信号才刷新持仓计时；更高 Tier 额外补仓并重置计时。
             # 低 Tier 信号代表概率走弱，不能给高 Tier 持仓续命。
-            elif current_pos == target_pos:
+            # N1 fixed12h：无刷新/补仓（持仓固定 12h，与 P0 口径一致）。
+            elif current_pos == target_pos and not n1_fixed12h:
                 hold_near_expiry = hold_timer_mins * 60 <= HOLD_EXPIRY_GRACE_SECONDS
                 if target_tier > current_tier or (target_tier == current_tier and not hold_near_expiry):
                     hold_timer_mins = HOLD_PERIOD * 60
@@ -548,7 +629,9 @@ def run_backtest(args=None):
             close_return = 0.0
 
             is_reversal = False
-            if current_pos == 1 and p_down > th["down_top_10"]: is_reversal = True
+            if n1_fixed12h:
+                pass  # N1 fixed12h：无反向退出（仅 12h 到期）
+            elif current_pos == 1 and p_down > th["down_top_10"]: is_reversal = True
             elif current_pos == -1 and p_up > th["up_top_10"]: is_reversal = True
             is_favorable_signal = False
             if current_pos == 1 and p_up > th["up_top_10"]: is_favorable_signal = True
@@ -569,6 +652,7 @@ def run_backtest(args=None):
                 if current_phys_profit < 0.005 and not trailing_active:
                     close_position = True
                     actual_exit_pct = current_phys_profit * current_leverage
+                    _n1_reason = "REVERSAL_EXIT"
                     exit_reasons["REVERSAL_EXIT"] += 1
                 else:
                     trailing_active = True
@@ -596,6 +680,22 @@ def run_backtest(args=None):
                         best_intra = (entry_price - m_low) / entry_price
                         close_return = (entry_price - m_close) / entry_price
 
+                    if n1_fixed12h:
+                        # N1 fixed12h：无 TP/SL/棘轮/反向，仅计时；到期无条件平仓
+                        # （对齐 P0 固定 12h 口径：入场=信号 bar 次根 open，出场=12h 后的 1m close）
+                        hold_timer_mins -= 1
+                        if best_intra > max_unrealized_phys_pnl:
+                            max_unrealized_phys_pnl = best_intra
+                        if worst_intra < min_adverse_phys_pnl:
+                            min_adverse_phys_pnl = worst_intra
+                        if hold_timer_mins <= 0:
+                            close_position = True
+                            actual_exit_pct = close_return * current_leverage
+                            _n1_reason = "TIME_LIMIT_EXIT"
+                            exit_reasons["TIME_LIMIT_EXIT"] += 1
+                            break
+                        continue
+
                     atr_price = atr_1m[m_idx] if m_idx < len(atr_1m) else 0.0
                     trailing_retrace_phys = (
                         TRAILING_ATR_MULTI * atr_price / entry_price
@@ -615,12 +715,15 @@ def run_backtest(args=None):
                     if worst_intra <= active_stop_phys:
                         close_position = True
                         actual_exit_pct = active_stop_phys * current_leverage
+                        _n1_reason = "TRAILING_EXIT" if trailing_active else "HARD_SL_EXIT"
                         if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
                         else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
 
                     if best_intra > max_unrealized_phys_pnl:
                         max_unrealized_phys_pnl = best_intra
+                    if worst_intra < min_adverse_phys_pnl:
+                        min_adverse_phys_pnl = worst_intra
 
                     if max_unrealized_phys_pnl >= abs(HARD_TP):
                         if trailing_mode != "tight":
@@ -642,6 +745,7 @@ def run_backtest(args=None):
                         if close_return < 0.005 and not trailing_active:
                             close_position = True
                             actual_exit_pct = close_return * current_leverage
+                            _n1_reason = "TIME_LIMIT_EXIT"
                             exit_reasons["TIME_LIMIT_EXIT"] += 1
                             break
                         else:
@@ -660,6 +764,7 @@ def run_backtest(args=None):
                     if worst_intra <= active_stop_phys:
                         close_position = True
                         actual_exit_pct = active_stop_phys * current_leverage
+                        _n1_reason = "TRAILING_EXIT" if trailing_active else "HARD_SL_EXIT"
                         if trailing_active: exit_reasons["TRAILING_EXIT"] += 1
                         else: exit_reasons["HARD_SL_EXIT"] += 1
                         break
@@ -667,6 +772,8 @@ def run_backtest(args=None):
                 close_pnl_pct = close_return * current_leverage
 
             if liquidated:
+                _n1_dir = current_pos
+                _n1_lev = current_leverage
                 equity = 0
                 current_pos = 0
                 current_tier = 0
@@ -676,6 +783,16 @@ def run_backtest(args=None):
                 gross_loss += trade_start_equity
                 exit_reasons["LIQUIDATION_EXIT"] += 1
                 pnl_list.append(-1.0)
+                if n1_mode:
+                    n1_trades.append({
+                        "entry_time": int(entry_time), "exit_time": int(chunk_end_time),
+                        "dir": int(_n1_dir), "leverage": float(_n1_lev),
+                        "entry_price": float(entry_price), "exit_ret_phys": -1.0,
+                        "pnl_frac": -1.0, "mfe_phys": float(max_unrealized_phys_pnl),
+                        "mae_phys": float(min_adverse_phys_pnl),
+                        "hold_minutes": int(HOLD_PERIOD * 60 - hold_timer_mins),
+                        "reason": "LIQUIDATION_EXIT",
+                    })
                 trailing_active = False
                 trailing_mode = None
                 atr_sl_phys = None
@@ -695,6 +812,8 @@ def run_backtest(args=None):
                 else:
                     gross_loss += abs(trade_pnl)
 
+                _n1_dir = current_pos
+                _n1_lev = current_leverage
                 trade_count += 1
                 current_pos = 0
                 current_tier = 0
@@ -704,9 +823,25 @@ def run_backtest(args=None):
                 atr_sl_phys = None
 
                 pnl_list.append(trade_pnl / trade_start_equity)
+                if n1_mode:
+                    n1_trades.append({
+                        "entry_time": int(entry_time),
+                        "exit_time": int(chunk_end_time),
+                        "dir": int(_n1_dir),
+                        "leverage": float(_n1_lev),
+                        "entry_price": float(entry_price),
+                        "exit_ret_phys": float(actual_exit_pct / _n1_lev) if _n1_lev else 0.0,
+                        "pnl_frac": float(trade_pnl / trade_start_equity),
+                        "mfe_phys": float(max_unrealized_phys_pnl),
+                        "mae_phys": float(min_adverse_phys_pnl),
+                        "hold_minutes": int(HOLD_PERIOD * 60 - hold_timer_mins),
+                        "reason": _n1_reason,
+                    })
             else:
                 # 🚨 财务修复 3：跨小时浮动结算，同样严格遵守完整公式，防止资金幽灵恢复
-                cumulative_funding += trade_start_equity * current_leverage * HOURLY_FUNDING_COST
+                # N1：口径与 P0/阶段 L 一致（仅 0.07% 单边成本，不计 funding），保证三模式归因干净
+                if not n1_mode:
+                    cumulative_funding += trade_start_equity * current_leverage * HOURLY_FUNDING_COST
                 floating_pnl = trade_start_equity * close_pnl_pct
                 equity = trade_start_equity + floating_pnl - open_cost - cumulative_funding
                 entry_time = chunk_end_time
@@ -751,6 +886,36 @@ def run_backtest(args=None):
     avg_loss = np.mean([p for p in pnl_list if p <= 0]) if any(p <= 0 for p in pnl_list) else 0
     expectancy = float(np.mean(pnl_list)) if pnl_list else 0.0
     recovery_factor = total_return / (abs(max_drawdown)/100) if max_drawdown != 0 else 0
+
+    # ============ N1 模式：写出机器可读结果并提前返回（跳过绘图） ============
+    if n1_mode:
+        _n1_pf = float(profit_factor) if np.isfinite(profit_factor) else None
+        n1_summary = {
+            "exit_mode": n1_exit_mode, "gate": n1_gate, "leverage": n1_leverage,
+            "window": [n1_window_start, n1_window_end],
+            "total_return": float(total_return),
+            "n_trades": int(trade_count),
+            "win_rate": float(win_rate) / 100.0,
+            "profit_factor": _n1_pf,
+            "expectancy": float(expectancy),
+            "max_dd": float(max_drawdown) / 100.0,
+            "long_trades": int(long_trades), "short_trades": int(short_trades),
+            "exit_reasons": {k: int(v) for k, v in exit_reasons.items()},
+            "mfe_median": float(np.median([t["mfe_phys"] for t in n1_trades])) if n1_trades else None,
+            "mae_median": float(np.median([t["mae_phys"] for t in n1_trades])) if n1_trades else None,
+            "trades": n1_trades,
+        }
+        if n1_json_out:
+            with open(n1_json_out, "w") as f:
+                json.dump(n1_summary, f, ensure_ascii=False, indent=1)
+        if n1_trades_out:
+            if n1_trades:
+                pd.DataFrame(n1_trades).to_csv(n1_trades_out, index=False)
+            else:
+                with open(n1_trades_out, "w") as f:
+                    f.write("entry_time,exit_time,dir,leverage,entry_price,exit_ret_phys,pnl_frac,mfe_phys,mae_phys,hold_minutes,reason\n")
+        print(f"💾 N1 结果已写出: {n1_json_out or '(无 json)'} / {n1_trades_out or '(无 csv)'}")
+        return
 
     print("\n" + "="*50)
     print(f" 📜 TimesFM 引擎终极回测审计报告 | {SYMBOL}")
