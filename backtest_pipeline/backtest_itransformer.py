@@ -146,7 +146,9 @@ def _resolve_model_specs(args):
 
 
 def _load_thresholds(exp_id):
-    json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}.json"
+    # [E2] BT_THRESH_SUFFIX: 阈值文件后缀（如 _P0S=严格 val 版），默认空=原文件名
+    suffix = os.environ.get("BT_THRESH_SUFFIX", "").strip()
+    json_path = MODEL_DIR / f"dynamic_thresholds_{exp_id}{suffix}.json"
     if not json_path.exists():
         raise FileNotFoundError(f"❌ 找不到动态阈值文件: {json_path}")
     with open(json_path, "r") as f:
@@ -380,8 +382,24 @@ def run_backtest(args=None):
               "down_top_1": _thd, "down_top_5": _thd, "down_top_10": _thd}
         print(f"⚙️ N1 信号加载: {len(predictions_probs)} 行 | 严格 val 阈值 up_top10={_thu:.4f} down_top10={_thd:.4f}")
     else:
-        # 🚨 防呆机制 2：彻底消灭时空错位。使用各模型 seq_len 独立预热，对齐同一个测试集原点
-        split_idx = int(df.height * 0.8) + ckpt_horizon
+        # [E2 严格窗口] (2026-11-03, Joel 预批): env 覆盖评估窗口, 默认不启用=原行为零改动
+        #   BT_TEST_END_TS  : 数据在窗口末端物理截断 (hour_timestamp < end)
+        #   BT_TEST_START_TS: test 起点, split=首个 ts>=start 的行号 (替代 80% 比例切分)
+        import datetime as _dt_mod
+        _bt_end = os.environ.get("BT_TEST_END_TS", "").strip()
+        if _bt_end:
+            _end_lit = pl.lit(_dt_mod.datetime.fromisoformat(_bt_end)).cast(df["hour_timestamp"].dtype)
+            _h0 = df.height
+            df = df.filter(df["hour_timestamp"] < _end_lit)
+            timestamps = df.select("hour_timestamp").to_series().to_numpy()
+            print(f"🔒 [E2窗口] 数据截断于 {_bt_end}: {_h0} -> {df.height} 行")
+        _bt_start = os.environ.get("BT_TEST_START_TS", "").strip()
+        if _bt_start:
+            _start_lit = pl.lit(_dt_mod.datetime.fromisoformat(_bt_start)).cast(df["hour_timestamp"].dtype)
+            split_idx = df.filter(df["hour_timestamp"] < _start_lit).height
+            print(f"🔒 [E2窗口] test 起点 {_bt_start}: split_idx={split_idx} (test 侧 {df.height - split_idx} 行)")
+        else:
+            split_idx = int(df.height * 0.8) + ckpt_horizon
         max_seq_len = max(int(component["seq_len"]) for component in model_components)
         warmup_start_idx = split_idx - max_seq_len + 1
 
@@ -957,7 +975,7 @@ def run_backtest(args=None):
     plt.legend(facecolor='#1e1e1e', labelcolor='white')
     plt.grid(True, alpha=0.1, color='white')
 
-    plot_path = MODEL_DIR / f"backtest_probabilistic_{EXPERIMENT_ID}.png"
+    plot_path = MODEL_DIR / f"backtest_probabilistic_{os.environ.get('BT_PLOT_TAG', EXPERIMENT_ID)}.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='#121212')
     print(f"\n📈 最终资金曲线已生成: {plot_path}")
     plt.close('all')
