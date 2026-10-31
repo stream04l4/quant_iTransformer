@@ -1031,7 +1031,7 @@ def run_backtest(args=None):
     if bt_trades_out:
         _o_pf = float(profit_factor) if np.isfinite(profit_factor) else None
         o_summary = {
-            "window": [args.test_start, args.test_end],
+            "window": [os.environ.get("BT_TEST_START_TS"), os.environ.get("BT_TEST_END_TS")],
             "leverage_tiers": [bt_lev_t1, bt_lev_t2, bt_lev_t3],
             "long_only": bt_long_only, "short_only": bt_short_only,
             "regime_file": bt_regime_file or None,
