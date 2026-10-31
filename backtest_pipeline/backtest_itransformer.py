@@ -324,6 +324,8 @@ def run_backtest(args=None):
     bt_lev_t3 = float(os.environ.get("BT_LEV_T3", "0") or 0) or LEVERAGE_3
     bt_long_only = os.environ.get("BT_LONG_ONLY", "0") == "1"
     bt_short_only = os.environ.get("BT_SHORT_ONLY", "0") == "1"
+    # BT_REGIME_FLAT=1: regime 切换到不允许持仓方向时强制市价平存量仓（"默认空仓"语义；默认关闭=只禁新仓）
+    bt_regime_flat = os.environ.get("BT_REGIME_FLAT", "0") == "1"
     bt_regime_file = os.environ.get("BT_REGIME_FILE", "").strip()
     bt_regime_ts = None
     bt_regime_vals = None
@@ -513,6 +515,7 @@ def run_backtest(args=None):
         "TRAILING_EXIT": 0,
         "TIME_LIMIT_EXIT": 0,
         "LIQUIDATION_EXIT": 0,
+        "REGIME_FLAT_EXIT": 0,
     }
     pnl_list = []
 
@@ -535,6 +538,52 @@ def run_backtest(args=None):
         else:
             if benchmark_prices: benchmark_prices.append(benchmark_prices[-1])
             break
+
+        # Stage O: regime 强制平仓（BT_REGIME_FLAT=1；默认关闭=原行为）。
+        # 语义：regime 切换到不允许该持仓方向（多=BULL / 空=BEAR）时，执行时点开盘价市价全平。
+        # 完整对账：gross - 开仓摩擦(已扣) - 平仓摩擦 - 累计资金费，与生产平仓公式一致。
+        if bt_regime_flat and bt_regime_ts is not None and current_pos != 0 and not liquidated:
+            _ri = int(np.searchsorted(bt_regime_ts, signal_time, side="right")) - 1
+            _r = bt_regime_vals[_ri] if _ri >= 0 else "SIDEWAYS"
+            _allowed = (_r == "BULL") if current_pos == 1 else (_r == "BEAR")
+            if not _allowed and exec_idx_1h < len(opens_1h):
+                _fc_px = opens_1h[exec_idx_1h]
+                _fc_ret_phys = (_fc_px / entry_price - 1.0) if current_pos == 1 else (1.0 - _fc_px / entry_price)
+                _fc_close_cost = trade_start_equity * current_leverage * (FEE_RATE + SLIPPAGE)
+                _fc_gross = trade_start_equity * _fc_ret_phys * current_leverage
+                equity = trade_start_equity + _fc_gross - open_cost - _fc_close_cost - cumulative_funding
+                _fc_pnl = equity - trade_start_equity
+                if _fc_pnl > 0:
+                    win_count += 1; gross_profit += _fc_pnl
+                else:
+                    gross_loss += abs(_fc_pnl)
+                trade_count += 1
+                pnl_list.append(_fc_pnl / trade_start_equity)
+                exit_reasons["REGIME_FLAT_EXIT"] += 1
+                if n1_mode or bt_trades_out:
+                    n1_trades.append({
+                        "entry_time": int(entry_time), "exit_time": int(signal_time + 3600),
+                        "dir": int(current_pos), "leverage": float(current_leverage),
+                        "entry_price": float(entry_price),
+                        "exit_ret_phys": float(_fc_ret_phys),
+                        "pnl_frac": float(_fc_pnl / trade_start_equity),
+                        "mfe_phys": float(max_unrealized_phys_pnl),
+                        "mae_phys": float(min_adverse_phys_pnl),
+                        "hold_minutes": int((signal_time + 3600 - entry_time) / 60),
+                        "reason": "REGIME_FLAT_EXIT",
+                        "entry_tier": int(entry_tier), "max_tier": int(max_tier),
+                        "open_cost": float(open_cost), "close_cost": float(_fc_close_cost),
+                        "funding": float(cumulative_funding),
+                        "gross_pnl": float(_fc_gross),
+                    })
+                if current_pos == 1:
+                    pass  # long_trades/short_trades 已在开仓时计数，平仓不重复
+                current_pos = 0
+                current_tier = 0
+                current_leverage = 0.0
+                trailing_active = False
+                trailing_mode = None
+                atr_sl_phys = None
 
         # ------------------------------------------
         # 1. 寻找开仓与【阶梯升档】机会 (1h 级别)
